@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
 """
-Run Qwen3.6 inference via Ollama API.
+Run Gemini inference via HKU API proxy.
 
-This script sends a prompt (with optional image) to Qwen3.6 via Ollama
+This script sends a prompt (with optional image) to Gemini via the HKU API proxy
 and returns structured output in the requested format.
 
 USAGE:
     # Single image mode
-    python scripts/07_run_qwen.py --prompt "Describe this image" --image ./sample.jpg
-    python scripts/07_run_qwen.py --prompt "Detect all cars" --template object_detection --format json --vis-output ./result.jpg
-    python scripts/07_run_qwen.py --prompt "Count objects" --template counting --format text
+    python scripts/08_run_gemini.py --prompt "Describe this image" --image ./sample.jpg
+    python scripts/08_run_gemini.py --prompt "Detect all cars" --template object_detection --format json --vis-output ./result.jpg
+    python scripts/08_run_gemini.py --prompt "Count objects" --template counting --format text
 
     # Batch mode (folder of images)
-    python scripts/07_run_qwen.py --prompt "Detect all cars" --image-folder ./images/ --output ./output/qwen_results/
-    python scripts/07_run_qwen.py --prompt "Describe scene" --image-folder ./photos/ --output ./results/ --vis-output ./vis/
+    python scripts/08_run_gemini.py --prompt "Detect all cars" --image-folder ./images/ --output ./output/gemini_results/
+    python scripts/08_run_gemini.py --prompt "Describe scene" --image-folder ./photos/ --output ./results/ --vis-output ./vis/
 
-    EXAMPLE:
-     python scripts/07_run_qwen.py --prompt "Detect all objects: Ceiling light, Sign, Advertisement Board, Ticket Gate, Map. 
- Signs are hanging lcd screens from the ceiling which show directions. They can contain arrows, characters like A B C, and X's. Do not categorize the X's on ticket gates as a sign. Do not classify posters as signs. Only hanging monitors can be classified as signs.
- Ceiling light are a flat and horizontal rectangular strip, do not detect reflections of lights in the glass or wall. If there are lights in the green wall, they are likely to be reflections. Consider carefully whether or not they are actually reflections. Detect individual ceiling lights and do not cluster them together. 
- Advertisements are flat lcd screens on the green wall that only display commercial content, not directions. Also do not mistake them for posters.  
- Maps are posters which show the directions in the MTR and which way to go.
- Ticket gates are turnstiles. Do not classify ticket vending machines as ticket gates.
- " --template object_detection --image-folder ./qwen_test --annotations-output ./output/annotations/ --vis-output ./output/vis_qwen_batch/ --split-by-class
+    # With generation config
+    python scripts/08_run_gemini.py --prompt "Detect objects" --image ./scene.jpg --temperature 0.2 --thinking-budget 1024
 
 PREREQUISITES:
-    - Ollama installed and running: ollama serve
-    - Qwen3.6 model pulled: ollama pull qwen3.6
+    - Access to HKU Gemini API proxy (no authentication required)
 
 OUTPUT:
     - Raw model response
@@ -45,64 +38,49 @@ import cv2
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.models_inference import run_qwen, list_ollama_models
+from core.models_inference import run_gemini
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run Qwen3.6 inference via Ollama API",
+        description="Run Gemini inference via HKU API proxy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     # Basic prompt with image
-    python scripts/07_run_qwen.py --prompt "Describe this image" --image ./sample.jpg
+    python scripts/08_run_gemini.py --prompt "Describe this image" --image ./sample.jpg
 
     # Object detection with JSON output
-    python scripts/07_run_qwen.py --prompt "Detect all cars and people" \\
+    python scripts/08_run_gemini.py --prompt "Detect all cars and people" \\
         --template object_detection --format json --image ./street.jpg
 
     # Image captioning
-    python scripts/07_run_qwen.py --prompt "What is happening?" \\
+    python scripts/08_run_gemini.py --prompt "What is happening?" \\
         --template image_captioning --format text --image ./scene.jpg
 
     # Counting objects
-    python scripts/07_run_qwen.py --prompt "Count all objects" \\
+    python scripts/08_run_gemini.py --prompt "Count all objects" \\
         --template counting --format json --image ./parking.jpg
 
     # Spatial reasoning
-    python scripts/07_run_qwen.py --prompt "Describe object positions" \\
+    python scripts/08_run_gemini.py --prompt "Describe object positions" \\
         --template spatial_reasoning --format text --image ./room.jpg
 
     # Text-only prompt (no image)
-    python scripts/07_run_qwen.py --prompt "What is object detection?"
+    python scripts/08_run_gemini.py --prompt "What is object detection?"
 
-    # List available Ollama models
-    python scripts/07_run_qwen.py --list-models
+    # Use custom API endpoint
+    python scripts/08_run_gemini.py --prompt "test" --api-url https://custom.api.com/gemini
 
-    # Use custom Ollama server
-    python scripts/07_run_qwen.py --prompt "test" --ollama-url http://192.168.1.100:11434
-
-    #Multiclass
-    python scripts/07_run_qwen.py     --prompt "Detect all: Ceiling light, Sign, Advertisement Board, Ticket Gate. Monitors are hanging display boards which only show a blank screen. Signs show directions and are also hanging lcd s
-creens. Ceiling light are a flat and horizontal rectangular strip, do not detect reflections in the glass or wall. Detect individual ceiling light
-s and do not cluster them together. Advertisement boards are flat lcd screens on the green wall which display colorful advertisements. They are not posters or wall drawings. "     --template object_detection     --format json  --output ./qwenoutputmulticlass.json  --image test_multiclass.jpg
-   --vis-output ./qwen_vis_multiclass.jpg 
+    # With generation config
+    python scripts/08_run_gemini.py --prompt "Detect objects" --image ./scene.jpg \\
+        --temperature 0.2 --top-p 0.95 --top-k 40 --thinking-budget 1024
 
 Batch Mode (folder of images):
-    #Ceiling light
-    python scripts/07_run_qwen.py --prompt "Detect all objects: Ceiling light. 
-    Ceiling light are a flat and horizontal rectangular strip, do not detect reflections of lights in the glass or wall. If there are lights in the green wall, they are likely to be reflections. Consider carefully whether or not they are actually reflections. Detect individual ceiling lights and do not cluster them together. " --template object_detection --image ./qwen_test/image4.jpg --output lights.json --vis-output ./output/vis_lights.jpg
-    
     # Process all images in a folder
-     python scripts/07_run_qwen.py --prompt "Detect all objects: Ceiling light, Sign, Advertisement Board, Ticket Gate, Map. 
- Signs are hanging lcd screens from the ceiling which show directions. They can contain arrows, characters like A B C, and X's. Do not categorize the X's on ticket gates as a sign.
- Ceiling light are a flat and horizontal rectangular strip, do not detect reflections of lights in the glass or wall. If there are lights in the green wall, they are likely to be reflections. Consider carefully whether or not they are actually reflections. Detect individual ceiling lights and do not cluster them together. 
- Advertisement boards are flat lcd screens on the green wall. They are not posters or wall drawings. They only display commercial concent and do not display directions.  
- Maps are posters which show the directions in the MTR and which way to go." --template object_detection --image-folder ./qwen_test --annotations-output ./output/annotations/ --vis-output ./output/vis_qwen_batch/ --split-by-class
-    # Batch with visualizations
-    python scripts/07_run_qwen.py --prompt "Detect " \\
-        --template object_detection --image-folder ./photos/ \\
-        --output ./output/results/ --vis-output ./output/vis/ --split-by-class --annotations-output ./output/annotations/
+    python scripts/08_run_gemini.py --prompt "Detect all objects" \\
+        --template object_detection --image-folder ./images/ \\
+        --output ./output/results/ --vis-output ./output/vis/ --split-by-class
 
 Templates:
     object_detection    - Detect objects with bounding boxes
@@ -111,7 +89,7 @@ Templates:
     counting            - Count objects by category
     spatial_reasoning   - Analyze spatial relationships
 
-    Output Formats:
+Output Formats:
     json    - Valid JSON format
     yaml    - Valid YAML format
     bbox    - Bounding box format: [class, x1, y1, x2, y2]
@@ -156,20 +134,50 @@ Templates:
     parser.add_argument(
         "--model", "-m",
         type=str,
-        default="qwen3.6:27b",
-        help="Model name in Ollama (default: qwen3.6:27b)",
+        default="gemini-3.5-flash",
+        help="Model deployment ID (default: gemini-3.5-flash)",
     )
     parser.add_argument(
-        "--ollama-url",
+        "--api-url",
         type=str,
-        default="http://localhost:11434",
-        help="Ollama API base URL (default: http://localhost:11434)",
+        default="https://api.hku.hk/gemini/student",
+        help="Gemini API base URL (default: https://api.hku.hk/gemini/student)",
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=120,
         help="Request timeout in seconds (default: 120)",
+    )
+    parser.add_argument(
+        "--system-instruction",
+        type=str,
+        default=None,
+        help="System instruction to set model role/style",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Controls randomness (0.0-1.0, higher = more creative)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Controls nucleus sampling (0.0-1.0)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Limits sampling pool to top K tokens",
+    )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="Max tokens for model's internal reasoning",
     )
     parser.add_argument(
         "--output", "-o",
@@ -187,12 +195,7 @@ Templates:
         "--coord-scale",
         type=float,
         default=1000.0,
-        help="Coordinate scale factor: Qwen outputs normalized 0-1000 coordinates in x1,y1,x2,y2 format, which are scaled to pixel coordinates (default: 1000). Set to 1 if Qwen already outputs pixel coordinates.",
-    )
-    parser.add_argument(
-        "--list-models",
-        action="store_true",
-        help="List available Ollama models and exit",
+        help="Coordinate scale factor: Gemini outputs normalized 0-1000 coordinates in x1,y1,x2,y2 format, which are scaled to pixel coordinates (default: 1000). Set to 1 if Gemini already outputs pixel coordinates.",
     )
     parser.add_argument(
         "--split-by-class",
@@ -245,7 +248,7 @@ def generate_visualization(image_path, vis_path, parsed_output, coord_scale):
     Args:
         image_path: Path to input image
         vis_path: Path to save visualization image
-        parsed_output: Parsed output from Qwen containing bboxes
+        parsed_output: Parsed output from Gemini containing bboxes
         coord_scale: Coordinate scale factor (1000 for normalized, 1 for pixel)
     
     Returns:
@@ -268,7 +271,7 @@ def generate_visualization(image_path, vis_path, parsed_output, coord_scale):
         
         if bbox and len(bbox) == 4:
             # Scale coordinates from normalized range to pixel coordinates
-            # Qwen outputs x1, y1, x2, y2 format
+            # Gemini outputs x1, y1, x2, y2 format
             x1 = int(bbox[0] / coord_scale * img_w)
             y1 = int(bbox[1] / coord_scale * img_h)
             x2 = int(bbox[2] / coord_scale * img_w)
@@ -290,7 +293,7 @@ def generate_visualization(image_path, vis_path, parsed_output, coord_scale):
 
 
 def process_single_image(args, image_path, output_dir=None, vis_dir=None):
-    """Process a single image with Qwen3.6.
+    """Process a single image with Gemini.
     
     Args:
         args: Parsed command line arguments
@@ -304,15 +307,20 @@ def process_single_image(args, image_path, output_dir=None, vis_dir=None):
     print(f"\nProcessing: {image_path.name}")
     print(f"  Image: {image_path}")
     
-    # Run Qwen3.6
-    result = run_qwen(
+    # Run Gemini
+    result = run_gemini(
         prompt=args.prompt,
         template_id=args.template,
         output_format=args.format,
         image_path=str(image_path),
-        ollama_base_url=args.ollama_url,
-        model_name=args.model,
+        api_base_url=args.api_url,
+        deployment_id=args.model,
         timeout=args.timeout,
+        system_instruction=args.system_instruction,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        thinking_budget=args.thinking_budget,
         log_callback=lambda msg: print(f"  {msg}"),
     )
     
@@ -365,7 +373,7 @@ def split_annotations_by_class(parsed_output, image_path, annotations_dir, coord
     Each class JSON file contains the class name and all bounding boxes for that class.
     
     Args:
-        parsed_output: Parsed output from Qwen containing bboxes (list of dicts with bbox_2d and label)
+        parsed_output: Parsed output from Gemini containing bboxes (list of dicts with bbox_2d and label)
         image_path: Path to the input image
         annotations_dir: Base directory for annotations output
         coord_scale: Coordinate scale factor (1000 for normalized, 1 for pixel)
@@ -393,7 +401,7 @@ def split_annotations_by_class(parsed_output, image_path, annotations_dir, coord
                 bbox = item.get("bbox_2d") or item.get("bbox")
                 label = item.get("label", "object")
                 if bbox and len(bbox) == 4:
-                    # Qwen outputs x1, y1, x2, y2 format (normalized 0-1000)
+                    # Gemini outputs x1, y1, x2, y2 format (normalized 0-1000)
                     x1_norm, y1_norm, x2_norm, y2_norm = bbox
 
                     # Scale to pixel coordinates
@@ -430,7 +438,7 @@ def split_annotations_by_class(parsed_output, image_path, annotations_dir, coord
 
 
 def process_image_folder(args):
-    """Process all images in a folder with Qwen3.6.
+    """Process all images in a folder with Gemini.
     
     Args:
         args: Parsed command line arguments
@@ -454,7 +462,7 @@ def process_image_folder(args):
     print(f"Found {len(image_files)} image(s) in {folder_path}")
     
     # Setup output directories
-    output_dir = Path(args.output) if args.output else folder_path / "qwen_results"
+    output_dir = Path(args.output) if args.output else folder_path / "gemini_results"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Always create visualization directory in batch mode
@@ -544,26 +552,9 @@ def process_image_folder(args):
 def main():
     args = parse_args()
     
-    # List models mode
-    if args.list_models:
-        print("Fetching available Ollama models...")
-        result = list_ollama_models(args.ollama_url)
-        if result.get("success"):
-            models = result.get("models", [])
-            if models:
-                print(f"\nAvailable models ({len(models)}):")
-                for model in models:
-                    print(f"  - {model}")
-            else:
-                print("\nNo models found in Ollama.")
-        else:
-            print(f"\nError: {result.get('error', 'Unknown error')}")
-            print(f"Is Ollama running at {args.ollama_url}?")
-        return
-    
     # Validate prompt
     if not args.prompt:
-        print("Error: --prompt is required (unless using --list-models)")
+        print("Error: --prompt is required")
         sys.exit(1)
     
     # Batch mode: process folder of images
@@ -576,7 +567,7 @@ def main():
             print(f"Error: Path is not a directory: {folder_path}")
             sys.exit(1)
         
-        print(f"Running Qwen3.6 batch inference...")
+        print(f"Running Gemini batch inference...")
         print(f"  Model: {args.model}")
         print(f"  Template: {args.template or 'none'}")
         print(f"  Output format: {args.format}")
@@ -584,7 +575,7 @@ def main():
         print(f"  Image folder: {args.image_folder}")
         
         process_image_folder(args)
-        print("\nQwen3.6 batch inference completed successfully!")
+        print("\nGemini batch inference completed successfully!")
         return
     
     # Single image mode
@@ -595,7 +586,7 @@ def main():
             print(f"Error: Image not found: {image_path}")
             sys.exit(1)
     
-    print(f"Running Qwen3.6 inference...")
+    print(f"Running Gemini inference...")
     print(f"  Model: {args.model}")
     print(f"  Template: {args.template or 'none'}")
     print(f"  Output format: {args.format}")
@@ -603,15 +594,20 @@ def main():
     if args.image:
         print(f"  Image: {args.image}")
     
-    # Run Qwen3.6
-    result = run_qwen(
+    # Run Gemini
+    result = run_gemini(
         prompt=args.prompt,
         template_id=args.template,
         output_format=args.format,
         image_path=args.image,
-        ollama_base_url=args.ollama_url,
-        model_name=args.model,
+        api_base_url=args.api_url,
+        deployment_id=args.model,
         timeout=args.timeout,
+        system_instruction=args.system_instruction,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        thinking_budget=args.thinking_budget,
         log_callback=lambda msg: print(f"  {msg}"),
     )
     
@@ -664,7 +660,7 @@ def main():
         if generate_visualization(Path(args.image), vis_path, parsed_output, args.coord_scale):
             print(f"\nVisualization saved to: {vis_path}")
     
-    print("\nQwen3.6 inference completed successfully!")
+    print("\nGemini inference completed successfully!")
 
 
 if __name__ == "__main__":

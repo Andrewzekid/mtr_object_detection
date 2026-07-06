@@ -146,15 +146,15 @@ print(predictor.features)
 masks, boxes = predictor2.inference_features(predictor.features, src_shape=src_shape, bboxes=scaled_bbox)
 print(f"masks: {masks}, boxes: {boxes}")
 print("Multiple object segmentation")
-# # Visualize results
-# if masks is not None:
-#     masks, boxes = masks.cpu().numpy(), boxes.cpu().numpy()
-#     im = cv2.imread(source)
-#     annotator = Annotator(im, pil=False)
-#     annotator.masks(masks, [colors(x, True) for x in range(len(masks))])
+# Visualize results
+if masks is not None:
+    masks, boxes = masks.cpu().numpy(), boxes.cpu().numpy()
+    im = cv2.imread(source)
+    annotator = Annotator(im, pil=False)
+    annotator.masks(masks, [colors(x, True) for x in range(len(masks))])
 
-#     cv2.imshow("result", annotator.result())
-#     cv2.waitKey(0)
+    cv2.imshow("result", annotator.result())
+    cv2.waitKey(0)
 
 from ultralytics import SAM
 model = SAM("core/sam3/models/sam3-model/sam3.pt")

@@ -41,7 +41,9 @@ ANNOTATIONS FOLDER FORMAT (for --annotations-folder):
         "bboxes": [[x1, y1, x2, y2], ...]
     }
     
-    NOTE: The annotation files contain bounding boxes only, NOT the actual images.
+    NOTE: The annotation files contain bounding boxes in PIXEL COORDINATES (not normalized).
+    The bboxes are in [x1, y1, x2, y2] format.
+    The annotation files contain bounding boxes only, NOT the actual images.
     You must provide --image-folder to specify where the source images are located.
     The script matches images by filename: annotations/image1/ -> image_folder/image1.jpg
 
@@ -400,12 +402,6 @@ Examples:
         help="Don't save mask overlay image",
     )
     parser.add_argument(
-        "--coord-scale",
-        type=float,
-        default=None,
-        help="Coordinate scale factor: use 1000 if bboxes are in normalized 0-1000 range (e.g., from Qwen output). If not specified, auto-detects based on values.",
-    )
-    parser.add_argument(
         "--segmented-output",
         type=str,
         default="./output/segmented",
@@ -419,7 +415,7 @@ def parse_bboxes(bbox_list):
     """Parse flat bbox list into list of [x1, y1, x2, y2] lists."""
     if bbox_list is None:
         return None
-    
+
     if len(bbox_list) % 4 != 0:
         print("Error: Bounding boxes must be specified as groups of 4 values: x1 y1 x2 y2")
         sys.exit(1)
@@ -440,8 +436,7 @@ def load_bboxes_from_json(json_path):
     3. Qwen output: {"parsed_output": [{"bbox_2d": [x1, y1, x2, y2], "label": "..."}, ...]}
     
     Returns:
-        tuple: (bboxes, is_qwen_format) where is_qwen_format indicates if the bboxes
-               are in Qwen's normalized 0-1000 coordinate range
+        list: List of bounding boxes in [x1, y1, x2, y2] format (pixel coordinates)
     """
     json_file = Path(json_path)
     if not json_file.exists():
@@ -453,7 +448,7 @@ def load_bboxes_from_json(json_path):
     
     # Handle bare list format
     if isinstance(data, list):
-        return data, False
+        return data
     
     # Handle wrapped format
     if isinstance(data, dict):
@@ -467,14 +462,14 @@ def load_bboxes_from_json(json_path):
                         bboxes.append(item["bbox_2d"])
                     elif isinstance(item, list) and len(item) == 4:
                         bboxes.append(item)
-                return bboxes, True  # Qwen format uses normalized coordinates
+                return bboxes
         
         # Standard wrapped format
         if "bboxes" in data:
-            return data["bboxes"], False
+            return data["bboxes"]
         elif "bbox" in data:
             bbox = [data["bbox"]] if isinstance(data["bbox"], list) and len(data["bbox"]) == 4 else data["bbox"]
-            return bbox, False
+            return bbox
     
     print("Error: JSON file must contain a list of bboxes or a dict with 'bboxes' or 'parsed_output' key")
     sys.exit(1)
@@ -522,7 +517,7 @@ def process_single_image_sam3(args, image_path, bboxes=None, concepts=None):
     Args:
         args: Parsed command line arguments
         image_path: Path to input image
-        bboxes: Optional list of bounding boxes
+        bboxes: Optional list of bounding boxes (pixel coordinates)
         concepts: Optional list of concept labels
     
     Returns:
@@ -534,23 +529,10 @@ def process_single_image_sam3(args, image_path, bboxes=None, concepts=None):
         print(f"  Error: Could not read image: {image_path}")
         return {"success": False, "error": f"Could not read image: {image_path}"}
     
-    img_h, img_w = img.shape[:2]
-    
-    # Scale bboxes if needed (for normalized coordinates)
-    scaled_bboxes = bboxes
-    if bboxes and args.coord_scale and args.coord_scale != 1.0:
-        scaled_bboxes = []
-        for bbox in bboxes:
-            x1 = int(bbox[0] / args.coord_scale * img_w)
-            y1 = int(bbox[1] / args.coord_scale * img_h)
-            x2 = int(bbox[2] / args.coord_scale * img_w)
-            y2 = int(bbox[3] / args.coord_scale * img_h)
-            scaled_bboxes.append([x1, y1, x2, y2])
-    
-    # Run SAM3
+    # Run SAM3 (bboxes are already in pixel coordinates)
     result = run_sam3(
         image_path=str(image_path),
-        bboxes=scaled_bboxes,
+        bboxes=bboxes,
         concepts=concepts,
         model_path=args.model,
         device=args.device,
@@ -643,34 +625,34 @@ def process_image_folder_batch(args):
 
 def validate_bbox(bbox, img_w, img_h):
     """Validate and clip a bounding box to image bounds.
-    
+
     Args:
         bbox: [x1, y1, x2, y2] bounding box
         img_w: Image width
         img_h: Image height
-    
+
     Returns:
         Validated and clipped bbox, or None if invalid
     """
     if len(bbox) != 4:
         return None
-    
+
     x1, y1, x2, y2 = bbox
-    
-    # Check for valid coordinates
-    if x1 >= x2 or y1 >= y2:
+
+    # Check for valid dimensions
+    if x2 <= x1 or y2 <= y1:
         return None
-    
+
     # Clip to image bounds
     x1 = max(0, min(x1, img_w))
     y1 = max(0, min(y1, img_h))
     x2 = max(0, min(x2, img_w))
     y2 = max(0, min(y2, img_h))
-    
+
     # Check if bbox has any area after clipping
-    if x1 >= x2 or y1 >= y2:
+    if x2 <= x1 or y2 <= y1:
         return None
-    
+
     return [x1, y1, x2, y2]
 
 
@@ -852,6 +834,37 @@ def process_annotations_folder(args):
             output_path = output_dir / f"{image_subfolder.name}_segmented.png"
             cv2.imwrite(str(output_path), img)
             successful += 1
+        
+        # Save JSON results for this image
+        json_output = {
+            "image": str(image_path),
+            "image_name": image_subfolder.name,
+            "concepts": all_concepts,
+            "num_detections": len(all_detections),
+            "num_masks": len(all_masks),
+            "detections": [
+                {
+                    "label": d.get("label"),
+                    "bbox": d.get("bbox"),
+                    "confidence": d.get("confidence"),
+                    "area": d.get("area"),
+                    "center": d.get("center"),
+                }
+                for d in all_detections
+            ],
+            "input_annotations": [
+                {
+                    "class_name": load_class_annotation(ann_file)["class_name"],
+                    "bboxes": load_class_annotation(ann_file)["bboxes"],
+                }
+                for ann_file in annotation_files
+                if load_class_annotation(ann_file)
+            ],
+        }
+        json_path = output_dir / f"{image_subfolder.name}_results.json"
+        with open(json_path, "w") as f:
+            json.dump(json_output, f, indent=2)
+        print(f"  Saved JSON results to: {json_path}")
     
     print(f"\n{'=' * 60}")
     print(f"Annotations processing complete!")
@@ -902,49 +915,18 @@ def main():
         print(f"Error: Image not found: {image_path}")
         sys.exit(1)
     
-    # Get image dimensions for coordinate scaling
+    # Get image dimensions
     img = cv2.imread(str(image_path))
     if img is None:
         print(f"Error: Could not read image: {image_path}")
         sys.exit(1)
-    img_h, img_w = img.shape[:2]
     
-    # Parse bounding boxes from --bbox or --bbox-json
+    # Parse bounding boxes from --bbox or --bbox-json (already in pixel coordinates)
     bboxes = None
-    is_qwen_format = False
     if args.bbox:
         bboxes = parse_bboxes(args.bbox)
     elif args.bbox_json:
-        bboxes, is_qwen_format = load_bboxes_from_json(args.bbox_json)
-    
-    # Determine coordinate scale
-    coord_scale = args.coord_scale
-    if coord_scale is None:
-        # Auto-detect: if max coordinate value is <= 1000, assume normalized coordinates
-        if bboxes:
-            max_val = max(max(bbox) for bbox in bboxes)
-            if max_val <= 1000:
-                coord_scale = 1000.0
-                print(f"Auto-detected normalized coordinates (max value: {max_val}), using scale factor 1000")
-            else:
-                coord_scale = 1.0
-                print(f"Auto-detected pixel coordinates (max value: {max_val}), using scale factor 1")
-        else:
-            coord_scale = 1.0
-    
-    # Scale bboxes if needed
-    if bboxes and coord_scale != 1.0:
-        scaled_bboxes = []
-        for bbox in bboxes:
-            x1 = int(bbox[0] / coord_scale * img_w)
-            y1 = int(bbox[1] / coord_scale * img_h)
-            x2 = int(bbox[2] / coord_scale * img_w)
-            y2 = int(bbox[3] / coord_scale * img_h)
-            scaled_bboxes.append([x1, y1, x2, y2])
-        print(f"Scaled bboxes from normalized (0-{int(coord_scale)}) to pixel coordinates:")
-        print(f"  Original: {bboxes}")
-        print(f"  Scaled: {scaled_bboxes}")
-        bboxes = scaled_bboxes
+        bboxes = load_bboxes_from_json(args.bbox_json)
     
     # Parse concepts
     concepts = args.concept

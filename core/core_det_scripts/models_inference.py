@@ -1,4 +1,4 @@
-#    core/models_inference.py - SAM3 (local) + Qwen3.6 (via Ollama) + Gemini wrappers.
+#    core/models_inference.py - SAM3 (local) + Qwen3.6 (via Ollama) wrappers.
 #
 #    USAGE (SAM3 - local):
 #        from core.models_inference import run_sam3
@@ -28,20 +28,6 @@
 #        # r["response"]       - raw model text
 #        # r["parsed_output"]  - structured JSON/YAML/bbox list
 #
-#    USAGE (Gemini - via HKU API proxy):
-#        from core.models_inference import run_gemini
-#        r = run_gemini(
-#            prompt="Detect the cars in this scene",
-#            template_id="object_detection",   # or None for custom
-#            output_format="json",            # json | yaml | bbox | text
-#            image_path="./image.jpg",        # required for object detection
-#            api_base_url="https://api.hku.hk/gemini/student",
-#            deployment_id="gemini-3.5-flash",
-#            timeout=120,
-#        )
-#        # r["response"]       - raw model text
-#        # r["parsed_output"]  - structured JSON/YAML/bbox list
-#
 #    USAGE (list installed Ollama models):
 #        from core.models_inference import list_ollama_models
 #        print(list_ollama_models())
@@ -49,14 +35,13 @@
 #    PREREQUISITES:
 #        SAM3 weights go in ./core/sam3/models/ (sam_vit_h_4b8939.pth or similar)
 #        Qwen3.6 needs: ollama serve    ollama pull qwen3.6
-#        Gemini needs: access to HKU Gemini API proxy (no authentication required)
 #
 #    REQUIREMENTS:
 #        pip install opencv-python-headless numpy requests torch torchvision
 #        pip install segment-anything   # optional, only needed for SAM3
 
 """
-Model inference wrappers for SAM3 (local), Qwen3.6 (via Ollama), and Gemini (via HKU API proxy).
+Model inference wrappers for SAM3 (local) and Qwen3.6 (via Ollama).
 All functions are headless and return structured results.
 """
 
@@ -84,7 +69,7 @@ def run_sam3(
     is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> Dict:
     """
-    Run SAM3 semantic segmentation on an image using the Ultralytics SAM API.
+    Run SAM3 semantic segmentation on an image using Ultralytics SAM3SemanticPredictor.
 
     Multiple bounding boxes can be supplied as exemplars of the same visual concept
     (e.g. multiple cars to define the car class). The predictor segments all
@@ -92,9 +77,8 @@ def run_sam3(
 
     Args:
         image_path   : Path to input image.
-        bboxes       : List of bounding boxes in [x1, y1, x2, y2] format (pixel
-                       coordinates). Pass a single bbox or multiple exemplars as
-                       a list of lists.
+        bboxes       : List of bounding boxes in [x1, y1, w, h] format. Pass
+                       a single bbox or multiple exemplars as a list of lists.
         concepts     : Optional list of concept labels (e.g. ["car", "person"]).
                        When provided alongside bboxes, concepts are logged for
                        reference. SAM3 uses bboxes as exemplars; concepts can
@@ -113,7 +97,7 @@ def run_sam3(
           - success               : bool
           - masks                 : list of numpy bool/HxW arrays (one per region)
           - combined_mask         : single HxW bool array (union of all masks)
-          - mask_overlay          : BGR image with green mask overlay
+          - mask_overlay          : BGR image with green overlay
           - segmented_regions     : list of dicts {bbox, area, center, contour}
           - bboxes_used           : the bboxes actually passed to the predictor
     """
@@ -143,8 +127,8 @@ def run_sam3(
             log_callback("No bboxes or concepts supplied — predictor will fall back to its defaults.")
 
     try:
-        # Use the high-level Ultralytics SAM API (recommended for SAM3)
-        from ultralytics import SAM
+        # Import Ultralytics SAM3 predictor (per request)
+        from ultralytics.models.sam import SAM3SemanticPredictor
 
         # Read the source image so we can generate an overlay ourselves
         image = cv2.imread(str(image_file))
@@ -154,28 +138,29 @@ def run_sam3(
         if progress_callback:
             progress_callback(10)
 
-        if status_callback:
-            status_callback("Loading SAM3 model...")
-
-        # Build kwargs for model.predict
-        predict_kwargs = {
-            "source": str(image_file),
-            "task": "segment",
-            "verbose": False,
-            "conf": conf,
-            "device": device,
-            "save": save,
-        }
-        if bboxes is not None:
-            predict_kwargs["bboxes"] = bboxes
-            # All bboxes belong to the same class (class 0) when provided as exemplars for a single concept
-            # This ensures SAM3 treats all bboxes as the same class and returns them with consistent class_ids
-            predict_kwargs["labels"] = [0] * len(bboxes)
-        # Note: SAM3 does not support 'text' parameter - it uses bboxes as exemplars only
+        # Determine if half-precision is safe (only on CUDA)
+        use_half = device.startswith("cuda")
+        
+        # Build the overrides dict following the working SAM3 pattern
+        overrides = dict(
+            conf=conf,
+            task="segment",
+            mode="predict",
+            model=str(model_path),
+            device=device,
+            half=use_half,  # Use FP16 on GPU for faster inference
+            save=save,
+            verbose=False,
+        )
+        # Handle quantize parameter for INT8/INT16 if specified
         if quantize is not None:
-            predict_kwargs["quantize"] = quantize
+            overrides["quantize"] = quantize
 
-        model = SAM(str(model_path))
+        if status_callback:
+            status_callback("Initializing SAM3SemanticPredictor...")
+
+        predictor = SAM3SemanticPredictor(overrides=overrides)
+        predictor.set_image(str(image_file))
 
         if progress_callback:
             progress_callback(40)
@@ -183,45 +168,53 @@ def run_sam3(
         if status_callback:
             status_callback("Segmenting...")
 
+        # SAM3SemanticPredictor is an open-vocabulary segmenter that requires
+        # text prompts to know what to segment.
+        # The official API uses `text=` parameter (not `concepts=`).
+        # If only bboxes are provided, use a default text prompt.
+        if bboxes and not concepts:
+            concepts = ["object"]
+        
+        # Predict with text prompts (official SAM3 API uses `text=` parameter)
         print(f"Running SAM3 with concepts: {concepts} and bboxes: {bboxes}")
-        results = model.predict(**predict_kwargs)
+        
+        if concepts:
+            results = predictor(text=concepts,bboxes=bboxes)
+        else:
+            results = predictor(text=["object"],bboxes=bboxes)
         print(f"SAM3 results: {results}")
         if progress_callback:
             progress_callback(70)
 
-        # Handle both list and single result formats
+        # Handle both list and single result formats (as shown in working code)
         if not isinstance(results, list):
             results = [results]
 
         # Extract detections from results
+        # SAM3 returns results with .boxes (bounding boxes) and optionally .masks
         detections = []  # List of {bbox, label, confidence}
         masks_array = []
-
+        
         for result in results:
             # Extract bounding boxes (primary detection output)
             if hasattr(result, 'boxes') and result.boxes is not None and len(result.boxes) > 0:
                 boxes = result.boxes.xyxy.cpu().numpy()
-
+                
                 # Get class IDs to map to concepts
                 if hasattr(result.boxes, 'cls'):
                     class_ids = result.boxes.cls.cpu().numpy().astype(int)
                 else:
                     class_ids = np.zeros(len(boxes), dtype=int)
-
+                
                 # Get confidence scores if available
                 if hasattr(result.boxes, 'conf'):
                     confidences = result.boxes.conf.cpu().numpy()
                 else:
                     confidences = np.ones(len(boxes))
-
-                # When bboxes are provided as exemplars for a concept, all detections 
-                # should use the primary concept name (first concept) to ensure consistent
-                # coloring. SAM3 may return different class_ids for each bbox, but we
-                # want all instances of the same class to have the same label.
-                primary_concept = concepts[0] if concepts else "object"
+                
+                # Create detection for each instance with correct label
                 for j, (box, class_id, conf) in enumerate(zip(boxes, class_ids, confidences)):
-                    # Use primary concept for all detections when bboxes are provided
-                    concept = primary_concept if bboxes is not None else (concepts[class_id] if class_id < len(concepts) else f"class_{class_id}")
+                    concept = concepts[class_id] if class_id < len(concepts) else f"class_{class_id}"
                     detections.append({
                         "bbox": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
                         "label": concept,
@@ -229,7 +222,7 @@ def run_sam3(
                         "area": float((box[2] - box[0]) * (box[3] - box[1])),
                         "center": [float((box[0] + box[2]) / 2), float((box[1] + box[3]) / 2)],
                     })
-
+            
             # Extract masks if available
             if hasattr(result, 'masks') and result.masks is not None:
                 mask_data = result.masks.data
@@ -271,12 +264,14 @@ def run_sam3(
             # No masks but we have detections - create overlay from bounding boxes
             combined_mask = np.zeros(image.shape[:2], dtype=np.uint8)
             mask_overlay = image.copy()
-            # Draw bounding boxes on overlay (bboxes are in x1, y1, x2, y2 format)
+            # Draw bounding boxes on overlay (bboxes are in x1, y1, w, h format)
             for det in detections:
-                x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
+                x1, y1, w, h = [int(v) for v in det["bbox"]]
+                x2 = x1 + w
+                y2 = y1 + h
                 cv2.rectangle(mask_overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 label = det.get("label", "")
-                cv2.putText(mask_overlay, label, (x1, y1 - 5),
+                cv2.putText(mask_overlay, label, (x1, y1 - 5), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         else:
             combined_mask = np.zeros(image.shape[:2], dtype=np.uint8)
@@ -499,8 +494,8 @@ def run_qwen(
         # Parse output based on format
         parsed_output = parse_output(raw_response, output_format)
         print(f"Parsed output: {parsed_output}")
-        # Keep Qwen bounding boxes in x1,y1,x2,y2 format (pixel coordinates)
-        # No conversion to xywh is performed.
+        # Convert any x1,y1,x2,y2 bounding boxes returned by Qwen into x,y,w,h format
+        parsed_output = convert_bboxes_to_xywh(parsed_output)
         
         if log_callback:
             log_callback(f"Response received. Length: {len(raw_response)} chars")
@@ -530,219 +525,6 @@ def run_qwen(
         return {
             "success": False,
             "error": f"Qwen3.6 inference failed: {str(e)}",
-        }
-
-
-def run_gemini(
-    prompt: str,
-    template_id: Optional[str] = None,
-    output_format: str = "json",
-    image_path: Optional[str | Path] = None,
-    api_base_url: str = "https://api.hku.hk/gemini/student",
-    deployment_id: str = "gemini-3.5-flash",
-    timeout: int = 120,
-    system_instruction: Optional[str] = None,
-    temperature: Optional[float] = None,
-    top_p: Optional[float] = None,
-    top_k: Optional[int] = None,
-    thinking_budget: Optional[int] = None,
-    progress_callback: Optional[Callable[[int], None]] = None,
-    status_callback: Optional[Callable[[str], None]] = None,
-    log_callback: Optional[Callable[[str], None]] = None,
-    is_cancelled: Optional[Callable[[], bool]] = None,
-) -> Dict:
-    """
-    Run Gemini inference via HKU API proxy.
-    
-    Args:
-        prompt: Text prompt for the model
-        template_id: Optional template identifier for predefined prompts
-        output_format: Desired output format ('json', 'yaml', 'bbox', 'text')
-        image_path: Image path for multimodal input (required for object detection)
-        api_base_url: Gemini API base URL
-        deployment_id: Model deployment ID (e.g., 'gemini-3.5-flash')
-        timeout: Request timeout in seconds
-        system_instruction: Optional system instruction to set model role/style
-        temperature: Controls randomness (0.0-1.0, higher = more creative)
-        top_p: Controls nucleus sampling (0.0-1.0)
-        top_k: Limits sampling pool to top K tokens
-        thinking_budget: Max tokens for model's internal reasoning
-        progress_callback: Callback for progress updates
-        status_callback: Callback for status messages
-        log_callback: Callback for log messages
-        is_cancelled: Callback to check if operation should be cancelled
-    
-    Returns:
-        Dictionary with inference results:
-            - success: Boolean
-            - response: Raw model response
-            - parsed_output: Parsed output in requested format
-            - format: Output format used
-            - model: Model name used
-    """
-    if status_callback:
-        status_callback("Preparing Gemini request...")
-    
-    if log_callback:
-        log_callback(f"Prompt: {prompt[:100]}...")
-        log_callback(f"Model: {deployment_id}")
-        log_callback(f"Output format: {output_format}")
-    
-    # Apply template if provided
-    if template_id:
-        prompt = apply_prompt_template(prompt, template_id)
-    
-    # Add format instruction to prompt
-    format_instruction = get_format_instruction(output_format)
-    full_prompt = f"{prompt}\n\n{format_instruction}"
-    
-    try:
-        if progress_callback:
-            progress_callback(10)
-        
-        # Build the contents array
-        contents_parts = []
-        
-        # Add image if provided
-        if image_path is not None:
-            image_file = Path(image_path)
-            if not image_file.exists():
-                return {"success": False, "error": f"Image not found: {image_file}"}
-            
-            # Read and encode image
-            with open(image_file, "rb") as f:
-                image_data = base64.b64encode(f.read()).decode("utf-8")
-            
-            # Determine MIME type from file extension
-            suffix = image_file.suffix.lower()
-            mime_map = {
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg',
-                '.png': 'image/png',
-                '.gif': 'image/gif',
-                '.webp': 'image/webp',
-                '.bmp': 'image/bmp',
-            }
-            mime_type = mime_map.get(suffix, 'image/jpeg')
-            
-            contents_parts.append({
-                "inline_data": {
-                    "mime_type": mime_type,
-                    "data": image_data
-                }
-            })
-        
-        # Add text prompt
-        contents_parts.append({"text": full_prompt})
-        
-        # Build request payload
-        payload = {
-            "contents": [{
-                "role": "user",
-                "parts": contents_parts
-            }]
-        }
-        
-        # Add system instruction if provided
-        if system_instruction:
-            payload["system_instruction"] = {
-                "parts": [{"text": system_instruction}]
-            }
-        
-        # Build generation config
-        generation_config = {}
-        if temperature is not None:
-            generation_config["temperature"] = temperature
-        if top_p is not None:
-            generation_config["topP"] = top_p
-        if top_k is not None:
-            generation_config["topK"] = top_k
-        if thinking_budget is not None:
-            generation_config["thinkingConfig"] = {"thinkingBudget": thinking_budget}
-        
-        if generation_config:
-            payload["generationConfig"] = generation_config
-        
-        if status_callback:
-            status_callback("Sending request to Gemini API...")
-        
-        if progress_callback:
-            progress_callback(30)
-        
-        # Make API request
-        api_url = f"{api_base_url}/{deployment_id}:generateContent"
-        print(f"Sending request to Gemini API at {api_url}...")
-        
-        response = requests.post(
-            api_url,
-            json=payload,
-            timeout=timeout,
-        )
-        
-        if progress_callback:
-            progress_callback(70)
-        
-        if response.status_code != 200:
-            return {
-                "success": False,
-                "error": f"Gemini API error: {response.status_code} - {response.text}",
-            }
-        
-        result = response.json()
-        
-        # Parse Gemini response format
-        # Response structure: candidates[0].content.parts[0].text
-        raw_response = ""
-        if "candidates" in result and len(result["candidates"]) > 0:
-            candidate = result["candidates"][0]
-            if "content" in candidate and "parts" in candidate["content"]:
-                parts = candidate["content"]["parts"]
-                for part in parts:
-                    if "text" in part:
-                        raw_response += part["text"]
-        
-        if not raw_response:
-            return {
-                "success": False,
-                "error": "No text content in Gemini response",
-                "raw_response": result,
-            }
-        
-        if status_callback:
-            status_callback("Parsing response...")
-        
-        # Parse output based on format
-        parsed_output = parse_output(raw_response, output_format)
-        print(f"Parsed output: {parsed_output}")
-        
-        if log_callback:
-            log_callback(f"Response received. Length: {len(raw_response)} chars")
-        
-        if progress_callback:
-            progress_callback(100)
-        
-        return {
-            "success": True,
-            "response": raw_response,
-            "parsed_output": parsed_output,
-            "format": output_format,
-            "model": deployment_id,
-        }
-        
-    except requests.exceptions.Timeout:
-        return {
-            "success": False,
-            "error": f"Request timed out after {timeout} seconds",
-        }
-    except requests.exceptions.ConnectionError:
-        return {
-            "success": False,
-            "error": f"Could not connect to Gemini API at {api_base_url}.",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Gemini inference failed: {str(e)}",
         }
 
 
@@ -819,7 +601,7 @@ def parse_output(response: str, output_format: str) -> Any:
                         x1, y1, x2, y2 = [float(p.strip()) for p in parts[1:5]]
                         bboxes.append({
                             "class": parts[0].strip(),
-                            "bbox": [x1, y1, x2, y2],
+                            "bbox": [x1, y1, x2 - x1, y2 - y1],
                         })
                 except:
                     pass
@@ -829,6 +611,25 @@ def parse_output(response: str, output_format: str) -> Any:
         return response
 
 
+def convert_bboxes_to_xywh(parsed_output: Any) -> Any:
+    """Convert bounding boxes from x1,y1,x2,y2 format to x,y,w,h format.
+    
+    Recursively walks through parsed JSON/YAML output and converts any
+    bbox_2d or bbox field with 4 values from [x1, y1, x2, y2] to [x, y, w, h].
+    """
+    if isinstance(parsed_output, dict):
+        converted = {}
+        for key, value in parsed_output.items():
+            if key in ("bbox_2d", "bbox") and isinstance(value, (list, tuple)) and len(value) == 4:
+                x1, y1, x2, y2 = value
+                converted[key] = [x1, y1, x2 - x1, y2 - y1]
+            else:
+                converted[key] = convert_bboxes_to_xywh(value)
+        return converted
+    elif isinstance(parsed_output, list):
+        return [convert_bboxes_to_xywh(item) for item in parsed_output]
+    else:
+        return parsed_output
 
 
 def list_ollama_models(ollama_base_url: str = "http://localhost:11434") -> Dict:
