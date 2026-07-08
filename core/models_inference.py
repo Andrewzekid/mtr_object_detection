@@ -67,6 +67,17 @@ from typing import Optional, Callable, Dict, Any, List, Tuple
 import json
 import requests
 import base64
+import os
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load from core/.env
+    _env_path = Path(__file__).parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # python-dotenv not installed, will use os.environ directly
 
 
 def run_sam3(
@@ -397,7 +408,8 @@ def run_qwen(
     prompt: str,
     template_id: Optional[str] = None,
     output_format: str = "json",
-    image_path: Optional[str | Path] = None,
+    image_path: Optional[str | Path | List[str | Path]] = None,
+    conditioning_images: Optional[List[Dict[str, str]]] = None,
     ollama_base_url: str = "http://localhost:11434",
     model_name: str = "qwen3.6",
     timeout: int = 120,
@@ -413,7 +425,11 @@ def run_qwen(
         prompt: Text prompt for the model
         template_id: Optional template identifier for predefined prompts
         output_format: Desired output format ('json', 'yaml', 'bbox', 'text')
-        image_path: Optional image path for multimodal input
+        image_path: Optional image path for multimodal input. Can be a single path
+                    or a list of paths (for multiple images).
+        conditioning_images: Optional list of conditioning/reference images for few-shot
+                             visual prompting. Each item is a dict with 'label' (class name)
+                             and 'path' (image path). These are prepended before the main image.
         ollama_base_url: Ollama API base URL
         model_name: Model name in Ollama
         timeout: Request timeout in seconds
@@ -456,17 +472,43 @@ def run_qwen(
             "stream": False,
         }
         print(f"Sending request to Ollama at {ollama_base_url} with model {model_name}... prompt: {full_prompt}...")
-        # If image is provided, encode it
+        
+        # Collect all images: conditioning images first, then main image
+        all_images = []
+        
+        # Encode conditioning images
+        if conditioning_images:
+            for cond_img in conditioning_images:
+                cond_path = Path(cond_img["path"])
+                if not cond_path.exists():
+                    return {"success": False, "error": f"Conditioning image not found: {cond_path}"}
+                with open(cond_path, "rb") as f:
+                    cond_data = base64.b64encode(f.read()).decode("utf-8")
+                all_images.append(cond_data)
+                if log_callback:
+                    log_callback(f"Conditioning image: {cond_img['label']} -> {cond_path}")
+        
+        # Encode main image(s)
         if image_path is not None:
-            image_file = Path(image_path)
-            if not image_file.exists():
-                return {"success": False, "error": f"Image not found: {image_file}"}
-            
-            # Read and encode image
-            with open(image_file, "rb") as f:
-                image_data = base64.b64encode(f.read()).decode("utf-8")
-            
-            payload["images"] = [image_data]
+            # Handle both single path and list of paths
+            if isinstance(image_path, list):
+                for img_path in image_path:
+                    image_file = Path(img_path)
+                    if not image_file.exists():
+                        return {"success": False, "error": f"Image not found: {image_file}"}
+                    with open(image_file, "rb") as f:
+                        image_data = base64.b64encode(f.read()).decode("utf-8")
+                    all_images.append(image_data)
+            else:
+                image_file = Path(image_path)
+                if not image_file.exists():
+                    return {"success": False, "error": f"Image not found: {image_file}"}
+                with open(image_file, "rb") as f:
+                    image_data = base64.b64encode(f.read()).decode("utf-8")
+                all_images.append(image_data)
+        
+        if all_images:
+            payload["images"] = all_images
         
         if status_callback:
             status_callback("Sending request to Ollama...")
@@ -530,6 +572,235 @@ def run_qwen(
         return {
             "success": False,
             "error": f"Qwen3.6 inference failed: {str(e)}",
+        }
+
+
+def run_qwen_api(
+    prompt: str,
+    template_id: Optional[str] = None,
+    output_format: str = "json",
+    image_path: Optional[str | Path | List[str | Path]] = None,
+    conditioning_images: Optional[List[Dict[str, str]]] = None,
+    api_key: Optional[str] = None,
+    base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    model_name: str = "qwen3.7-plus",
+    timeout: int = 120,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
+) -> Dict:
+    """
+    Run Qwen VL Plus inference via Aliyun DashScope API (OpenAI-compatible).
+    
+    This function uses the OpenAI-compatible API to call Qwen vision-language models
+    for object detection and image understanding tasks.
+    
+    Args:
+        prompt: Text prompt for the model
+        template_id: Optional template identifier for predefined prompts
+        output_format: Desired output format ('json', 'yaml', 'bbox', 'text')
+        image_path: Optional image path for multimodal input. Can be a single path
+                    or a list of paths (for multiple images).
+        conditioning_images: Optional list of conditioning/reference images for few-shot
+                             visual prompting. Each item is a dict with 'label' (class name)
+                             and 'path' (image path). These are prepended before the main image.
+        api_key: API key (if None, loads from API_KEY environment variable)
+        base_url: Aliyun DashScope API base URL
+        model_name: Model name (e.g., 'qwen-vl-plus', 'qwen-vl-max')
+        timeout: Request timeout in seconds
+        progress_callback: Callback for progress updates
+        status_callback: Callback for status messages
+        log_callback: Callback for log messages
+        is_cancelled: Callback to check if operation should be cancelled
+    
+    Returns:
+        Dictionary with inference results:
+            - success: Boolean
+            - response: Raw model response
+            - parsed_output: Parsed output in requested format
+            - format: Output format used
+            - model: Model name used
+    """
+    if status_callback:
+        status_callback("Preparing Qwen API request...")
+    
+    if log_callback:
+        log_callback(f"Prompt: {prompt[:100]}...")
+        log_callback(f"Model: {model_name}")
+        log_callback(f"Output format: {output_format}")
+    
+    # Apply template if provided
+    if template_id:
+        prompt = apply_prompt_template(prompt, template_id)
+    
+    # Add format instruction to prompt
+    format_instruction = get_format_instruction(output_format)
+    full_prompt = f"{prompt}\n\n{format_instruction}"
+    
+    # Get API key
+    if api_key is None:
+        api_key = os.getenv("API_KEY")
+    
+    if not api_key:
+        return {
+            "success": False,
+            "error": "API key not provided. Set API_KEY environment variable or pass api_key parameter.",
+        }
+    
+    try:
+        from openai import OpenAI
+        
+        if progress_callback:
+            progress_callback(10)
+        
+        # Create OpenAI client with Aliyun base URL
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+        )
+        
+        if status_callback:
+            status_callback("Building request...")
+        
+        # Build message content
+        content_parts = []
+        
+        # Helper to encode an image and return (base64_data, mime_type)
+        def _encode_image(img_path):
+            img_file = Path(img_path)
+            if not img_file.exists():
+                return None, None
+            with open(img_file, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+            suffix = img_file.suffix.lower()
+            mime_map = {
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.png': 'image/png',
+                '.gif': 'image/gif',
+                '.webp': 'image/webp',
+                '.bmp': 'image/bmp',
+            }
+            return img_data, mime_map.get(suffix, 'image/jpeg')
+        
+        # Add conditioning images with labels
+        if conditioning_images:
+            for cond_img in conditioning_images:
+                cond_data, cond_mime = _encode_image(cond_img["path"])
+                if cond_data is None:
+                    return {"success": False, "error": f"Conditioning image not found: {cond_img['path']}"}
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{cond_mime};base64,{cond_data}"
+                    }
+                })
+                content_parts.append({
+                    "type": "text",
+                    "text": f"Reference image for class: {cond_img['label']}"
+                })
+                if log_callback:
+                    log_callback(f"Conditioning image: {cond_img['label']} -> {cond_img['path']}")
+        
+        # Add main image(s)
+        if image_path is not None:
+            if isinstance(image_path, list):
+                for img_path in image_path:
+                    img_data, img_mime = _encode_image(img_path)
+                    if img_data is None:
+                        return {"success": False, "error": f"Image not found: {img_path}"}
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{img_mime};base64,{img_data}"
+                        }
+                    })
+            else:
+                img_data, img_mime = _encode_image(image_path)
+                if img_data is None:
+                    image_file = Path(image_path)
+                    return {"success": False, "error": f"Image not found: {image_file}"}
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{img_mime};base64,{img_data}"
+                    }
+                })
+        
+        # Add text prompt
+        content_parts.append({
+            "type": "text",
+            "text": full_prompt
+        })
+        
+        # Build messages
+        messages = [{
+            "role": "user",
+            "content": content_parts
+        }]
+        
+        if status_callback:
+            status_callback("Sending request to Qwen API...")
+        
+        if progress_callback:
+            progress_callback(30)
+        
+        print(f"Sending request to Qwen API at {base_url} with model {model_name}...")
+        
+        # Make API request (non-streaming)
+        completion = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+        )
+        
+        if progress_callback:
+            progress_callback(70)
+        
+        # Extract response
+        raw_response = ""
+        if completion.choices and len(completion.choices) > 0:
+            message = completion.choices[0].message
+            if message.content:
+                raw_response = message.content
+        
+        if not raw_response:
+            return {
+                "success": False,
+                "error": "No text content in Qwen API response",
+                "raw_response": completion,
+            }
+        
+        if status_callback:
+            status_callback("Parsing response...")
+        
+        # Parse output based on format
+        parsed_output = parse_output(raw_response, output_format)
+        print(f"Parsed output: {parsed_output}")
+        
+        if log_callback:
+            log_callback(f"Response received. Length: {len(raw_response)} chars")
+        
+        if progress_callback:
+            progress_callback(100)
+        
+        return {
+            "success": True,
+            "response": raw_response,
+            "parsed_output": parsed_output,
+            "format": output_format,
+            "model": model_name,
+        }
+        
+    except ImportError:
+        return {
+            "success": False,
+            "error": "openai package not installed. Install with: pip install openai",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Qwen API inference failed: {str(e)}",
         }
 
 

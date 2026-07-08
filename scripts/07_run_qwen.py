@@ -37,6 +37,7 @@ OUTPUT:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -45,7 +46,137 @@ import cv2
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.models_inference import run_qwen, list_ollama_models
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent.parent / "core" / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # python-dotenv not installed, will use os.environ directly
+
+from core.models_inference import run_qwen, run_qwen_api, list_ollama_models
+
+
+def get_api_key(args):
+    """Resolve the API key from args or environment variables.
+    
+    Priority:
+    1. --api-key-env: Use the specified environment variable (e.g., PREMIUM_KEY)
+    2. --api-key: Use the directly provided API key
+    3. API_KEY: Use the default API_KEY environment variable
+    """
+    if args.api_key_env:
+        key = os.getenv(args.api_key_env)
+        if key:
+            return key
+        else:
+            print(f"Warning: Environment variable '{args.api_key_env}' not found or empty")
+    
+    if args.api_key:
+        return args.api_key
+    
+    return os.getenv("API_KEY")
+
+
+# Supported image extensions
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+
+
+# Default class descriptions for MTR station object detection.
+# Keys match the conditioning image filenames (underscores replaced with spaces).
+MTR_CLASS_DESCRIPTIONS = {
+    "ceiling light": "a flat and horizontal rectangular strip light mounted on the ceiling. Do NOT detect reflections of lights in glass or walls — if there are lights visible in the green wall, they are likely reflections. Consider carefully whether each detection is an actual light or a reflection. Detect individual ceiling lights separately; do not cluster them together.",
+    "light": "a flat and horizontal rectangular strip light mounted on the ceiling. Do NOT detect reflections of lights in glass or walls — if there are lights visible in the green wall, they are likely reflections. Consider carefully whether each detection is an actual light or a reflection. Detect individual ceiling lights separately; do not cluster them together.",
+    "exit sign": "a hanging monitor/display showing the lime-green character 出 along with letters and arrows indicating directions. It is a hanging LCD screen, not a wall poster.",
+    "advertisement board": "a flat LCD screen mounted on the green wall that displays commercial/advertising content only, NOT directions. These are NOT TVs and NOT maps.",
+    "ticket gate": "turnstiles/gates that passengers pass through after tapping their ticket/card. Do NOT classify ticket vending machines as ticket gates.",
+    "map": "a poster/sign that shows MTR station directions, routes, and which way to go. It is a static poster, not an electronic display.",
+    "tv": "an LCD screen hanging from the ceiling that does NOT contain directions or symbols. It displays general content (news, ads, etc.), not wayfinding information.",
+}
+
+
+def load_conditioning_images(folder_path):
+    """Load conditioning images from a folder.
+    
+    Each image file in the folder becomes a conditioning image.
+    The class name is derived from the filename (without extension),
+    with underscores replaced by spaces.
+    
+    Args:
+        folder_path: Path to folder containing reference images
+    
+    Returns:
+        List of dicts with 'label' (class name) and 'path' (image path)
+    """
+    folder = Path(folder_path)
+    if not folder.exists() or not folder.is_dir():
+        print(f"Error: Conditioning images folder not found: {folder}")
+        return []
+    
+    conditioning = []
+    for img_file in sorted(folder.iterdir()):
+        if img_file.is_file() and img_file.suffix.lower() in IMAGE_EXTENSIONS:
+            # Derive class name from filename (without extension)
+            class_name = img_file.stem.replace("_", " ")
+            conditioning.append({
+                "label": class_name,
+                "path": str(img_file),
+            })
+    
+    return conditioning
+
+
+def build_conditioning_prompt(conditioning_images, original_prompt, class_descriptions=None):
+    """Build an enhanced prompt that references conditioning images.
+    
+    Args:
+        conditioning_images: List of dicts with 'label' and 'path'
+        original_prompt: The user's original prompt
+        class_descriptions: Optional dict mapping class names to detailed descriptions.
+                           If None, uses MTR_CLASS_DESCRIPTIONS as default.
+    
+    Returns:
+        Enhanced prompt string
+    """
+    if not conditioning_images:
+        return original_prompt
+    
+    if class_descriptions is None:
+        class_descriptions = MTR_CLASS_DESCRIPTIONS
+    
+    class_names = [img["label"] for img in conditioning_images]
+    num_refs = len(conditioning_images)
+    main_image_num = num_refs + 1
+    
+    # Build reference description with per-class details
+    ref_lines = []
+    for i, img in enumerate(conditioning_images, 1):
+        label = img["label"]
+        desc = class_descriptions.get(label, "")
+        if desc:
+            ref_lines.append(f"- Image {i}: Reference for \"{label}\" — {desc}")
+        else:
+            ref_lines.append(f"- Image {i}: Reference for \"{label}\"")
+    
+    ref_text = "\n".join(ref_lines)
+    
+    # Build the enhanced prompt
+    enhanced = (
+        f"You will be given {main_image_num} images. "
+        f"The first {num_refs} are reference examples (one per class), "
+        f"and image {main_image_num} is the main scene to analyze.\n\n"
+        f"REFERENCE IMAGES:\n"
+        f"{ref_text}\n\n"
+        f"MAIN IMAGE:\n"
+        f"- Image {main_image_num}: The scene to analyze.\n\n"
+        f"Detect all instances of: {', '.join(class_names)}.\n"
+        f"Use the reference images to understand what each class looks like "
+        f"and compare objects in the main image against these references.\n\n"
+        f"{original_prompt}"
+    )
+    
+    return enhanced
 
 
 def parse_args():
@@ -205,12 +336,59 @@ Templates:
         default=None,
         help="Output folder for split-by-class annotations (default: <output>/annotations/). Only used with --split-by-class.",
     )
+    
+    # API mode arguments
+    parser.add_argument(
+        "--use-api",
+        action="store_true",
+        help="Use Aliyun DashScope API (qwen-vl-plus) instead of local Ollama",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for Aliyun DashScope (if not provided, loads from API_KEY env variable)",
+    )
+    parser.add_argument(
+        "--api-key-env",
+        type=str,
+        default=None,
+        help="Environment variable name to use for API key (e.g., PREMIUM_KEY). "
+             "Overrides --api-key and API_KEY env variable.",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=int,
+        default=None,
+        help="Resume from this image number (1-indexed) in batch mode. "
+             "Images before this number will be skipped.",
+    )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        help="Base URL for Aliyun DashScope API (default: https://dashscope-intl.aliyuncs.com/compatible-mode/v1)",
+    )
+    parser.add_argument(
+        "--api-model",
+        type=str,
+        default="qwen3.7-plus",
+        help="Model name for API mode (default: qwen3.7-plus)",
+    )
+
+    # Conditioning images argument
+    parser.add_argument(
+        "--conditioning-images", "-c",
+        type=str,
+        default=None,
+        help="Path to folder containing reference/conditioning images (one per class). "
+             "Filename (without extension) becomes the class name. "
+             "Underscores in filenames are converted to spaces. "
+             "Example: --conditioning-images ./ref_images/ where ref_images/ contains "
+             "ceiling_light.jpg, sign.jpg, etc.",
+    )
 
     return parser.parse_args()
-
-
-# Supported image extensions
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
 
 
 def extract_bboxes_from_output(parsed_output):
@@ -289,7 +467,7 @@ def generate_visualization(image_path, vis_path, parsed_output, coord_scale):
     return True
 
 
-def process_single_image(args, image_path, output_dir=None, vis_dir=None):
+def process_single_image(args, image_path, output_dir=None, vis_dir=None, conditioning_images=None):
     """Process a single image with Qwen3.6.
     
     Args:
@@ -297,6 +475,7 @@ def process_single_image(args, image_path, output_dir=None, vis_dir=None):
         image_path: Path to input image
         output_dir: Directory to save JSON output (for batch mode)
         vis_dir: Directory to save visualization (for batch mode)
+        conditioning_images: Optional list of conditioning images (dicts with 'label' and 'path')
     
     Returns:
         dict with processing results
@@ -304,17 +483,45 @@ def process_single_image(args, image_path, output_dir=None, vis_dir=None):
     print(f"\nProcessing: {image_path.name}")
     print(f"  Image: {image_path}")
     
-    # Run Qwen3.6
-    result = run_qwen(
-        prompt=args.prompt,
-        template_id=args.template,
-        output_format=args.format,
-        image_path=str(image_path),
-        ollama_base_url=args.ollama_url,
-        model_name=args.model,
-        timeout=args.timeout,
-        log_callback=lambda msg: print(f"  {msg}"),
-    )
+    # Build the prompt (with conditioning info if provided)
+    prompt = args.prompt
+    if conditioning_images:
+        prompt = build_conditioning_prompt(conditioning_images, args.prompt)
+        print(f"  Conditioning images: {len(conditioning_images)} reference(s)")
+        for ci in conditioning_images:
+            print(f"    - {ci['label']}: {ci['path']}")
+    
+    # Choose between API mode and Ollama mode
+    if args.use_api:
+        # Resolve API key
+        api_key = get_api_key(args)
+        
+        # Run Qwen via Aliyun DashScope API
+        result = run_qwen_api(
+            prompt=prompt,
+            template_id=args.template,
+            output_format=args.format,
+            image_path=str(image_path),
+            conditioning_images=conditioning_images,
+            api_key=api_key,
+            base_url=args.base_url,
+            model_name=args.api_model,
+            timeout=args.timeout,
+            log_callback=lambda msg: print(f"  {msg}"),
+        )
+    else:
+        # Run Qwen3.6 via Ollama
+        result = run_qwen(
+            prompt=prompt,
+            template_id=args.template,
+            output_format=args.format,
+            image_path=str(image_path),
+            conditioning_images=conditioning_images,
+            ollama_base_url=args.ollama_url,
+            model_name=args.model,
+            timeout=args.timeout,
+            log_callback=lambda msg: print(f"  {msg}"),
+        )
     
     if not result.get("success"):
         print(f"  Error: {result.get('error', 'Unknown error')}")
@@ -451,7 +658,18 @@ def process_image_folder(args):
         print(f"Supported extensions: {', '.join(sorted(IMAGE_EXTENSIONS))}")
         sys.exit(1)
     
-    print(f"Found {len(image_files)} image(s) in {folder_path}")
+    total_images = len(image_files)
+    print(f"Found {total_images} image(s) in {folder_path}")
+    
+    # Handle resume-from: filter images to process
+    start_index = 0
+    if args.resume_from is not None:
+        # resume_from is 1-indexed, convert to 0-indexed
+        start_index = max(0, args.resume_from - 1)
+        if start_index > 0:
+            print(f"Resuming from image {args.resume_from} (skipping first {start_index} images)")
+            image_files = image_files[start_index:]
+            print(f"Images to process: {len(image_files)}")
     
     # Setup output directories
     output_dir = Path(args.output) if args.output else folder_path / "qwen_results"
@@ -479,6 +697,17 @@ def process_image_folder(args):
     if vis_dir:
         print(f"Visualization directory: {vis_dir}")
     
+    # Load conditioning images if provided
+    conditioning_images = None
+    if args.conditioning_images:
+        conditioning_images = load_conditioning_images(args.conditioning_images)
+        if conditioning_images:
+            print(f"Conditioning images: {len(conditioning_images)} reference(s)")
+            for ci in conditioning_images:
+                print(f"  - {ci['label']}: {ci['path']}")
+        else:
+            print(f"Warning: No valid conditioning images found in {args.conditioning_images}")
+    
     # Process each image
     results = []
     successful = 0
@@ -487,7 +716,7 @@ def process_image_folder(args):
     
     for i, image_path in enumerate(image_files, 1):
         print(f"\n[{i}/{len(image_files)}]", end="")
-        result = process_single_image(args, image_path, output_dir, vis_dir)
+        result = process_single_image(args, image_path, output_dir, vis_dir, conditioning_images)
         
         # If split-by-class mode, process the annotations
         if args.split_by_class and result["success"] and result.get("parsed_output"):
@@ -576,8 +805,14 @@ def main():
             print(f"Error: Path is not a directory: {folder_path}")
             sys.exit(1)
         
-        print(f"Running Qwen3.6 batch inference...")
-        print(f"  Model: {args.model}")
+        if args.use_api:
+            print(f"Running Qwen API batch inference...")
+            print(f"  Model: {args.api_model}")
+            print(f"  Mode: Aliyun DashScope API")
+        else:
+            print(f"Running Qwen3.6 batch inference...")
+            print(f"  Model: {args.model}")
+            print(f"  Mode: Ollama (local)")
         print(f"  Template: {args.template or 'none'}")
         print(f"  Output format: {args.format}")
         print(f"  Prompt: {args.prompt[:100]}{'...' if len(args.prompt) > 100 else ''}")
@@ -595,25 +830,66 @@ def main():
             print(f"Error: Image not found: {image_path}")
             sys.exit(1)
     
-    print(f"Running Qwen3.6 inference...")
-    print(f"  Model: {args.model}")
+    # Determine mode and model info
+    if args.use_api:
+        print(f"Running Qwen API inference...")
+        print(f"  Model: {args.api_model}")
+        print(f"  Mode: Aliyun DashScope API")
+    else:
+        print(f"Running Qwen3.6 inference...")
+        print(f"  Model: {args.model}")
+        print(f"  Mode: Ollama (local)")
+    
     print(f"  Template: {args.template or 'none'}")
     print(f"  Output format: {args.format}")
     print(f"  Prompt: {args.prompt[:100]}{'...' if len(args.prompt) > 100 else ''}")
     if args.image:
         print(f"  Image: {args.image}")
     
-    # Run Qwen3.6
-    result = run_qwen(
-        prompt=args.prompt,
-        template_id=args.template,
-        output_format=args.format,
-        image_path=args.image,
-        ollama_base_url=args.ollama_url,
-        model_name=args.model,
-        timeout=args.timeout,
-        log_callback=lambda msg: print(f"  {msg}"),
-    )
+    # Load conditioning images if provided
+    conditioning_images = None
+    if args.conditioning_images:
+        conditioning_images = load_conditioning_images(args.conditioning_images)
+        if conditioning_images:
+            print(f"  Conditioning images: {len(conditioning_images)} reference(s)")
+            for ci in conditioning_images:
+                print(f"    - {ci['label']}: {ci['path']}")
+        else:
+            print(f"  Warning: No valid conditioning images found in {args.conditioning_images}")
+    
+    # Build the prompt (with conditioning info if provided)
+    prompt = args.prompt
+    if conditioning_images:
+        prompt = build_conditioning_prompt(conditioning_images, args.prompt)
+    
+    # Run inference based on mode
+    if args.use_api:
+        # Run Qwen via Aliyun DashScope API
+        result = run_qwen_api(
+            prompt=prompt,
+            template_id=args.template,
+            output_format=args.format,
+            image_path=args.image,
+            conditioning_images=conditioning_images,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            model_name=args.api_model,
+            timeout=args.timeout,
+            log_callback=lambda msg: print(f"  {msg}"),
+        )
+    else:
+        # Run Qwen3.6 via Ollama
+        result = run_qwen(
+            prompt=prompt,
+            template_id=args.template,
+            output_format=args.format,
+            image_path=args.image,
+            conditioning_images=conditioning_images,
+            ollama_base_url=args.ollama_url,
+            model_name=args.model,
+            timeout=args.timeout,
+            log_callback=lambda msg: print(f"  {msg}"),
+        )
     
     if not result.get("success"):
         print(f"\nError: {result.get('error', 'Unknown error')}")

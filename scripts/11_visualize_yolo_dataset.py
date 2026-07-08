@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+python scripts/11_visualize_yolo_dataset.py --dataset train_yolo_detection 
+--split train --output output/vis_yolo_train_detection 
 Visualize bounding boxes from YOLO format dataset.
 Reads images and labels, draws bounding boxes with class names, and saves annotated images.
 """
