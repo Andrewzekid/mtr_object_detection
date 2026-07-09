@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-Evaluate a trained YOLO model and generate visualizations.
-
-This script evaluates a trained YOLO model on test data, calculates metrics
-(mAP, precision, recall), and generates prediction visualizations.
+Script to evaluate detection/segmentation models using ModelEvaluator class.
 
 USAGE:
-    python scripts/05_evaluate_model.py --model ./output/training/yolo_training/weights/best.pt \\
-        --test-data ./output/split/dataset.yaml
-    python scripts/05_evaluate_model.py --model ./best.pt --test-data ./dataset.yaml \\
-        --visualize --images-dir ./test_images
-    python scripts/05_evaluate_model.py --model ./best.pt --test-data ./dataset.yaml \\
-        --conf 0.5 --iou 0.5
+    python scripts/05_evaluate_model.py --model yolo26l.pt --data ../Datasets/yolo26l/dataset.yaml
+    python scripts/05_evaluate_model.py --model yolo26l-seg.pt --data ../Datasets/yolo26l_seg/dataset.yaml
 
-OUTPUT:
-    - Evaluation metrics (mAP, precision, recall)
-    - Per-class performance breakdown
-    - Prediction visualization images with bounding boxes
-    - JSON summary of results
+    # Compare predictions with ground truth
+    python scripts/05_evaluate_model.py --pred-json predictions.json --gt-json ground_truth.json
+
+    # Load GT from YOLO format labels
+    python scripts/05_evaluate_model.py --labels-dir ../Datasets/yolo26l/labels --images-dir ../Datasets/yolo26l/images
 """
 
 import argparse
@@ -26,350 +19,462 @@ import sys
 from pathlib import Path
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.model_evaluator import ModelEvaluator
-from core.visualizer import generate_prediction_visualizations
 
 
-def parse_args():
+# Supported image extensions
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+
+
+def load_bboxes_from_json(json_path):
+    """Load bounding boxes from a JSON file."""
+    json_file = Path(json_path)
+    if not json_file.exists():
+        print(f"Error: JSON file not found: {json_file}")
+        sys.exit(1)
+
+    with open(json_file, "r") as f:
+        data = json.load(f)
+
+    # Handle bare list format
+    if isinstance(data, list):
+        return data
+
+    # Handle wrapped format or Qwen output format
+    if isinstance(data, dict):
+        if "parsed_output" in data:
+            parsed = data["parsed_output"]
+            if isinstance(parsed, list):
+                bboxes = []
+                for item in parsed:
+                    if isinstance(item, dict) and "bbox_2d" in item:
+                        bboxes.append(item["bbox_2d"])
+                    elif isinstance(item, list) and len(item) == 4:
+                        bboxes.append(item)
+                return bboxes
+
+        if "bboxes" in data:
+            return data["bboxes"]
+        elif "bbox" in data:
+            bbox = data["bbox"]
+            return [bbox] if isinstance(bbox, list) and len(bbox) == 4 else bbox
+
+    print("Error: JSON file must contain a list of bboxes or a dict with 'bboxes' or 'parsed_output' key")
+    sys.exit(1)
+
+
+def load_predictions_from_json(json_path: str) -> list:
+    """Load predictions from a JSON file.
+
+    Expected format:
+    [
+        {"image_id": "img1.jpg", "class_id": 0, "bbox": [x1, y1, x2, y2], ...},
+        ...
+    ]
+
+    Returns:
+        List of prediction dictionaries
+    """
+    json_file = Path(json_path)
+    if not json_file.exists():
+        print(f"Error: Predictions JSON file not found: {json_file}")
+        sys.exit(1)
+
+    with open(json_file, "r") as f:
+        data = json.load(f)
+
+    # Handle different formats
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        # Try common keys
+        for key in ["predictions", "results", "data", "bboxes"]:
+            if key in data:
+                return data[key]
+
+        # Try direct use of dict if it looks like predictions
+        return data
+
+    print("Error: Predictions JSON file must contain a list or dict with 'predictions'/'results' key")
+    sys.exit(1)
+
+
+def load_gt_from_yolo(labels_dir: str, images_dir: str) -> list:
+    """Load ground truth from YOLO format label files.
+
+    Args:
+        labels_dir: Path to directory containing .txt label files
+        images_dir: Path to directory containing images
+
+    Returns:
+        List of ground truth dictionaries: {"image_id": ..., "class_id": ..., "bbox": [...]}
+    """
+    labels_path = Path(labels_dir)
+    images_path = Path(images_dir)
+
+    ground_truth = []
+
+    for label_file in labels_path.glob("*.txt"):
+        image_id = label_file.stem
+        image_file = images_path / f"{image_id}.jpg"
+
+        # Try different extensions
+        if not image_file.exists():
+            image_file = images_path / f"{image_id}.png"
+
+        if not image_file.exists():
+            continue
+
+        # Validate image is readable
+        import cv2
+        img = cv2.imread(str(image_file))
+        if img is None:
+            continue
+
+        # Read label file
+        with open(label_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 5:
+                    continue
+
+                class_id = int(parts[0])
+                x_center = float(parts[1])
+                y_center = float(parts[2])
+                width = float(parts[3])
+                height = float(parts[4])
+
+                # Convert to bounding box
+                x1 = x_center - width / 2
+                y1 = y_center - height / 2
+                x2 = x_center + width / 2
+                y2 = y_center + height / 2
+
+                ground_truth.append({
+                    "image_id": image_id,
+                    "class_id": class_id,
+                    "bbox": [x1, y1, x2, y2],
+                })
+
+    return ground_truth
+
+
+def evaluate_model(model_path: str, data_path: str, split: str = "val", conf_threshold: float = 0.5, iou_threshold: float = 0.5, log_callback=None):
+    """Evaluate model on unseen data.
+
+    Args:
+        model_path: Path to trained model (.pt file)
+        data_path: Path to dataset YAML file (or image folder)
+        split: Dataset split to use (val/test/unsupervised/default)
+        conf_threshold: Confidence threshold for predictions
+        iou_threshold: IoU threshold for matching
+        log_callback: Optional callback for logging messages
+
+    Returns:
+        Evaluation results dictionary
+    """
+    try:
+        evaluator = ModelEvaluator(model_path=model_path)
+    except Exception as e:
+        if log_callback:
+            log_callback(f"Error initializing model: {e}")
+        return {"success": False, "error": f"Failed to load model: {e}"}
+
+    if not evaluator.model_path or not evaluator.model_path.exists():
+        if log_callback:
+            log_callback(f"Error: Model file not found: {evaluator.model_path}")
+        return {"success": False, "error": f"Model file not found: {evaluator.model_path}"}
+
+    # Set test data path (with split support)
+    if log_callback:
+        log_callback(f"Evaluating model: {evaluator.model_path}")
+        log_callback(f"Test data: {data_path}")
+        log_callback(f"Split: {split}")
+
+    try:
+        result = evaluator.evaluate_unseen(
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            model_path=model_path,
+            test_data_path=data_path,
+            split=split,
+            log_callback=log_callback,
+        )
+
+        if result.get("success"):
+            if log_callback:
+                log_callback(f"✓ Evaluation successful")
+                log_callback(f"  mAP50: {result['metrics'].get('mAP50', 'N/A'):.4f}")
+                log_callback(f"  mAP50-95: {result['metrics'].get('mAP50_95', 'N/A'):.4f}")
+
+            return result
+        else:
+            if log_callback:
+                log_callback(f"✗ Evaluation failed: {result.get('error', 'Unknown error')}")
+            return result
+
+    except Exception as e:
+        if log_callback:
+            log_callback(f"✗ Evaluation failed with exception: {e}")
+        return {"success": False, "error": f"Evaluation failed: {e}"}
+
+
+def compare_with_gt(predictions: list, ground_truth: list, iou_threshold: float = 0.5):
+    """Compare predictions with ground truth.
+
+    Args:
+        predictions: List of prediction dicts with "image_id", "class_id", "bbox"
+        ground_truth: List of ground truth dicts with "image_id", "class_id", "bbox"
+        iou_threshold: IoU threshold for matching
+
+    Returns:
+        Comparison results dictionary
+    """
+    try:
+        evaluator = ModelEvaluator()
+        result = evaluator.compare_with_gt(
+            predictions=predictions,
+            ground_truth=ground_truth,
+            iou_threshold=iou_threshold,
+        )
+        return result
+    except Exception as e:
+        return {"success": False, "error": f"Comparison failed: {e}"}
+
+
+def main():
+    """Main entry point for the script."""
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained YOLO model and generate visualizations",
+        description="Evaluate detection/segmentation models using ModelEvaluator class.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-    # Basic evaluation on test set
-    python scripts/05_evaluate_model.py \\
-        --model ./output/training/yolo_training/weights/best.pt \\
-        --test-data ./output/split/dataset.yaml
+EXAMPLES:
+    # Evaluate model on unseen data
+    python 05_evaluate_model.py --model yolo26l.pt --data ../Datasets/yolo26l/dataset.yaml
 
-    # Evaluation with custom thresholds
-    python scripts/05_evaluate_model.py \\
-        --model ./output/training/yolo_training/weights/best.pt \\
-        --test-data ./output/split/dataset.yaml \\
-        --conf 0.5 --iou 0.5
+    # Evaluate segmentation model
+    python 05_evaluate_model.py --model yolo26l-seg.pt --data ../Datasets/yolo26l_seg/dataset.yaml
 
-    # Evaluation with prediction visualizations
-    python scripts/05_evaluate_model.py \\
-        --model ./output/training/yolo_training/weights/best.pt \\
-        --test-data ./output/split/dataset.yaml \\
-        --visualize --images-dir ./test_images \\
-        --output-dir ./output/evaluation
+    # Compare predictions with ground truth
+    python 05_evaluate_model.py --pred-json predictions.json --gt-json ground_truth.json
 
-    # Save results to JSON
-    python scripts/05_evaluate_model.py \\
-        --model ./output/training/yolo_training/weights/best.pt \\
-        --test-data ./output/split/dataset.yaml \\
-        --output ./output/evaluation/results.json
+    # Load GT from YOLO format
+    python 05_evaluate_model.py --labels-dir ../Datasets/yolo26l/labels --images-dir ../Datasets/yolo26l/images
 
-Metrics Explained:
-    mAP50      - Mean Average Precision at IoU=0.50
-    mAP50-95   - Mean Average Precision averaged over IoU thresholds 0.50-0.95
-    Precision  - Ratio of true positives to all positive predictions
-    Recall     - Ratio of true positives to all actual positives
-
-Output Structure:
-    output_dir/
-    ├── evaluation_results.json
-    ├── prediction_images/
-    │   ├── img1_pred.jpg
-    │   └── img2_pred.jpg
-    └── summary.json
-        """,
+    # Use custom thresholds
+    python 05_evaluate_model.py --model yolo26l.pt --data dataset.yaml --conf 0.4
+        """
     )
 
+    # Model and data arguments
     parser.add_argument(
         "--model", "-m",
         type=str,
-        required=True,
-        help="Path to trained YOLO model (.pt file)",
+        default=None,
+        help="Path to trained model (.pt file). Default: ./best.pt",
     )
     parser.add_argument(
-        "--test-data", "-t",
+        "--data", "-d",
         type=str,
-        required=True,
-        help="Path to dataset YAML file or test directory",
+        default=None,
+        help="Path to dataset YAML file (for evaluation on unseen data)",
     )
     parser.add_argument(
-        "--conf",
-        type=float,
-        default=0.25,
-        help="Confidence threshold for detections (0.0-1.0, default: 0.25)",
+        "--split", "-s",
+        type=str,
+        default="val",
+        help="Dataset split to use (val/test/unsupervised/default)",
+    )
+
+    # Prediction/ground truth arguments
+    parser.add_argument(
+        "--pred-json",
+        type=str,
+        default=None,
+        help="Path to predictions JSON file (for comparison with GT)",
     )
     parser.add_argument(
-        "--iou",
-        type=float,
-        default=0.5,
-        help="IoU threshold for matching predictions to ground truth (0.0-1.0, default: 0.5)",
+        "--gt-json",
+        type=str,
+        default=None,
+        help="Path to ground truth JSON file",
     )
     parser.add_argument(
-        "--visualize",
-        action="store_true",
-        help="Generate prediction visualization images",
+        "--labels-dir",
+        type=str,
+        default=None,
+        help="Path to YOLO format label files directory",
     )
     parser.add_argument(
         "--images-dir",
         type=str,
         default=None,
-        help="Directory of images for visualization (required with --visualize if not in test-data)",
+        help="Path to images directory (for YOLO GT loading)",
+    )
+
+    # Thresholds
+    parser.add_argument(
+        "--conf", "-c",
+        type=float,
+        default=0.5,
+        help="Confidence threshold (default: 0.5)",
     )
     parser.add_argument(
-        "--output-dir", "-o",
-        type=str,
-        default="./output/evaluation",
-        help="Output directory for evaluation results (default: ./output/evaluation)",
+        "--iou", "-i",
+        type=float,
+        default=0.5,
+        help="IoU threshold for matching (default: 0.5)",
     )
+
+    # Logging
     parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Output JSON file path for detailed results",
-    )
-    parser.add_argument(
-        "--device", "-d",
-        type=str,
-        default="0",
-        help="Device to run evaluation on: '0' for GPU 0, 'cpu' for CPU (default: 0)",
+        "--silent",
+        action="store_true",
+        default=False,
+        help="Suppress output",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
 
+    # Determine operation mode
+    if args.model and args.data:
+        # Evaluation mode
+        model_path = args.model
+        data_path = args.data
+        split = args.split  # Default to "val" for evaluation
+        conf_threshold = args.conf
+        iou_threshold = args.iou
 
-def print_metrics(metrics, per_class=None):
-    """Print evaluation metrics in a formatted way.
-    
-    Args:
-        metrics: Dict with overall metrics
-        per_class: Optional dict with per-class metrics
-    """
-    print("\n" + "=" * 60)
-    print("EVALUATION METRICS")
-    print("=" * 60)
-    
-    # Overall metrics
-    print("\nOverall Performance:")
-    
-    # Handle different metric key names
-    map50 = metrics.get('mAP50', metrics.get('map50', metrics.get('metrics/mAP50(B)', 'N/A')))
-    map50_95 = metrics.get('mAP50_95', metrics.get('map50_95', metrics.get('metrics/mAP50-95(B)', 'N/A')))
-    precision = metrics.get('precision', metrics.get('metrics/precision(B)', 'N/A'))
-    recall = metrics.get('recall', metrics.get('metrics/recall(B)', 'N/A'))
-    
-    if isinstance(map50, (int, float)):
-        print(f"  mAP50:      {map50:.4f} ({map50*100:.1f}%)")
-    else:
-        print(f"  mAP50:      {map50}")
-    
-    if isinstance(map50_95, (int, float)):
-        print(f"  mAP50-95:   {map50_95:.4f} ({map50_95*100:.1f}%)")
-    else:
-        print(f"  mAP50-95:   {map50_95}")
-    
-    if isinstance(precision, (int, float)):
-        print(f"  Precision:  {precision:.4f} ({precision*100:.1f}%)")
-    else:
-        print(f"  Precision:  {precision}")
-    
-    if isinstance(recall, (int, float)):
-        print(f"  Recall:     {recall:.4f} ({recall*100:.1f}%)")
-    else:
-        print(f"  Recall:     {recall}")
-    
-    # Per-class metrics
-    if per_class:
-        print("\nPer-Class Performance:")
-        print(f"  {'Class':<20} {'AP50':>10} {'Precision':>10} {'Recall':>10}")
-        print("  " + "-" * 52)
-        
-        for class_name, class_metrics in per_class.items():
-            # Try multiple key names for AP50
-            c_ap50 = class_metrics.get('AP50', class_metrics.get('mAP50', class_metrics.get('ap50', 'N/A')))
-            c_prec = class_metrics.get('precision', None)
-            c_rec = class_metrics.get('recall', None)
-            
-            c_ap50_str = f"{c_ap50:.4f}" if isinstance(c_ap50, (int, float)) else str(c_ap50)
-            c_prec_str = f"{c_prec:.4f}" if isinstance(c_prec, (int, float)) else "-"
-            c_rec_str = f"{c_rec:.4f}" if isinstance(c_rec, (int, float)) else "-"
-            
-            print(f"  {class_name:<20} {c_ap50_str:>10} {c_prec_str:>10} {c_rec_str:>10}")
+        print("=" * 70)
+        print("Model Evaluation")
+        print("=" * 70)
+        print(f"Model: {model_path}")
+        print(f"Data: {data_path}")
+        print(f"Split: {split}")
+        print(f"Confidence threshold: {conf_threshold}")
+        print(f"IoU threshold: {iou_threshold}")
+        print()
 
+        log_callback = lambda msg: print(msg) if not args.silent else None
+        result = evaluate_model(
+            model_path=model_path,
+            data_path=data_path,
+            split=split,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            log_callback=log_callback,
+        )
 
-def main():
-    args = parse_args()
-    
-    # Validate model file
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f"Error: Model file not found: {model_path}")
-        sys.exit(1)
-    
-    # Validate test data
-    test_data_path = Path(args.test_data)
-    if not test_data_path.exists():
-        print(f"Error: Test data not found: {test_data_path}")
-        sys.exit(1)
-    
-    # Validate thresholds
-    if args.conf < 0 or args.conf > 1:
-        print(f"Error: Confidence threshold must be between 0 and 1, got {args.conf}")
-        sys.exit(1)
-    
-    if args.iou < 0 or args.iou > 1:
-        print(f"Error: IoU threshold must be between 0 and 1, got {args.iou}")
-        sys.exit(1)
-    
-    print("=" * 60)
-    print("YOLO MODEL EVALUATION")
-    print("=" * 60)
-    print(f"\nModel: {model_path}")
-    print(f"Test data: {test_data_path}")
-    print(f"Confidence threshold: {args.conf}")
-    print(f"IoU threshold: {args.iou}")
-    print(f"Device: {args.device}")
-    
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Run evaluation
-    print("\nRunning evaluation...")
-    print("-" * 60)
-    
-    # Define callbacks for debug output
-    def log_callback(msg):
-        print(f"  [DEBUG] {msg}")
-    
-    def status_callback(msg):
-        print(f"  [STATUS] {msg}")
-    
-    evaluator = ModelEvaluator(
-        model_path=str(model_path),
-        test_data_path=str(test_data_path),
-    )
-    
-    result = evaluator.evaluate_unseen(
-        conf_threshold=args.conf,
-        iou_threshold=args.iou,
-        log_callback=log_callback,
-        status_callback=status_callback,
-    )
-    
-    if not result.get("success", False):
-        print(f"\nError: {result.get('error', 'Unknown error')}")
-        sys.exit(1)
-    
-    # Get metrics
-    metrics = result.get("metrics", {})
-    per_class = result.get("per_class", None)
-    
-    # Print metrics
-    print_metrics(metrics, per_class)
-    
-    # Generate visualizations if requested
-    vis_results = None
-    if args.visualize:
-        images_dir = args.images_dir
-        
-        # Try to get images directory from test data path
-        if not images_dir:
-            # Check if test_data is a directory with test/images
-            if test_data_path.is_dir():
-                test_images = test_data_path / "test" / "images"
-                if test_images.exists():
-                    images_dir = str(test_images)
-            elif test_data_path.suffix in ['.yaml', '.yml']:
-                # Try to parse YAML to find images path
-                try:
-                    import yaml
-                    with open(test_data_path) as f:
-                        yaml_data = yaml.safe_load(f)
-                    
-                    # Get the base path from YAML
-                    base_path = yaml_data.get('path', '')
-                    test_path = yaml_data.get('test', yaml_data.get('val'))
-                    
-                    if test_path:
-                        # Construct full path
-                        full_test_path = Path(base_path) / test_path if base_path else Path(test_path)
-                        
-                        # Check if it's an images directory or a text file list
-                        if full_test_path.exists():
-                            if full_test_path.is_dir():
-                                images_dir = str(full_test_path)
-                            elif full_test_path.suffix in ['.txt', '.json']:
-                                # It's a file list, read the first image path to get the directory
-                                with open(full_test_path) as f:
-                                    first_line = f.readline().strip()
-                                    if first_line:
-                                        first_img = Path(first_line)
-                                        if first_img.exists():
-                                            images_dir = str(first_img.parent)
-                        else:
-                            # Try relative to the YAML file location
-                            yaml_dir = test_data_path.parent
-                            relative_test = Path(test_path)
-                            if relative_test.exists():
-                                images_dir = str(relative_test)
-                            elif (yaml_dir / relative_test).exists():
-                                images_dir = str(yaml_dir / relative_test)
-                except Exception as e:
-                    print(f"  Warning: Could not parse YAML for images: {e}")
-        
-        if images_dir and Path(images_dir).exists():
-            print(f"\nGenerating prediction visualizations...")
-            vis_dir = output_dir / "prediction_images"
-            
-            vis_results = generate_prediction_visualizations(
-                model_path=str(model_path),
-                images_dir=images_dir,
-                output_dir=str(vis_dir),
-                conf_threshold=args.conf,
-            )
-            
-            if vis_results.get("success", True):
-                print(f"  Visualizations saved to: {vis_dir}")
-                print(f"  Images processed: {vis_results.get('images_processed', 'N/A')}")
-            else:
-                print(f"  Visualization failed: {vis_results.get('error', 'Unknown error')}")
+        if result.get("success"):
+            print(f"\n{'=' * 70}")
+            print(f"✓ Evaluation completed successfully!")
+            print(f"{'=' * 70}")
+
+            # Print metrics
+            metrics = result.get("metrics", {})
+            for key, value in metrics.items():
+                if value is not None:
+                    print(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
+
+            # Print per-class metrics if available
+            per_class = result.get("per_class", {})
+            if per_class:
+                print(f"\nPer-class mAP50:")
+                for cls_name, cls_metrics in per_class.items():
+                    print(f"  {cls_name}: {cls_metrics.get('AP50', 'N/A'):.4f}")
+
+            print()
         else:
-            print("\nWarning: Could not find images directory for visualization")
-            print("  Use --images-dir to specify the images directory")
-    
-    # Prepare output data
-    output_data = {
-        "model": str(model_path),
-        "test_data": str(test_data_path),
-        "confidence_threshold": args.conf,
-        "iou_threshold": args.iou,
-        "metrics": metrics,
-        "per_class": per_class,
-    }
-    
-    if vis_results:
-        output_data["visualizations"] = {
-            "output_dir": str(output_dir / "prediction_images"),
-            "images_processed": vis_results.get("images_processed"),
-        }
-    
-    # Save results to JSON
-    if args.output:
-        output_path = Path(args.output)
+            print(f"\n{'=' * 70}")
+            print(f"✗ Evaluation failed!")
+            print(f"{'=' * 70}")
+            print(f"Error: {result.get('error', 'Unknown error')}")
+            print()
+
+    elif args.pred_json or args.gt_json:
+        # Comparison mode
+        if not args.pred_json:
+            print("Error: --pred-json is required for comparison mode")
+            sys.exit(1)
+
+        if not args.gt_json and not (args.labels_dir and args.images_dir):
+            print("Error: --gt-json or --labels-dir/--images-dir is required")
+            sys.exit(1)
+
+        predictions = load_predictions_from_json(args.pred_json)
+
+        if args.gt_json:
+            # Load from JSON
+            with open(args.gt_json, "r") as f:
+                ground_truth = json.load(f)
+            # Ensure it's a list
+            if isinstance(ground_truth, dict):
+                if "bboxes" in ground_truth:
+                    ground_truth = [{"image_id": k, "class_id": v["class_id"], "bbox": v["bbox"]} for k, v in ground_truth.items()]
+                elif "data" in ground_truth:
+                    ground_truth = [{"image_id": v["image_id"], "class_id": v["class_id"], "bbox": v["bbox"]} for v in ground_truth["data"]]
+        else:
+            # Load from YOLO format
+            ground_truth = load_gt_from_yolo(args.labels_dir, args.images_dir)
+
+        if args.silent:
+            result = compare_with_gt(predictions, ground_truth, iou_threshold=args.iou)
+        else:
+            print("=" * 70)
+            print("Ground Truth Comparison")
+            print("=" * 70)
+            print(f"Predictions: {len(predictions)}")
+            print(f"Ground truth: {len(ground_truth)}")
+            print(f"IoU threshold: {args.iou}")
+            print()
+            result = compare_with_gt(predictions, ground_truth, iou_threshold=args.iou)
+
+        if result.get("success"):
+            print(f"\n{'=' * 70}")
+            print(f"✓ Comparison completed successfully!")
+            print(f"{'=' * 70}")
+
+            # Print overall metrics
+            overall = result.get("overall", {})
+            print(f"\nOverall metrics:")
+            for key, value in overall.items():
+                print(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
+
+            # Print per-class metrics
+            per_class = result.get("per_class", {})
+            if per_class:
+                print(f"\nPer-class metrics:")
+                for cls_name, cls_metrics in per_class.items():
+                    print(f"  {cls_name}:")
+                    for metric, value in cls_metrics.items():
+                        print(f"    {metric}: {value:.4f}" if isinstance(value, float) else f"    {metric}: {value}")
+
+            # Print confusion matrix
+            confusion = result.get("confusion_matrix", {})
+            if confusion:
+                print(f"\nConfusion matrix:")
+                for cls_name, cls_preds in confusion.items():
+                    print(f"  {cls_name}:")
+                    for target, count in cls_preds.items():
+                        print(f"    {target}: {count}")
+
+            print()
+        else:
+            print(f"\n{'=' * 70}")
+            print(f"✗ Comparison failed!")
+            print(f"{'=' * 70}")
+            print(f"Error: {result.get('error', 'Unknown error')}")
+            print()
+
     else:
-        output_path = output_dir / "evaluation_results.json"
-    
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump(output_data, f, indent=2)
-    
-    print(f"\nResults saved to: {output_path}")
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("EVALUATION COMPLETE")
-    print("=" * 60)
-    print(f"\nOutput directory: {output_dir}")
-    
-    print("\nYOLO model evaluation completed successfully!")
+        # No valid arguments
+        parser.print_help()
+        print("\nError: Please provide either model+data for evaluation, or pred-json+gt-json/labels for comparison")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

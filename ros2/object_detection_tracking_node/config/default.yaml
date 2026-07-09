@@ -1,0 +1,34 @@
+/**:
+  ros__parameters:
+    # Input image topic. Change this to match your rosbag.
+    image_topic: "/camera/image_raw"
+    # QoS profile for the image subscription: 'sensor_data' (best-effort, typical for
+    # rosbag2/cameras) or 'default' (reliable). Default is sensor_data.
+    image_qos_profile: "sensor_data"
+
+    # YOLO segmentation model path (relative to project root or absolute)
+    model_path: "runs/segment/output/training/yolo_training/weights/best.pt"
+
+    # Inference parameters
+    conf: 0.4
+    iou: 0.45
+    imgsz: 640
+    device: "auto"
+
+    # Tracking parameters
+    tracker_type: "botsort"
+    with_cmc: true
+    cmc_method: "sparseOptFlow"
+    track_buffer: 30
+    track_high_thresh: 0.5
+    with_reid: false
+
+    # Output
+    output_dir: "output/ros2_tracking"
+    fps: 30
+    max_frames: -1
+
+    # Publishing
+    publish_annotated_image: true
+    publish_detections: true
+    publish_masks_json: true

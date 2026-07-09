@@ -143,6 +143,7 @@ class ModelEvaluator:
         iou_threshold: float = 0.5,
         model_path: Optional[str | Path] = None,
         test_data_path: Optional[str | Path] = None,
+        split: Optional[str] = None,
         progress_callback: Optional[Callable[[int], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
         log_callback: Optional[Callable[[str], None]] = None,
@@ -160,10 +161,28 @@ class ModelEvaluator:
         
         m_path = Path(model_path) if model_path else self.model_path
         t_path = Path(test_data_path) if test_data_path else self.test_data_path
-        
-        if not m_path or not m_path.exists():
+
+        # If test_data_path is not provided, try to get it from the model path (ultralytics expects a yaml file in the model directory)
+        if not t_path:
+            model_dir = m_path.parent if m_path else None
+            if model_dir:
+                yaml_file = model_dir / f"{m_path.stem}.yaml"
+                if yaml_file.exists():
+                    t_path = yaml_file
+
+        # Validate paths
+        if not m_path:
+            return {"success": False, "error": "Model path not provided"}
+
+        if not m_path.exists():
             return {"success": False, "error": f"Model file not found: {m_path}"}
-        
+
+        if t_path:
+            if not t_path.exists():
+                return {"success": False, "error": f"Test data path not found: {t_path}"}
+        else:
+            return {"success": False, "error": "No test data path provided and none found in model directory"}
+
         if status_callback:
             status_callback("Loading model...")
         if log_callback:
@@ -179,13 +198,25 @@ class ModelEvaluator:
             if status_callback:
                 status_callback("Running inference on test set...")
             
-            results = self.model.val(
-                data=str(t_path) if t_path.suffix in ['.yaml', '.yml'] else None,
-                source=str(t_path) if t_path.suffix not in ['.yaml', '.yml'] else None,
-                conf=conf_threshold,
-                iou=iou_threshold,
-                verbose=True,
-            )
+            if t_path is None:
+                if log_callback:
+                    log_callback("Error: test_data_path or model_path with yaml path not provided")
+                return {"success": False, "error": "test_data_path or model_path with yaml path not provided"}
+
+            # Determine the split to use for evaluation
+            # If split is provided, use it; otherwise, let ultralytics use the default behavior
+            val_args = {
+                "data": str(t_path) if t_path.suffix in ['.yaml', '.yml'] else None,
+                "source": str(t_path) if t_path.suffix not in ['.yaml', '.yml'] else None,
+                "conf": conf_threshold,
+                "iou": iou_threshold,
+                "verbose": True,
+            }
+            # Add split if provided
+            if split:
+                val_args["split"] = split
+
+            results = self.model.val(**val_args)
             
             # --- Box (detection) metrics ---
             metrics = {}
