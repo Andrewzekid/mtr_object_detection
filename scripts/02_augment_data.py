@@ -21,24 +21,29 @@ INPUT DIRECTORY STRUCTURE:
         └── img2.txt
 
 OUTPUT:
-    Augmented dataset with same structure:
+    Augmented dataset with the same structure:
     output_dir/
     ├── images/
     │   ├── img1.jpg
-    │   ├── img1_aug_001_flip_horizontal.jpg
+    │   ├── img1_aug0_rotate.jpg
     │   └── ...
     └── labels/
         ├── img1.txt
-        ├── img1_aug_001_flip_horizontal.txt
+        ├── img1_aug0_rotate.txt
         └── ...
 
 AVAILABLE AUGMENTATIONS:
-    - flip_horizontal: Mirror image horizontally
-    - flip_vertical: Mirror image vertically
-    - rotate: Rotate image by random angle within range
+    - flip_horizontal: Mirror image horizontally (updates bbox x_center)
+    - flip_vertical: Mirror image vertically (updates bbox y_center)
+    - rotate: Rotate image and bounding boxes/polygons by a random angle
     - brightness: Adjust image brightness
     - contrast: Adjust image contrast
     - mosaic: Combine 4 images into a 2x2 grid
+
+NOTE:
+    The ``rotate`` augmentation rotates the image using the same affine matrix
+    for all bounding-box corners, then computes a new axis-aligned bbox. Polygon
+    segmentation labels are also rotated point-by-point.
 """
 
 import argparse
@@ -84,7 +89,7 @@ Examples:
 Available Augmentations:
     flip_horizontal   - Mirror image horizontally (adjusts bbox accordingly)
     flip_vertical     - Mirror image vertically
-    rotate            - Random rotation within specified range
+    rotate            - Random rotation within specified range (rotates bboxes/polygons)
     brightness        - Random brightness adjustment
     contrast          - Random contrast adjustment
     mosaic            - Combine 4 random images into 2x2 grid
@@ -160,29 +165,36 @@ Input Directory Structure:
 
 def main():
     args = parse_args()
-    
+
     # Validate input directory
     input_path = Path(args.input_dir)
     if not input_path.exists():
         print(f"Error: Input directory not found: {input_path}")
         sys.exit(1)
-    
+
     images_path = input_path / args.images_subdir
     labels_path = input_path / args.labels_subdir
-    
+
     if not images_path.exists():
         print(f"Error: Images directory not found: {images_path}")
         sys.exit(1)
-    
+
     if not labels_path.exists():
         print(f"Error: Labels directory not found: {labels_path}")
         sys.exit(1)
-    
+
     # Validate multiplier
     if args.multiplier < 1 or args.multiplier > 10:
         print(f"Error: Multiplier must be between 1 and 10, got {args.multiplier}")
         sys.exit(1)
-    
+
+    # Validate rotation range when rotation is requested
+    if "rotate" in args.augmentations:
+        rot_min, rot_max = args.rotation_range
+        if rot_min > rot_max:
+            print(f"Error: --rotation-range must be min max, got {args.rotation_range}")
+            sys.exit(1)
+
     print("=" * 60)
     print("DATASET AUGMENTATION")
     print("=" * 60)

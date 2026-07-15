@@ -131,9 +131,13 @@ def load_data_yaml(input_dir: Path) -> dict:
 
 
 def read_yolo_detection_labels(label_path: Path, img_w: int, img_h: int) -> list:
-    """Read YOLO detection labels and convert to pixel-coordinate bboxes.
+    """Read YOLO labels and convert to pixel-coordinate bboxes.
     
-    YOLO detection format: class_id x_center y_center width height (normalized)
+    Supports both formats:
+    - Detection: class_id x_center y_center width height (5 values, normalized)
+    - Segmentation: class_id x1 y1 x2 y2 ... xn yn (polygon, normalized)
+    
+    For segmentation format, the bounding box is computed from polygon extents.
     
     Returns:
         List of dicts: [{"class_id": int, "bbox": [x1, y1, x2, y2]}]
@@ -152,15 +156,29 @@ def read_yolo_detection_labels(label_path: Path, img_w: int, img_h: int) -> list
                 continue
             
             class_id = int(parts[0])
-            x_center = float(parts[1]) * img_w
-            y_center = float(parts[2]) * img_h
-            width = float(parts[3]) * img_w
-            height = float(parts[4]) * img_h
+            values = [float(v) for v in parts[1:]]
             
-            x1 = x_center - width / 2
-            y1 = y_center - height / 2
-            x2 = x_center + width / 2
-            y2 = y_center + height / 2
+            if len(values) == 4:
+                # Detection format: x_center y_center width height
+                x_center = values[0] * img_w
+                y_center = values[1] * img_h
+                width = values[2] * img_w
+                height = values[3] * img_h
+                
+                x1 = x_center - width / 2
+                y1 = y_center - height / 2
+                x2 = x_center + width / 2
+                y2 = y_center + height / 2
+            elif len(values) >= 6 and len(values) % 2 == 0:
+                # Segmentation polygon format: x1 y1 x2 y2 ... xn yn
+                xs = [values[i] * img_w for i in range(0, len(values), 2)]
+                ys = [values[i] * img_h for i in range(1, len(values), 2)]
+                x1 = min(xs)
+                y1 = min(ys)
+                x2 = max(xs)
+                y2 = max(ys)
+            else:
+                continue
             
             # Clip to image bounds
             x1 = max(0, min(x1, img_w))
@@ -359,6 +377,45 @@ def process_image_for_segmentation(
     }
 
 
+def _find_split_img_dir(input_dir: Path, split: str) -> Path:
+    """Find the image directory for a split, supporting both layouts:
+    - Layout A: input_dir/images/{split}/
+    - Layout B: input_dir/{split}/images/
+    Also handles 'valid' as alias for 'val'.
+    """
+    candidates = [
+        input_dir / "images" / split,
+        input_dir / split / "images",
+    ]
+    # Also try 'valid' as alias for 'val'
+    if split == "val":
+        candidates.extend([
+            input_dir / "images" / "valid",
+            input_dir / "valid" / "images",
+        ])
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]  # fallback
+
+
+def _find_split_label_dir(input_dir: Path, split: str) -> Path:
+    """Find the label directory for a split, supporting both layouts."""
+    candidates = [
+        input_dir / "labels" / split,
+        input_dir / split / "labels",
+    ]
+    if split == "val":
+        candidates.extend([
+            input_dir / "labels" / "valid",
+            input_dir / "valid" / "labels",
+        ])
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]  # fallback
+
+
 def setup_output_directories(input_dir: Path, output_dir: Path, symlink_images: bool = False):
     """Create output directory structure and copy/symlink images.
     
@@ -380,7 +437,7 @@ def setup_output_directories(input_dir: Path, output_dir: Path, symlink_images: 
     
     # Copy or symlink images
     for split in ["train", "val", "test"]:
-        src_img_dir = input_dir / "images" / split
+        src_img_dir = _find_split_img_dir(input_dir, split)
         dst_img_dir = output_dir / "images" / split
         
         if not src_img_dir.exists():
@@ -434,8 +491,8 @@ def process_split(
     max_images: int = None,
 ):
     """Process all images in a split (train/val/test)."""
-    src_img_dir = input_dir / "images" / split
-    src_label_dir = input_dir / "labels" / split
+    src_img_dir = _find_split_img_dir(input_dir, split)
+    src_label_dir = _find_split_label_dir(input_dir, split)
     dst_label_dir = output_dir / "labels" / split
     
     if not src_img_dir.exists():

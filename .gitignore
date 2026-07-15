@@ -1,0 +1,9 @@
+core/sam3/
+core/sam3.zip
+__pycache__/
+.env
+output/
+.claude/
+.devcontainer/
+inspection_grounding/
+Datasets/

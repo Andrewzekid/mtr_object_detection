@@ -36,6 +36,7 @@ OUTPUT:
 """
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -169,7 +170,7 @@ def print_split_statistics(stats_path):
     
     total = sum(stats.get(s, {}).get("image_count", 0) for s in ["train", "val", "test"])
     print(f"\nTOTAL IMAGES: {total}")
-    
+
     if total > 0:
         print(f"\nSplit Distribution:")
         for split_name in ["train", "val", "test"]:
@@ -177,6 +178,31 @@ def print_split_statistics(stats_path):
             pct = (count / total * 100) if total > 0 else 0
             bar = "█" * int(pct / 2)
             print(f"  {split_name:5s}: {count:5d} ({pct:5.1f}%) {bar}")
+
+
+def copy_labels_to_splits(output_dir: str, labels_path: Path):
+    """Copy the correct .txt labels into each split after DatasetCreator ran.
+
+    DatasetCreator.split_dataset expects labels under ``src/labels``; when the
+    caller keeps labels next to the ``images/`` subdirectory, the labels are
+    not found there. This helper fixes the resulting split by copying each
+    label from the real ``labels_path`` into ``<output_dir>/<split>/labels/``.
+    """
+    out_path = Path(output_dir)
+    for split in ["train", "test", "val"]:
+        split_img_dir = out_path / split / "images"
+        split_lbl_dir = out_path / split / "labels"
+        if not split_img_dir.exists():
+            continue
+        split_lbl_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for img_file in split_img_dir.iterdir():
+            label_file = labels_path / f"{img_file.stem}.txt"
+            if label_file.exists():
+                shutil.copy2(label_file, split_lbl_dir / f"{img_file.stem}.txt")
+                copied += 1
+        if copied:
+            print(f"  Copied {copied} label(s) into {split}/labels")
 
 
 def main():
@@ -253,12 +279,16 @@ def main():
         output_dir=args.output_dir,
         seed=args.seed,
     )
-    
+
+    # DatasetCreator looks for labels under ``src/labels``; when the dataset
+    # uses ``images/`` + ``labels/`` siblings we need to copy them ourselves.
+    copy_labels_to_splits(args.output_dir, labels_path)
+
     # Print results
     print("\n" + "=" * 60)
     print("SPLIT COMPLETE")
     print("=" * 60)
-    
+
     if result.get("success", True):
         splits = result.get("splits", {})
         print(f"\nSplit results:")

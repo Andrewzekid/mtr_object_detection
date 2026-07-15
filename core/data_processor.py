@@ -67,9 +67,29 @@ class DataProcessor:
         self.brightness_range = self.config.get("brightness_range", (0.7, 1.3))
     
     def get_image_files(self, directory: Optional[Path] = None) -> List[Path]:
-        """Get all image files in a directory."""
+        """Get all image files in a directory.
+
+        Supports the standard YOLO layout where images live under
+        ``<directory>/images/``. If that subdirectory exists it is used,
+        otherwise images are read directly from ``directory``.
+        """
         dir_path = directory or self.input_dir
+        images_subdir = dir_path / "images"
+        if images_subdir.exists() and images_subdir.is_dir():
+            dir_path = images_subdir
         return [f for f in dir_path.iterdir() if f.suffix.lower() in self.IMAGE_EXTENSIONS]
+
+    def _get_labels_dir(self, directory: Optional[Path] = None) -> Path:
+        """Return the labels directory for a dataset root.
+
+        If ``<directory>/labels/`` exists it is returned; otherwise fall back to
+        ``<directory>/labels/`` so callers can create it when needed.
+        """
+        base = directory or self.input_dir
+        labels_subdir = base / "labels"
+        if labels_subdir.exists() and labels_subdir.is_dir():
+            return labels_subdir
+        return labels_subdir
     
     def augment_dataset(
         self,
@@ -105,7 +125,8 @@ class DataProcessor:
                     continue
                 
                 # Read labels
-                label_file = self.input_dir / "labels" / f"{img_file.stem}.txt"
+                labels_dir = self._get_labels_dir()
+                label_file = labels_dir / f"{img_file.stem}.txt"
                 labels = []
                 if label_file.exists():
                     with open(label_file, 'r') as f:
@@ -177,6 +198,17 @@ class DataProcessor:
             for label in labels:
                 f.write(' '.join(str(x) for x in label) + '\n')
     
+    def _rotate_points(self, points: np.ndarray, M: np.ndarray,
+                       img_w: int, img_h: int) -> np.ndarray:
+        """Rotate a (N, 2) array of points and clamp to image bounds."""
+        if points.size == 0:
+            return points
+        ones = np.ones((points.shape[0], 1), dtype=np.float32)
+        rotated = (M @ np.hstack([points, ones]).T).T
+        rotated[:, 0] = np.clip(rotated[:, 0], 0, img_w)
+        rotated[:, 1] = np.clip(rotated[:, 1], 0, img_h)
+        return rotated
+
     def _rotate_bbox(
         self,
         labels: List[List],
@@ -186,104 +218,100 @@ class DataProcessor:
         min_area_ratio: float = 0.01,
     ) -> List[List]:
         """
-        Rotate bounding boxes using the same affine matrix used for the image.
-        
-        For each YOLO-format label [class_id, x_center, y_center, width, height, ...]:
-        1. Convert normalized bbox to 4 absolute corner points
-        2. Rotate all corners using the affine matrix M
-        3. Compute new axis-aligned bbox from rotated corners
-        4. Clamp to image boundaries
-        5. Filter out boxes that are too small or entirely outside
-        6. Convert back to YOLO normalized format
-        
-        Args:
-            labels: List of YOLO-format labels
-            M: 2x3 affine rotation matrix
-            img_w: Image width in pixels
-            img_h: Image height in pixels
-            min_area_ratio: Minimum area ratio to keep a box (relative to original)
-        
-        Returns:
-            List of rotated and clipped labels
+        Rotate labels using the same affine matrix used for the image.
+
+        Supports:
+        - YOLO detection: ``class_id x_center y_center width height``
+        - YOLO segmentation: ``class_id x1 y1 x2 y2 ... xn yn``
+
+        Detection boxes are rotated via their four corners, then a new axis-aligned
+        bbox is computed and filtered by area. Polygon points are rotated and
+        clamped individually.
         """
         rotated_labels = []
-        
+
         for label in labels:
-            # Parse YOLO format: class_id, x_center, y_center, width, height, [extra...]
+            if not label:
+                continue
+
             class_id = int(label[0])
-            x_center_norm = float(label[1])
-            y_center_norm = float(label[2])
-            width_norm = float(label[3])
-            height_norm = float(label[4])
-            extra = label[5:] if len(label) > 5 else []
-            
+            values = label[1:]
+            n_values = len(values)
+
+            # Segmentation format: class_id followed by an even number of coords.
+            if n_values % 2 == 0 and n_values >= 6:
+                pts = np.array([
+                    [float(values[i]) * img_w, float(values[i + 1]) * img_h]
+                    for i in range(0, n_values, 2)
+                ], dtype=np.float32)
+                rotated = self._rotate_points(pts, M, img_w, img_h)
+                if rotated.shape[0] < 3:
+                    continue
+                new_values = []
+                for x, y in rotated:
+                    new_values.append(f"{x / img_w:.6f}")
+                    new_values.append(f"{y / img_h:.6f}")
+                rotated_labels.append([class_id] + new_values)
+                continue
+
+            # Detection format (must have exactly 4 numeric values).
+            if n_values < 4:
+                continue
+
+            x_center_norm = float(values[0])
+            y_center_norm = float(values[1])
+            width_norm = float(values[2])
+            height_norm = float(values[3])
+            extra = values[4:] if n_values > 4 else []
+
             # Convert to absolute coordinates
             x_center = x_center_norm * img_w
             y_center = y_center_norm * img_h
             box_w = width_norm * img_w
             box_h = height_norm * img_h
-            
+
             # Compute 4 corners of the original bbox
             x1 = x_center - box_w / 2
             y1 = y_center - box_h / 2
             x2 = x_center + box_w / 2
             y2 = y_center + box_h / 2
-            
-            # Define 4 corners as numpy array for matrix multiplication
+
             corners = np.array([
                 [x1, y1],
                 [x2, y1],
                 [x2, y2],
                 [x1, y2]
             ], dtype=np.float32)
-            
-            # Add homogeneous coordinate for affine transform
-            ones = np.ones((4, 1), dtype=np.float32)
-            corners_h = np.hstack([corners, ones])  # Shape: (4, 3)
-            
-            # Apply rotation matrix M (2x3) to get rotated corners
-            rotated_corners = (M @ corners_h.T).T  # Shape: (4, 2)
-            
+
+            rotated_corners = self._rotate_points(corners, M, img_w, img_h)
+
             # Compute new axis-aligned bounding box from rotated corners
-            new_x1 = np.min(rotated_corners[:, 0])
-            new_y1 = np.min(rotated_corners[:, 1])
-            new_x2 = np.max(rotated_corners[:, 0])
-            new_y2 = np.max(rotated_corners[:, 1])
-            
-            # Clamp to image boundaries
-            new_x1 = np.clip(new_x1, 0, img_w)
-            new_y1 = np.clip(new_y1, 0, img_h)
-            new_x2 = np.clip(new_x2, 0, img_w)
-            new_y2 = np.clip(new_y2, 0, img_h)
-            
-            # Check if box is still valid after clamping
+            new_x1 = float(np.min(rotated_corners[:, 0]))
+            new_y1 = float(np.min(rotated_corners[:, 1]))
+            new_x2 = float(np.max(rotated_corners[:, 0]))
+            new_y2 = float(np.max(rotated_corners[:, 1]))
+
             clamped_w = new_x2 - new_x1
             clamped_h = new_y2 - new_y1
-            
+
             if clamped_w <= 0 or clamped_h <= 0:
-                # Box is entirely outside the image
                 continue
-            
-            # Check area ratio - skip if too small
+
             original_area = box_w * box_h
             new_area = clamped_w * clamped_h
             if original_area > 0 and (new_area / original_area) < min_area_ratio:
-                # Box is too small after rotation/clipping
                 continue
-            
-            # Convert back to YOLO normalized format
+
             new_x_center = (new_x1 + new_x2) / 2 / img_w
             new_y_center = (new_y1 + new_y2) / 2 / img_h
             new_width = clamped_w / img_w
             new_height = clamped_h / img_h
-            
-            # Build new label
+
             new_label = [class_id, new_x_center, new_y_center, new_width, new_height]
             if extra:
                 new_label.extend(extra)
-            
             rotated_labels.append(new_label)
-        
+
         return rotated_labels
     
     def apply_augmentation(

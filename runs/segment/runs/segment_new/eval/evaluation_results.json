@@ -1,0 +1,48 @@
+{
+  "model": "runs/segment/runs/segment_new/yolo_training/weights/best.pt",
+  "test_data": "train_yolo_new_seg/data.yaml",
+  "confidence_threshold": 0.25,
+  "iou_threshold": 0.5,
+  "metrics": {
+    "mAP50": 0.8413126166924538,
+    "mAP50_95": 0.6514982849259757,
+    "precision": 0.9501298662650178,
+    "recall": 0.8049992940237573,
+    "mask_mAP50": 0.8129403624531925,
+    "mask_mAP50_95": 0.5746839836447365,
+    "mask_precision": 0.9439064854096944,
+    "mask_recall": 0.7907665072418294
+  },
+  "per_class": {
+    "Advertisement Board": {
+      "AP50": 0.8736932146800567,
+      "mAP50": 0.8736932146800567,
+      "mask_AP50": 0.8376055581845057
+    },
+    "Exit Sign": {
+      "AP50": 0.785,
+      "mAP50": 0.785,
+      "mask_AP50": 0.715
+    },
+    "Lights": {
+      "AP50": 0.7829324854746655,
+      "mAP50": 0.7829324854746655,
+      "mask_AP50": 0.7187866165346488
+    },
+    "Map": {
+      "AP50": 0.995,
+      "mAP50": 0.995,
+      "mask_AP50": 0.995
+    },
+    "TV": {
+      "AP50": 0.885,
+      "mAP50": 0.885,
+      "mask_AP50": 0.885
+    },
+    "Ticket Gate": {
+      "AP50": 0.7262500000000001,
+      "mAP50": 0.7262500000000001,
+      "mask_AP50": 0.7262500000000001
+    }
+  }
+}
