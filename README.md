@@ -42,7 +42,7 @@ You can paste each block into the terminal from top to bottom.
 Skip this if you already have a folder of images to label.
 
 ```bash
-python scripts/select_new_1k_subset.py \
+python scripts/00_sample_from_dataset.py \
   --out-dir Datasets/MTR/MTR_new_1k
 ```
 
@@ -70,13 +70,14 @@ Output:
 
 ### 2. Review and clean the boxes with `08_click_review_coco.py`
 
-```bash
+```
 python scripts/08_click_review_coco.py \
-  --qwen-annotations-dir Datasets/MTR/MTR_new_1k/qwen_results \
+  --qwen-annotations-dir Datasets/MTR/mtr_new_1k_annotations \
   --img_dir Datasets/MTR/MTR_new_1k \
   --output_json output/MTR_new_1k/reviewed/coco_reviewed.json \
   --output-yolo-dir output/MTR_new_1k/reviewed/yolo_reviewed \
-  --data-yaml Datasets/MTR/detect/train_yolo_detection/data.yaml
+  --data-yaml Datasets/MTR/detect/train_yolo_detection/data.yamlbash
+
 ```
 
 Interactive controls in the matplotlib window:
@@ -96,32 +97,8 @@ Output:
 - `output/MTR_new_1k/reviewed/coco_reviewed.json`
 - `output/MTR_new_1k/reviewed/yolo_reviewed/` (images, labels, data.yaml)
 
-### 3. Augment the reviewed YOLO dataset
 
-```bash
-python scripts/02_augment_data.py \
-  --input-dir output/MTR_new_1k/reviewed/yolo_reviewed \
-  --output-dir output/MTR_new_1k/reviewed/yolo_reviewed_augmented \
-  --augmentations flip_horizontal rotate brightness \
-  --multiplier 2 --rotation-range -15 15
-```
-
-The `rotate` augmentation rotates the image and recomputes the axis-aligned
-bounding boxes (and polygon segmentation labels) so the labels stay valid.
-
-### 4. Split into train / val / test
-
-```bash
-python scripts/03_split_dataset.py \
-  --input-dir output/MTR_new_1k/reviewed/yolo_reviewed_augmented \
-  --output-dir output/MTR_new_1k/reviewed/yolo_split \
-  --ratios 0.7 0.15 0.15 \
-  --seed 42 \
-  --class-names "Advertisement Board" "Exit Sign" "Lights" "Map" "TV" "Ticket Gate" \
-  --generate-yaml
-```
-
-### 5. Convert detection boxes to SAM3 segmentation masks
+### 3. Convert detection boxes to SAM3 segmentation masks
 
 ```bash
 python scripts/09_create_seg_dataset.py \
@@ -141,8 +118,8 @@ output/MTR_new_1k/reviewed/yolo_seg/
 └── creation_summary.json
 ```
 
-### 6. Upload to Roboflow
-
+### 4. Upload to Roboflow
+Data augmentation and train test split is done by roboflow
 ```bash
 python scripts/12_upload_to_roboflow.py \
   --dataset-dir output/MTR_new_1k/reviewed/yolo_seg \
@@ -154,7 +131,7 @@ python scripts/12_upload_to_roboflow.py \
 Use `--dry-run` to preview the upload plan, or `--max-images-per-split N` to
 limit the number of images sent per split.
 
-### 7. Train a YOLO segmentation model
+### 5. Train a YOLO segmentation model
 
 ```bash
 python scripts/04_train_model.py \
@@ -166,7 +143,7 @@ python scripts/04_train_model.py \
 Trained weights are written to
 `runs/segment/output/training/yolo_training/weights/best.pt` by default.
 
-### 8. Evaluate the trained model
+### 6. Evaluate the trained model
 
 ```bash
 python scripts/05_evaluate_model.py \
@@ -175,7 +152,7 @@ python scripts/05_evaluate_model.py \
   --split val --conf 0.5 --iou 0.5
 ```
 
-### 9. Run tracking on the original images
+### 7. Run tracking on the original images
 
 ```bash
 python scripts/11_run_tracking.py \

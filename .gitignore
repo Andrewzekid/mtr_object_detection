@@ -7,3 +7,5 @@ output/
 .devcontainer/
 inspection_grounding/
 Datasets/
+cvat/
+cvat_local/
