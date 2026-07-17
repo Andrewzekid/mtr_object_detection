@@ -44,6 +44,10 @@ Skip this if you already have a folder of images to label.
 ```bash
 python scripts/00_sample_from_dataset.py \
   --out-dir Datasets/MTR/MTR_new_1k
+
+#Example with only 10 images
+python scripts/00_sample_from_dataset.py \
+  --source-dir Datasets/MTR/MTR_new_1k --out-dir Datasets/MTR/MTR_new_10_images -n 10 --copy
 ```
 
 ### 1. Auto-label with Qwen3.6
@@ -56,6 +60,15 @@ python scripts/07_run_qwen.py \
   --image-folder Datasets/MTR/MTR_new_1k \
   --output Datasets/MTR/MTR_new_1k/qwen_results \
   --vis-output output/MTR_new_1k/qwen_vis
+
+#Example with only 10 images
+python scripts/07_run_qwen.py \
+  --prompt "Detect all: Ceiling light, Exit Sign, Advertisement Board, Ticket Gate, Map, TV. Ceiling lights are flat, horizontal rectangular strips on the ceiling. Exit signs are hanging LCD screens showing directions. Advertisement boards are flat LCD screens on the green wall showing commercial content. Maps are posters showing MTR directions. Ticket gates are turnstiles. TVs are hanging LCD screens showing general content, not directions." \
+  --template object_detection --format json \
+  --image-folder Datasets/MTR/MTR_new_10_images \
+  --output Datasets/MTR/MTR_new_10_images_annotations \
+  --vis-output output/MTR_new_10_images/qwen_vis
+
 ```
 
 Output:
@@ -76,7 +89,14 @@ python scripts/08_click_review_coco.py \
   --img_dir Datasets/MTR/MTR_new_1k \
   --output_json output/MTR_new_1k/reviewed/coco_reviewed.json \
   --output-yolo-dir output/MTR_new_1k/reviewed/yolo_reviewed \
-  --data-yaml Datasets/MTR/detect/train_yolo_detection/data.yamlbash
+  --data-yaml Datasets/MTR/detect/train_yolo_detection/data.yaml
+
+python scripts/08_click_review_coco.py \
+  --qwen-annotations-dir Datasets/MTR/MTR_new_10_images_annotations \
+  --img_dir Datasets/MTR/MTR_new_10_images \
+  --output_json output/MTR_new_10_images/reviewed/coco_reviewed.json \
+  --output-yolo-dir output/MTR_new_10_images/reviewed/yolo_reviewed \
+  --data-yaml Datasets/MTR/detect/train_yolo_detection/data.yaml
 
 ```
 
@@ -98,12 +118,46 @@ Output:
 - `output/MTR_new_1k/reviewed/yolo_reviewed/` (images, labels, data.yaml)
 
 
-### 3. Convert detection boxes to SAM3 segmentation masks
+### 3. Split the reviewed dataset into train/val/test
+
+`09_create_seg_dataset.py` expects a split layout (`images/{train,val,test}/`,
+`labels/{train,val,test}/`), but `08_click_review_coco.py` emits a flat
+`yolo_reviewed/` dataset. This intermediate step splits it and writes a
+`data.yaml` carrying the class names from the reviewed dataset.
+
+```bash
+python scripts/08b_split_reviewed_dataset.py \
+  --input-dir output/MTR_new_1k/reviewed/yolo_reviewed \
+  --output-dir output/MTR_new_1k/reviewed/yolo_split \
+  --ratios 0.7 0.15 0.15 --seed 42
+
+python scripts/08b_split_reviewed_dataset.py \
+  --input-dir output/MTR_new_10_images/reviewed/yolo_reviewed \
+  --output-dir output/MTR_new_10_images/reviewed/yolo_split \
+  --ratios 0.7 0.15 0.15 --seed 42
+```
+
+Output layout:
+
+```
+output/MTR_new_10_images/reviewed/yolo_split/
+├── images/{train,val,test}/
+├── labels/{train,val,test}/
+└── data.yaml
+```
+
+### 4. Convert detection boxes to SAM3 segmentation masks
 
 ```bash
 python scripts/09_create_seg_dataset.py \
   --input-dir output/MTR_new_1k/reviewed/yolo_split \
   --output-dir output/MTR_new_1k/reviewed/yolo_seg \
+  --model core/sam3/models/sam3-model/sam3.pt \
+  --conf 0.4 --device cuda
+
+python scripts/09_create_seg_dataset.py \
+  --input-dir output/MTR_new_10_images/reviewed/yolo_split \
+  --output-dir output/MTR_new_10_images/reviewed/yolo_seg \
   --model core/sam3/models/sam3-model/sam3.pt \
   --conf 0.4 --device cuda
 ```
@@ -118,7 +172,7 @@ output/MTR_new_1k/reviewed/yolo_seg/
 └── creation_summary.json
 ```
 
-### 4. Upload to Roboflow
+### 5. Upload to Roboflow
 Data augmentation and train test split is done by roboflow
 ```bash
 python scripts/12_upload_to_roboflow.py \
@@ -131,11 +185,11 @@ python scripts/12_upload_to_roboflow.py \
 Use `--dry-run` to preview the upload plan, or `--max-images-per-split N` to
 limit the number of images sent per split.
 
-### 5. Train a YOLO segmentation model
+### 6. Train a YOLO segmentation model
 
 ```bash
 python scripts/04_train_model.py \
-  --config output/MTR_new_1k/reviewed/yolo_seg/data.yaml \
+  --config output/MTR_new_10_images/reviewed/yolo_seg/data.yaml \
   --model-type yolo26l --task segment --loss-type focal \
   --epochs 1000 --batch-size 32 --device 0 --imgsz 640
 ```
@@ -143,7 +197,7 @@ python scripts/04_train_model.py \
 Trained weights are written to
 `runs/segment/output/training/yolo_training/weights/best.pt` by default.
 
-### 6. Evaluate the trained model
+### 7. Evaluate the trained model
 
 ```bash
 python scripts/05_evaluate_model.py \
@@ -152,8 +206,14 @@ python scripts/05_evaluate_model.py \
   --split val --conf 0.5 --iou 0.5
 ```
 
-### 7. Run tracking on the original images
+### 8. Run tracking on the original images
+If data is from metcam, need to first undistort the result. Undistortion example:
+```bash
+python scripts/undistort_rosbag.py --images-root Datasets/iw/tracking/IW_run2/camera/left --output-root Datasets/iw/tracking/IW_run2_left_undistorted --calibration Datasets/iw/tracking/IW_run2/info/calibration.json --camera-name left
 
+python scripts/undistort_rosbag.py --images-root Datasets/MTR/rosbags/2026-06-11_16-50-08_rosbag/camera/left --output-root Datasets/MTR/tracking/MTR_left_undistorted --calibration Datasets/MTR/rosbags/2026-06-11_16-50-08_rosbag/info/calibration.json --camera-name left
+
+```
 ```bash
 python scripts/11_run_tracking.py \
   --tracker botsort \
@@ -161,6 +221,23 @@ python scripts/11_run_tracking.py \
   --data Datasets/MTR/MTR_new_1k \
   --output output/MTR_new_1k/tracking \
   --conf 0.5 --device 0
+
+#Examples:
+python scripts/11_run_tracking.py \
+  --tracker botsort \
+  --model runs/segment/output/training/MTR_segmentation/weights/best.pt \
+  --data Datasets/MTR/tracking/MTR_left_undistorted \
+  --conf 0.4 --device 0 \
+  --warmup-frames 3 \
+  --output output/tracking/MTR/metacam/left/tracking1
+
+python scripts/11_run_tracking.py \
+  --tracker botsort \
+  --model runs/segment/output/training/iw_segmentation/weights/best.pt \
+  --data Datasets/iw/tracking/IWrun2/IW_run2_left_undistorted \
+  --conf 0.5 --device 0 \
+  --warmup-frames 3
+  --output output/tracking/iw/IWrun2
 ```
 
 Tracking output:
@@ -185,6 +262,23 @@ python scripts/11_run_tracking.py \
   --data Datasets/MTR/MTR_new_1k \
   --conf 0.5 --device 0 \
   --warmup-frames 3
+
+#Examples:
+python scripts/11_run_tracking.py \
+  --tracker botsort \
+  --model runs/segment/output/training/iw_segmentation/weights/best.pt \
+  --data Datasets/MTR/tracking/MTR_left_undistorted \
+  --conf 0.5 --device 0 \
+  --warmup-frames 3
+  --output output/tracking/MTR/metacam/left/tracking1
+
+python scripts/11_run_tracking.py \
+  --tracker botsort \
+  --model runs/segment/output/training/iw_segmentation/weights/best.pt \
+  --data Datasets/iw/tracking/IWrun2/IW_run2_left_undistorted \
+  --conf 0.5 --device 0 \
+  --warmup-frames 3
+  --output output/tracking/iw/IWrun2
 ```
 
 It prints mean / min / max / p50 / p95 / p99 latencies and FPS for:
@@ -202,13 +296,8 @@ Speed options for benchmark mode:
 
 ---
 
-## Notes
 
-- The pipeline assumes a standard YOLO layout:
-  `images/{train,val,test}/` and `labels/{train,val,test}/`. The augmentation
-  script also uses `images/` and `labels/` directly under its `--input-dir`.
-- To skip the interactive review step and convert Qwen JSON directly to YOLO,
-  use `scripts/10_qwen_json_to_yolo.py`.
-- For detection-only training, replace `--task segment` with `--task detect`
-  and point `04_train_model.py` at a detection `data.yaml`.
-- Launch the GUI any time with `python app.py`.
+
+
+
+

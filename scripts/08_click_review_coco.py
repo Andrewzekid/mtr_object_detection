@@ -226,6 +226,9 @@ def build_coco_from_qwen(qwen_dir, img_dir):
 
         for class_name, (x1, y1, x2, y2) in boxes:
             x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+            # 07_run_qwen.py already scales Qwen's 0-1000 normalized coords to
+            # pixel coordinates before saving the JSON, so the boxes here are in
+            # pixel space. Just clamp to the image bounds.
             x1 = max(0.0, min(x1, w))
             x2 = max(0.0, min(x2, w))
             y1 = max(0.0, min(y1, h))
@@ -532,7 +535,8 @@ class ProReviewer:
         self.drawing = False
 
         # 创建或重用图形窗口
-        if self.fig is None:
+        first_time = self.fig is None
+        if first_time:
             self.fig, self.ax = plt.subplots(figsize=(12, 8))
             self.fig.canvas.mpl_connect('key_press_event', self.on_key)
             self.fig.canvas.mpl_connect('button_press_event', self.on_click)
@@ -545,8 +549,16 @@ class ProReviewer:
             self.ax.clear()
 
         self.redraw()
-        plt.show(block=False)
-        plt.pause(0.1)
+        if first_time:
+            # 仅在首次加载时启动 GUI；此时还在 run() 调用
+            # plt.show(block=True) 之前，进入阻塞事件循环是安全的。
+            plt.show(block=False)
+            plt.pause(0.1)
+        else:
+            # 已经处在阻塞的 plt.show(block=True) 事件循环中（由 n/b 键触发）。
+            # 这里不能再调用 plt.show / plt.pause，否则会启动嵌套事件循环并
+            # 导致窗口冻结。直接强制重绘即可。
+            self.fig.canvas.draw()
         return True
 
     def redraw(self):

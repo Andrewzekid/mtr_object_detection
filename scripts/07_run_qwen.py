@@ -31,6 +31,9 @@ PREREQUISITES:
 OUTPUT:
     - Raw model response
     - Parsed output in requested format (json/yaml/bbox/text)
+      NOTE: bounding boxes are scaled to PIXEL coordinates (Qwen's raw 0-1000
+      normalized coords are converted using --coord-scale and the image's real
+      W/H) before being saved, so the JSON can be fed directly to SAM3.
     - Optional visualization image with bounding boxes drawn
     - For batch mode: individual JSON files per image + summary.json
 """
@@ -318,7 +321,7 @@ Templates:
         "--coord-scale",
         type=float,
         default=1000.0,
-        help="Coordinate scale factor: Qwen outputs normalized 0-1000 coordinates in x1,y1,x2,y2 format, which are scaled to pixel coordinates (default: 1000). Set to 1 if Qwen already outputs pixel coordinates.",
+        help="Coordinate scale factor: Qwen outputs normalized 0-1000 coordinates in x1,y1,x2,y2 format, which are scaled to pixel coordinates and saved as PIXEL coordinates in the output JSON (default: 1000). Set to 1 if Qwen already outputs pixel coordinates.",
     )
     parser.add_argument(
         "--list-models",
@@ -417,15 +420,70 @@ def extract_bboxes_from_output(parsed_output):
     return bboxes
 
 
-def generate_visualization(image_path, vis_path, parsed_output, coord_scale):
+def read_image_size(image_path):
+    """Return (width, height) of an image, or None if it cannot be read."""
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    return (w, h)
+
+
+def scale_parsed_output_to_pixels(parsed_output, img_w, img_h, coord_scale):
+    """Scale bounding boxes in parsed_output to integer pixel coordinates.
+
+    Qwen emits ``bbox_2d``/``bbox`` values in the normalized 0-coord_scale range
+    (0-1000 by default). This converts them in place (on a shallow copy) so the
+    saved JSON contains pixel coordinates that can be fed directly to downstream
+    consumers such as SAM3 — which expects pixel-space boxes.
+
+    Args:
+        parsed_output: Parsed Qwen output (list of dicts, a single dict, or other)
+        img_w, img_h: Image dimensions in pixels
+        coord_scale: Coordinate scale factor (1000 for Qwen's normalized range,
+                     1 if Qwen already emitted pixel coordinates)
+
+    Returns:
+        parsed_output with bbox values replaced by [x1, y1, x2, y2] pixel ints.
+        If coord_scale == 1 the input is returned unchanged.
+    """
+    if coord_scale == 1 or parsed_output is None:
+        return parsed_output
+
+    def scale_bbox(bbox):
+        x1 = int(round(bbox[0] / coord_scale * img_w))
+        y1 = int(round(bbox[1] / coord_scale * img_h))
+        x2 = int(round(bbox[2] / coord_scale * img_w))
+        y2 = int(round(bbox[3] / coord_scale * img_h))
+        return [x1, y1, x2, y2]
+
+    def fix_item(item):
+        if not isinstance(item, dict):
+            return item
+        item = dict(item)
+        key = "bbox_2d" if "bbox_2d" in item else ("bbox" if "bbox" in item else None)
+        if key is not None:
+            bbox = item[key]
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                item[key] = scale_bbox(bbox)
+        return item
+
+    if isinstance(parsed_output, list):
+        return [fix_item(item) for item in parsed_output]
+    if isinstance(parsed_output, dict):
+        return fix_item(parsed_output)
+    return parsed_output
+
+
+def generate_visualization(image_path, vis_path, parsed_output):
     """Generate visualization image with bounding boxes drawn.
-    
+
     Args:
         image_path: Path to input image
         vis_path: Path to save visualization image
-        parsed_output: Parsed output from Qwen containing bboxes
-        coord_scale: Coordinate scale factor (1000 for normalized, 1 for pixel)
-    
+        parsed_output: Parsed output from Qwen containing bboxes in PIXEL
+                       coordinates (already scaled upstream before saving JSON)
+
     Returns:
         True if visualization was generated successfully, False otherwise
     """
@@ -445,12 +503,12 @@ def generate_visualization(image_path, vis_path, parsed_output, coord_scale):
         label = bbox_info.get("label", "object")
         
         if bbox and len(bbox) == 4:
-            # Scale coordinates from normalized range to pixel coordinates
-            # Qwen outputs x1, y1, x2, y2 format
-            x1 = int(bbox[0] / coord_scale * img_w)
-            y1 = int(bbox[1] / coord_scale * img_h)
-            x2 = int(bbox[2] / coord_scale * img_w)
-            y2 = int(bbox[3] / coord_scale * img_h)
+            # Bboxes are already in pixel coordinates (scaled upstream before
+            # the JSON was saved). Qwen outputs x1, y1, x2, y2 format.
+            x1 = max(0, min(int(bbox[0]), img_w))
+            y1 = max(0, min(int(bbox[1]), img_h))
+            x2 = max(0, min(int(bbox[2]), img_w))
+            y2 = max(0, min(int(bbox[3]), img_h))
 
             # Draw rectangle
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -534,7 +592,19 @@ def process_single_image(args, image_path, output_dir=None, vis_dir=None, condit
     # Get outputs
     raw_response = result.get("response", "")
     parsed_output = result.get("parsed_output")
-    
+
+    # Scale Qwen's normalized 0-1000 bounding boxes to pixel coordinates before
+    # saving the JSON and before any downstream use (visualization, split-by-class,
+    # SAM3). The saved JSON therefore contains pixel-space boxes.
+    size = read_image_size(image_path)
+    if size is not None:
+        img_w, img_h = size
+        parsed_output = scale_parsed_output_to_pixels(
+            parsed_output, img_w, img_h, args.coord_scale
+        )
+    else:
+        print(f"  Warning: could not read image size for coordinate scaling: {image_path}")
+
     # Prepare output
     output_data = {
         "image": str(image_path),
@@ -543,7 +613,7 @@ def process_single_image(args, image_path, output_dir=None, vis_dir=None, condit
         "raw_response": raw_response,
         "parsed_output": parsed_output,
     }
-    
+
     # Save JSON output
     if output_dir:
         json_path = output_dir / f"{image_path.stem}_result.json"
@@ -551,11 +621,11 @@ def process_single_image(args, image_path, output_dir=None, vis_dir=None, condit
         with open(json_path, "w") as f:
             json.dump(output_data, f, indent=2)
         print(f"  Results saved to: {json_path}")
-    
+
     # Generate visualization if requested
     if vis_dir and parsed_output:
         vis_path = vis_dir / f"{image_path.stem}_vis.jpg"
-        if generate_visualization(image_path, vis_path, parsed_output, args.coord_scale):
+        if generate_visualization(image_path, vis_path, parsed_output):
             print(f"  Visualization saved to: {vis_path}")
     
     return {
@@ -565,51 +635,42 @@ def process_single_image(args, image_path, output_dir=None, vis_dir=None, condit
     }
 
 
-def split_annotations_by_class(parsed_output, image_path, annotations_dir, coord_scale):
+def split_annotations_by_class(parsed_output, image_path, annotations_dir, img_w, img_h):
     """Split annotations by class into separate files.
-    
+
     Creates a folder per image (named after image stem) with a JSON file per class.
     Each class JSON file contains the class name and all bounding boxes for that class.
-    
+
     Args:
-        parsed_output: Parsed output from Qwen containing bboxes (list of dicts with bbox_2d and label)
+        parsed_output: Parsed output from Qwen containing bboxes in PIXEL
+                       coordinates (already scaled upstream before saving JSON)
         image_path: Path to the input image
         annotations_dir: Base directory for annotations output
-        coord_scale: Coordinate scale factor (1000 for normalized, 1 for pixel)
-    
+        img_w, img_h: Image dimensions in pixels (used to clamp boxes to bounds)
+
     Returns:
         dict mapping class names to their annotation file paths
     """
     # Create image-specific folder
     image_folder = annotations_dir / image_path.stem
     image_folder.mkdir(parents=True, exist_ok=True)
-    
-    # Get image dimensions for coordinate scaling
-    img = cv2.imread(str(image_path))
-    if img is None:
-        print(f"  Warning: Could not read image for scaling: {image_path}")
-        return {}
-    img_h, img_w = img.shape[:2]
-    
+
     # Group bboxes by class
     class_bboxes = {}
-    
+
     if isinstance(parsed_output, list):
         for item in parsed_output:
             if isinstance(item, dict):
                 bbox = item.get("bbox_2d") or item.get("bbox")
                 label = item.get("label", "object")
                 if bbox and len(bbox) == 4:
-                    # Qwen outputs x1, y1, x2, y2 format (normalized 0-1000)
-                    x1_norm, y1_norm, x2_norm, y2_norm = bbox
+                    # Bboxes are already in pixel coordinates (scaled upstream).
+                    # Clamp to image bounds and store as x1, y1, x2, y2.
+                    x1 = max(0, min(int(bbox[0]), img_w))
+                    y1 = max(0, min(int(bbox[1]), img_h))
+                    x2 = max(0, min(int(bbox[2]), img_w))
+                    y2 = max(0, min(int(bbox[3]), img_h))
 
-                    # Scale to pixel coordinates
-                    x1 = int(x1_norm / coord_scale * img_w)
-                    y1 = int(y1_norm / coord_scale * img_h)
-                    x2 = int(x2_norm / coord_scale * img_w)
-                    y2 = int(y2_norm / coord_scale * img_h)
-
-                    # Store in x1, y1, x2, y2 format in pixel coordinates
                     if label not in class_bboxes:
                         class_bboxes[label] = []
                     class_bboxes[label].append([x1, y1, x2, y2])
@@ -721,15 +782,24 @@ def process_image_folder(args):
         # If split-by-class mode, process the annotations
         if args.split_by_class and result["success"] and result.get("parsed_output"):
             print(f"  Splitting annotations by class...")
-            saved_files = split_annotations_by_class(
-                result["parsed_output"], 
-                image_path, 
-                annotations_dir,
-                args.coord_scale
-            )
-            result["annotation_files"] = saved_files
-            total_classes_found += len(saved_files)
-        
+            # parsed_output is already in pixel coordinates (scaled in
+            # process_single_image); pass image dims for clamping.
+            size = read_image_size(image_path)
+            if size is None:
+                print(f"  Warning: could not read image size, skipping split: {image_path}")
+                result["annotation_files"] = {}
+            else:
+                img_w, img_h = size
+                saved_files = split_annotations_by_class(
+                    result["parsed_output"],
+                    image_path,
+                    annotations_dir,
+                    img_w,
+                    img_h,
+                )
+                result["annotation_files"] = saved_files
+                total_classes_found += len(saved_files)
+
         results.append(result)
         
         if result["success"]:
@@ -898,7 +968,20 @@ def main():
     # Get outputs
     raw_response = result.get("response", "")
     parsed_output = result.get("parsed_output")
-    
+
+    # Scale Qwen's normalized 0-1000 bounding boxes to pixel coordinates before
+    # saving the JSON and before any downstream use (visualization, SAM3). The
+    # saved JSON therefore contains pixel-space boxes.
+    if args.image:
+        size = read_image_size(Path(args.image))
+        if size is not None:
+            img_w, img_h = size
+            parsed_output = scale_parsed_output_to_pixels(
+                parsed_output, img_w, img_h, args.coord_scale
+            )
+        else:
+            print(f"  Warning: could not read image size for coordinate scaling: {args.image}")
+
     # Prepare output
     output_data = {
         "model": result.get("model"),
@@ -937,7 +1020,7 @@ def main():
             vis_path = vis_path / f"{Path(args.image).stem}_vis.jpg"
         vis_path.parent.mkdir(parents=True, exist_ok=True)
         
-        if generate_visualization(Path(args.image), vis_path, parsed_output, args.coord_scale):
+        if generate_visualization(Path(args.image), vis_path, parsed_output):
             print(f"\nVisualization saved to: {vis_path}")
     
     print("\nQwen3.6 inference completed successfully!")
