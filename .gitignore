@@ -12,5 +12,6 @@ cvat_local/
 .git/
 runs/
 yolo26l.pt
+core/tracking/
 yolo26n.pt
 yolo26l-seg.pt
