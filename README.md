@@ -27,18 +27,11 @@ There are two labeling flows:
 
 ```
 raw images → 07 Qwen VLM auto-label → 08 human review/clean boxes
-            → 08b train/val/test split → 09 SAM3 box→mask seg dataset
+            → 08b train/val/test split → 09 SAM3 box→mask seg dataset → Review the masks on roboflow and augment data
             → 04 YOLO train → 05 evaluate → 11 tracking on raw frames
 ```
 
-**Keyframe pipeline** (sparse labeling for near-static cameras — label every
-Nth frame, interpolate the rest):
 
-```
-12 extract keyframes → 07 Qwen seed boxes on keyframes → 08 review keyframes
-   → 13 KLT optical-flow interpolation to all frames → 08 review all
-   → 09 SAM3 segmentation dataset
-```
 
 ### Directory layout
 
@@ -46,9 +39,6 @@ Nth frame, interpolate the rest):
 |------|----------|
 | `scripts/` | Numbered CLI entry points (pipeline stages) + helpers. |
 | `core/` | Reusable OOP classes / headless inference wrappers the scripts build on. |
-| `Datasets/` | Raw images, reference/conditioning images, YOLO datasets. |
-| `output/` | Generated artifacts (annotations, splits, seg datasets, tracking, vis). |
-
 The numbered `scripts/` are thin CLI wrappers over `core/` classes
 (`ModelTrainer`, `ModelEvaluator`, `DataProcessor`, `DatasetCreator`,
 `ModelVisualizer`) and inference wrappers (`run_qwen`, `run_qwen_api`,
