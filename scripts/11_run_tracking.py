@@ -11,6 +11,14 @@ Works with both YOLO detection and segmentation models; segmentation masks are
 exported as COCO polygons when available.
 
 USAGE:
+    python scripts/11_run_tracking.py \\
+    --tracker botsort \\
+    --model runs/segment/output/training/iw_segmentation/weights/best.pt \\
+    --data Datasets/iw/tracking/IWrun2/IW_run2_left_undistorted \\
+    --conf 0.5 --device 0 \\
+    --warmup-frames 3 \\
+    --output output/tracking/iw/IWrun2
+    
     # ByteTrack on segmentation model
     python scripts/11_run_tracking.py --tracker bytetrack \\
         --model runs/segment/.../weights/best.pt \\
