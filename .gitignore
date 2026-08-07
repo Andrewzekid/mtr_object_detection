@@ -10,3 +10,7 @@ Datasets/
 cvat/
 cvat_local/
 .git/
+runs/
+yolo26l.pt
+yolo26n.pt
+yolo26l-seg.pt
