@@ -11,7 +11,16 @@ End-to-end pipeline that takes **raw images** and produces a **trained YOLO
 detection/segmentation model** plus **tracking results**, with a
 human-in-the-loop review step in the middle. It targets Hong Kong MTR and
 industrial (IW) station imagery but is dataset-agnostic.
-
+For a quick segmentation run for the YOLO seg  + Tracking, try the following command:
+```
+python scripts/11_run_tracking.py \
+  --tracker botsort \
+  --model runs/segment/output/training/iw_segmentation/weights/best.pt \
+  --data Datasets/iw/tracking/IWrun2/IW_run2_left_undistorted \
+  --conf 0.5 --device 0 \
+  --warmup-frames 3
+  --output output/tracking/iw/IWrun2
+```
 There are two labeling flows:
 
 **Full pipeline** (dense labeling — every frame is labeled):
@@ -39,7 +48,6 @@ Nth frame, interpolate the rest):
 | `core/` | Reusable OOP classes / headless inference wrappers the scripts build on. |
 | `Datasets/` | Raw images, reference/conditioning images, YOLO datasets. |
 | `output/` | Generated artifacts (annotations, splits, seg datasets, tracking, vis). |
-| `cvat_local/` | Local CVAT docker-compose deployment for browser-based review. |
 
 The numbered `scripts/` are thin CLI wrappers over `core/` classes
 (`ModelTrainer`, `ModelEvaluator`, `DataProcessor`, `DatasetCreator`,
@@ -53,7 +61,6 @@ reference with inputs/outputs is at the bottom of this file.
 
 ```bash
 pip install -r requirements.txt
-pip install roboflow                 # only needed for the Roboflow upload step
 ```
 
 - **Qwen3.6 labeling** can run locally with Ollama or via DashScope API.
@@ -66,11 +73,6 @@ pip install roboflow                 # only needed for the Roboflow upload step
 - **SAM3 segmentation** needs the Ultralytics SAM checkpoint. Place it at
   `core/sam3/models/sam3-model/sam3.pt` (or pass `--model` explicitly).
 
-- **Roboflow upload** needs a project already created in your workspace and
-  `ROBOFLOW_API_KEY` exported:
-
-  ```bash
-  export ROBOFLOW_API_KEY=your_roboflow_key
   ```
 
 ---
@@ -221,22 +223,7 @@ output/MTR_new_1k/reviewed/yolo_seg/
 
 ### 5. Upload to Roboflow (optional)
 
-> **Note:** `scripts/12_upload_to_roboflow.py` is **not currently in the repo**
-> (only a stale `__pycache__/12_upload_to_roboflow.cpython-313.pyc` remains;
-> the `12_*` slot is now `12_extract_keyframes.py`). The command below is the
-> intended interface if you re-add the script. Data augmentation and the
-> train/val/test split can alternatively be done by Roboflow itself.
-
-```bash
-python scripts/12_upload_to_roboflow.py \
-  --dataset-dir output/MTR_new_1k/reviewed/yolo_seg \
-  --workspace my-workspace \
-  --project my-project \
-  --api-key-env ROBOFLOW_API_KEY
-```
-
-Use `--dry-run` to preview the upload plan, or `--max-images-per-split N` to
-limit the number of images sent per split.
+Upload to roboflow and clean the segmentation masks. Afterwards, create a new dataset on roboflow and do data augmentation. Download the dataset and use for training model
 
 ### 6. Train a YOLO segmentation model
 

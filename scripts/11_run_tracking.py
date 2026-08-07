@@ -12,18 +12,18 @@ exported as COCO polygons when available.
 
 USAGE:
     # ByteTrack on segmentation model
-    python scripts/track.py --tracker bytetrack \\
+    python scripts/11_run_tracking.py --tracker bytetrack \\
         --model runs/segment/.../weights/best.pt \\
         --data MTR_dataset --output output/tracking/bytetrack
 
     # BoT-SORT on detection model with camera-motion compensation
-    python scripts/track.py --tracker botsort \\
+    python scripts/11_run_tracking.py --tracker botsort \\
         --model runs/detect/.../weights/best.pt \\
         --data MTR_metacam_right --output output/tracking/botsort \\
         --with-cmc --cmc-method sparseOptFlow
 
     # YOLO detect + SAM3 segment
-    python scripts/track.py --tracker detect-then-sam3 \\
+    python scripts/11_run_tracking.py --tracker detect-then-sam3 \\
         --yolo-model runs/detect/.../weights/best.pt \\
         --sam3-model core/sam3/models/sam3-model/sam3.pt \\
         --data MTR_dataset --output output/tracking/detect_then_sam3
