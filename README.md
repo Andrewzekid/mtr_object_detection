@@ -5,6 +5,50 @@ training and inference, built with PyQt6 and Ultralytics YOLO.
 
 ---
 
+## Overview
+
+End-to-end pipeline that takes **raw images** and produces a **trained YOLO
+detection/segmentation model** plus **tracking results**, with a
+human-in-the-loop review step in the middle. It targets Hong Kong MTR and
+industrial (IW) station imagery but is dataset-agnostic.
+
+There are two labeling flows:
+
+**Full pipeline** (dense labeling — every frame is labeled):
+
+```
+raw images → 07 Qwen VLM auto-label → 08 human review/clean boxes
+            → 08b train/val/test split → 09 SAM3 box→mask seg dataset
+            → 04 YOLO train → 05 evaluate → 11 tracking on raw frames
+```
+
+**Keyframe pipeline** (sparse labeling for near-static cameras — label every
+Nth frame, interpolate the rest):
+
+```
+12 extract keyframes → 07 Qwen seed boxes on keyframes → 08 review keyframes
+   → 13 KLT optical-flow interpolation to all frames → 08 review all
+   → 09 SAM3 segmentation dataset
+```
+
+### Directory layout
+
+| Path | Contents |
+|------|----------|
+| `scripts/` | Numbered CLI entry points (pipeline stages) + helpers. |
+| `core/` | Reusable OOP classes / headless inference wrappers the scripts build on. |
+| `Datasets/` | Raw images, reference/conditioning images, YOLO datasets. |
+| `output/` | Generated artifacts (annotations, splits, seg datasets, tracking, vis). |
+| `cvat_local/` | Local CVAT docker-compose deployment for browser-based review. |
+
+The numbered `scripts/` are thin CLI wrappers over `core/` classes
+(`ModelTrainer`, `ModelEvaluator`, `DataProcessor`, `DatasetCreator`,
+`ModelVisualizer`) and inference wrappers (`run_qwen`, `run_qwen_api`,
+`run_sam3`, `run_gemini` in `core/models_inference.py`). A full per-script
+reference with inputs/outputs is at the bottom of this file.
+
+---
+
 ## Prerequisites
 
 ```bash
@@ -68,6 +112,9 @@ python scripts/07_run_qwen.py \
   --image-folder Datasets/MTR/MTR_new_10_images \
   --output Datasets/MTR/MTR_new_10_images_annotations \
   --vis-output output/MTR_new_10_images/qwen_vis
+
+#Per image labels
+python scripts/07_run_qwen.py   --prompt "Detect all: Ceiling light, Exit Sign, Advertisement Board, Ticket Gate, Map, TV. Ceiling lights are flat, horizontal rectangular strips on the ceiling. Exit signs are hanging LCD screens showing directions. Advertisement boards are flat LCD screens on the green wall showing commercial content. Maps are posters showing MTR directions. Ticket gates are turnstiles. TVs are hanging LCD screens showing general content, not directions."   --template object_detection --format json   --image-folder Datasets/MTR/MTR_new_10_images   --output Datasets/MTR/MTR_new_10_images_annotations   --vis-output output/MTR_new_10_images/qwen_vis --per-class --conditioning-images ./ref_images --per-image-labels 
 
 ```
 
@@ -172,8 +219,14 @@ output/MTR_new_1k/reviewed/yolo_seg/
 └── creation_summary.json
 ```
 
-### 5. Upload to Roboflow
-Data augmentation and train test split is done by roboflow
+### 5. Upload to Roboflow (optional)
+
+> **Note:** `scripts/12_upload_to_roboflow.py` is **not currently in the repo**
+> (only a stale `__pycache__/12_upload_to_roboflow.cpython-313.pyc` remains;
+> the `12_*` slot is now `12_extract_keyframes.py`). The command below is the
+> intended interface if you re-add the script. Data augmentation and the
+> train/val/test split can alternatively be done by Roboflow itself.
+
 ```bash
 python scripts/12_upload_to_roboflow.py \
   --dataset-dir output/MTR_new_1k/reviewed/yolo_seg \
@@ -296,8 +349,66 @@ Speed options for benchmark mode:
 
 ---
 
+## Script reference
 
+Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
+(not exhaustive — run `python scripts/<name>.py --help` for the full set).
 
+### Pipeline stages
 
+| Script | Purpose | Key inputs | Outputs |
+|-------|---------|------------|---------|
+| `00_sample_from_dataset.py` | Pick N images from a source folder that aren't already in the labeled YOLO set, ready for labeling. | `--source-dir`, `--labeled-dir`, `--out-dir`, `-n`, `--copy`/`--symlink`, `--dry-run` | New image folder (copied or symlinked) |
+| `07_run_qwen.py` | Auto-label images with a VLM: Qwen via Ollama or DashScope API, or Gemma/Gemini. Supports conditioning refs, per-class, per-image labels. | `--prompt`, `--image`/`--image-folder`, `--template`, `--model`, `--conditioning-images`, `--per-class`, `--per-image-labels`, `--bbox-order`, `--dedup-iou`, `--use-api` | `<stem>_result.json` per image, `summary.json`, optional `--vis-output` |
+| `08_click_review_coco.py` | Interactive matplotlib reviewer to clean Qwen boxes; exports COCO + YOLO detection labels. | `--qwen-annotations-dir`, `--img_dir`, `--output_json`, `--output-yolo-dir`, `--data-yaml` | `coco_reviewed.json`, `yolo_reviewed/` (images, labels, `data.yaml`) |
+| `08b_split_reviewed_dataset.py` | Split `08`'s flat `yolo_reviewed/` into train/val/test for `09`. | `--input-dir`, `--output-dir`, `--ratios`, `--seed`, `--symlink-images` | `images/labels/{train,val,test}/`, `data.yaml` |
+| `09_create_seg_dataset.py` | Convert detection boxes → SAM3 masks → YOLO seg polygons, per class. | `--input-dir` (split), `--output-dir`, `--model` (sam3), `--conf`, `--device` | YOLO seg dataset + `creation_summary.json` |
+| `04_train_model.py` | Train a YOLO detect/segment model (Ultralytics). | `--config` (data.yaml), `--model-type`, `--task`, `--epochs`, `--batch-size`, `--device`, `--loss-type` | `runs/.../weights/best.pt` |
+| `05_evaluate_model.py` | Evaluate a trained model on a split, or compare pred vs GT COCO JSON. | `--model`, `--data`, `--split`, `--conf`, `--iou` (or `--pred-json`/`--gt-json`) | Metrics report (stdout) |
+| `11_run_tracking.py` | YOLO tracking (ByteTrack / BoT-SORT / detect-then-SAM3) + a no-output benchmark mode. | `--tracker`, `--model`, `--data`, `--output`, `--conf`, `--device`, `--warmup-frames` | `tracked_*.jpg`, `results.json`, `tracking_result.mp4` |
+
+### Keyframe pipeline
+
+| Script | Purpose | Key inputs | Outputs |
+|-------|---------|------------|---------|
+| `12_extract_keyframes.py` | Select every Nth frame as a keyframe + write a manifest for the interpolator. | `--image-folder`/`--video`, `--output-dir`, `--every`, `--mode` | Keyframe images + `keyframe_manifest.json` |
+| `13_interpolate_tracks.py` | Propagate reviewed keyframe boxes to every frame via anchored KLT optical flow. | `--keyframes-coco`, `--manifest`, `--image-folder`, `--output-coco`, `--match-max-dist` | COCO annotations for every frame (+ optional vis) |
+
+### Data prep & conversion
+
+| Script | Purpose | Key inputs | Outputs |
+|-------|---------|------------|---------|
+| `01_verify_labels.py` | Validate YOLO labels: missing files, bad formats, class stats. | `--input-dir`, `--images-subdir`, `--labels-subdir`, `--class-names`, `--fix` | Report (stdout / `--output`); optional in-place fixes |
+| `02_augment_data.py` | Augment a labeled YOLO dataset (flip/rotate/brightness/contrast/mosaic). | `--input-dir`, `--output-dir`, `--augmentations`, `--multiplier` | Augmented images + labels |
+| `03_split_dataset.py` | Split a labeled YOLO dataset into train/val/test + `data.yaml`. | `--input-dir`, `--output-dir`, `--ratios`, `--generate-yaml` | `images/labels/{train,val,test}/`, `data.yaml` |
+| `10_qwen_json_to_yolo.py` | Convert `07 --split-by-class` JSON into a YOLO detection dataset. | `--annotations-dir`, `--image-folder`, `--output-dir`, `--data-yaml` | YOLO detect dataset (`images/`, `labels/`, `data.yaml`) |
+
+### Standalone tools
+
+| Script | Purpose | Key inputs | Outputs |
+|-------|---------|------------|---------|
+| `06_run_sam3.py` | Run SAM3 segmentation on an image/folder, optionally with bbox exemplars. | `--image`/`--image-folder`, `--bbox`/`--bbox-json`, `--concept`, `--model` | Masks / overlay images (`--output`, `--save-overlay`) |
+| `track_sam3_video.py` | SAM3VideoPredictor video segmentation (single / reseed / chunks modes). | `--mode`, `--yolo-model`, `--sam3-model`, `--data`, `--output` | Per-frame masks / video |
+| `undistort_rosbag.py` | Fisheye-undistort a folder of images using a calibration JSON. | `--images-root`, `--output-root`, `--calibration`, `--camera-name` | Undistorted images |
+| `visualize.py` | Visualize Qwen annotations / YOLO detect / YOLO seg / model predictions. | `--mode`, `--dataset`/`--annotations-folder`, `--output`, `--model` | Annotated images |
+| `tracking_utils.py` | Shared helpers (tracker YAML, IoU, mask→polygon, summary video). | — (library, not a CLI) | — |
+
+> `scripts/12_upload_to_roboflow.py` is referenced in step 5 but is not present
+> in the repo (only a stale `.pyc`); the `12_*` slot is now `12_extract_keyframes.py`.
+
+### `core/` modules
+
+These back the scripts above; not normally invoked directly.
+
+| Module | Role |
+|--------|------|
+| `models_inference.py` | Headless VLM/SAM3 inference wrappers: `run_qwen` (Ollama), `run_qwen_api` (DashScope), `run_gemini` (HKU proxy), `run_sam3`; prompt templates + output parsing. |
+| `model_trainer.py` | `ModelTrainer` — YOLO training pipeline (backs `04`). |
+| `model_evaluator.py` | `ModelEvaluator` — evaluation + pred/GT comparison (backs `05`). |
+| `data_processor.py` | `DataProcessor` — augmentation + dataset stats (backs `02`). |
+| `dataset_creator.py` | `DatasetCreator` — undistortion, random selection, split (backs `00`/`03`). |
+| `model_visualizer.py` / `visualizer.py` / `visualization.py` | Visualization helpers (back `visualize.py`). |
+| `hyperparameter_search.py` | Search-space + grid/random search strategies for training. |
+| `sam3_test.py` | SAM3 scratch/test harness (not a pipeline stage). |
 
 

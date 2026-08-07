@@ -417,6 +417,9 @@ def run_qwen(
     status_callback: Optional[Callable[[str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    per_image_labels: bool = False,
+    bbox_field: str = "bbox_2d",
+    bbox_order: str = "xyxy",
 ) -> Dict:
     """
     Run Qwen3.6 inference via Ollama API.
@@ -430,6 +433,11 @@ def run_qwen(
         conditioning_images: Optional list of conditioning/reference images for few-shot
                              visual prompting. Each item is a dict with 'label' (class name)
                              and 'path' (image path). These are prepended before the main image.
+        per_image_labels: If True, attach a "Reference image for class: <label>" text
+                          part after each conditioning image. The local Ollama backend
+                          then uses the interleaved /v1/chat/completions endpoint
+                          (instead of /api/generate's flat image list) so each
+                          reference can be labeled individually.
         ollama_base_url: Ollama API base URL
         model_name: Model name in Ollama
         timeout: Request timeout in seconds
@@ -455,85 +463,132 @@ def run_qwen(
     
     # Apply template if provided
     if template_id:
-        prompt = apply_prompt_template(prompt, template_id)
-    
+        prompt = apply_prompt_template(prompt, template_id,
+                                       bbox_field=bbox_field,
+                                       bbox_order=bbox_order)
+
     # Add format instruction to prompt
     format_instruction = get_format_instruction(output_format)
     full_prompt = f"{prompt}\n\n{format_instruction}"
-    
+
     try:
         if progress_callback:
             progress_callback(10)
-        
-        # Prepare request payload
-        payload = {
-            "model": model_name,
-            "prompt": full_prompt,
-            "stream": False,
-        }
+
+        # MIME helper for the OpenAI-compatible image_url data-URI format.
+        def _mime_for(suffix: str) -> str:
+            return {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+                ".tiff": "image/tiff", ".tif": "image/tiff",
+            }.get(suffix.lower(), "image/jpeg")
+
+        def _encode_image(img_path) -> str:
+            with open(img_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+
         print(f"Sending request to Ollama at {ollama_base_url} with model {model_name}... prompt: {full_prompt}...")
-        
-        # Collect all images: conditioning images first, then main image
-        all_images = []
-        
-        # Encode conditioning images
-        if conditioning_images:
-            for cond_img in conditioning_images:
-                cond_path = Path(cond_img["path"])
-                if not cond_path.exists():
-                    return {"success": False, "error": f"Conditioning image not found: {cond_path}"}
-                with open(cond_path, "rb") as f:
-                    cond_data = base64.b64encode(f.read()).decode("utf-8")
-                all_images.append(cond_data)
-                if log_callback:
-                    log_callback(f"Conditioning image: {cond_img['label']} -> {cond_path}")
-        
-        # Encode main image(s)
-        if image_path is not None:
-            # Handle both single path and list of paths
-            if isinstance(image_path, list):
-                for img_path in image_path:
+
+        if per_image_labels:
+            # OpenAI-compatible /v1/chat/completions so each reference image can be
+            # interleaved with its own text label (not possible with /api/generate's
+            # flat images list). Conditioning images first, each followed by a
+            # "Reference image for class: <label>" text part, then the main image(s),
+            # then the prompt.
+            content_parts = []
+            if conditioning_images:
+                for cond_img in conditioning_images:
+                    cond_path = Path(cond_img["path"])
+                    if not cond_path.exists():
+                        return {"success": False, "error": f"Conditioning image not found: {cond_path}"}
+                    cond_data = _encode_image(cond_path)
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{_mime_for(cond_path.suffix)};base64,{cond_data}"},
+                    })
+                    content_parts.append({
+                        "type": "text",
+                        "text": f"Reference image for class: {cond_img['label']}",
+                    })
+                    if log_callback:
+                        log_callback(f"Conditioning image (labeled): {cond_img['label']} -> {cond_path}")
+            if image_path is not None:
+                main_paths = image_path if isinstance(image_path, list) else [image_path]
+                for img_path in main_paths:
                     image_file = Path(img_path)
                     if not image_file.exists():
                         return {"success": False, "error": f"Image not found: {image_file}"}
-                    with open(image_file, "rb") as f:
-                        image_data = base64.b64encode(f.read()).decode("utf-8")
-                    all_images.append(image_data)
-            else:
-                image_file = Path(image_path)
-                if not image_file.exists():
-                    return {"success": False, "error": f"Image not found: {image_file}"}
-                with open(image_file, "rb") as f:
-                    image_data = base64.b64encode(f.read()).decode("utf-8")
-                all_images.append(image_data)
-        
-        if all_images:
-            payload["images"] = all_images
-        
+                    img_data = _encode_image(image_file)
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{_mime_for(image_file.suffix)};base64,{img_data}"},
+                    })
+            content_parts.append({"type": "text", "text": full_prompt})
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": content_parts}],
+                "stream": False,
+            }
+            endpoint = f"{ollama_base_url}/v1/chat/completions"
+        else:
+            # Legacy /api/generate path: flat images list + single prompt.
+            payload = {
+                "model": model_name,
+                "prompt": full_prompt,
+                "stream": False,
+            }
+            all_images = []
+            if conditioning_images:
+                for cond_img in conditioning_images:
+                    cond_path = Path(cond_img["path"])
+                    if not cond_path.exists():
+                        return {"success": False, "error": f"Conditioning image not found: {cond_path}"}
+                    all_images.append(_encode_image(cond_path))
+                    if log_callback:
+                        log_callback(f"Conditioning image: {cond_img['label']} -> {cond_path}")
+            if image_path is not None:
+                if isinstance(image_path, list):
+                    for img_path in image_path:
+                        image_file = Path(img_path)
+                        if not image_file.exists():
+                            return {"success": False, "error": f"Image not found: {image_file}"}
+                        all_images.append(_encode_image(image_file))
+                else:
+                    image_file = Path(image_path)
+                    if not image_file.exists():
+                        return {"success": False, "error": f"Image not found: {image_file}"}
+                    all_images.append(_encode_image(image_file))
+            if all_images:
+                payload["images"] = all_images
+            endpoint = f"{ollama_base_url}/api/generate"
+
         if status_callback:
             status_callback("Sending request to Ollama...")
-        
+
         if progress_callback:
             progress_callback(30)
-        
+
         # Make API request
-        response = requests.post(
-            f"{ollama_base_url}/api/generate",
-            json=payload,
-            timeout=timeout,
-        )
-        
+        response = requests.post(endpoint, json=payload, timeout=timeout)
+
         if progress_callback:
             progress_callback(70)
-        
+
         if response.status_code != 200:
             return {
                 "success": False,
                 "error": f"Ollama API error: {response.status_code} - {response.text}",
             }
-        
+
         result = response.json()
-        raw_response = result.get("response", "")
+        if per_image_labels:
+            # /v1/chat/completions response shape: choices[0].message.content
+            try:
+                raw_response = result["choices"][0]["message"]["content"]
+            except (KeyError, IndexError):
+                raw_response = result.get("response", "") or json.dumps(result)
+        else:
+            raw_response = result.get("response", "")
         
         if status_callback:
             status_callback("Parsing response...")
@@ -589,6 +644,9 @@ def run_qwen_api(
     status_callback: Optional[Callable[[str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    per_image_labels: bool = False,
+    bbox_field: str = "bbox_2d",
+    bbox_order: str = "xyxy",
 ) -> Dict:
     """
     Run Qwen VL Plus inference via Aliyun DashScope API (OpenAI-compatible).
@@ -632,12 +690,14 @@ def run_qwen_api(
     
     # Apply template if provided
     if template_id:
-        prompt = apply_prompt_template(prompt, template_id)
-    
+        prompt = apply_prompt_template(prompt, template_id,
+                                       bbox_field=bbox_field,
+                                       bbox_order=bbox_order)
+
     # Add format instruction to prompt
     format_instruction = get_format_instruction(output_format)
     full_prompt = f"{prompt}\n\n{format_instruction}"
-    
+
     # Get API key
     if api_key is None:
         api_key = os.getenv("API_KEY")
@@ -684,7 +744,7 @@ def run_qwen_api(
             }
             return img_data, mime_map.get(suffix, 'image/jpeg')
         
-        # Add conditioning images with labels
+        # Add conditioning images; attach a per-image text label when enabled.
         if conditioning_images:
             for cond_img in conditioning_images:
                 cond_data, cond_mime = _encode_image(cond_img["path"])
@@ -696,10 +756,11 @@ def run_qwen_api(
                         "url": f"data:{cond_mime};base64,{cond_data}"
                     }
                 })
-                content_parts.append({
-                    "type": "text",
-                    "text": f"Reference image for class: {cond_img['label']}"
-                })
+                if per_image_labels:
+                    content_parts.append({
+                        "type": "text",
+                        "text": f"Reference image for class: {cond_img['label']}"
+                    })
                 if log_callback:
                     log_callback(f"Conditioning image: {cond_img['label']} -> {cond_img['path']}")
         
@@ -859,14 +920,16 @@ def run_gemini(
         log_callback(f"Model: {deployment_id}")
         log_callback(f"Output format: {output_format}")
     
-    # Apply template if provided
+    # Apply template if provided. Gemini natively emits box_2d in yxyx.
     if template_id:
-        prompt = apply_prompt_template(prompt, template_id)
-    
+        prompt = apply_prompt_template(prompt, template_id,
+                                       bbox_field="box_2d",
+                                       bbox_order="yxyx")
+
     # Add format instruction to prompt
     format_instruction = get_format_instruction(output_format)
     full_prompt = f"{prompt}\n\n{format_instruction}"
-    
+
     try:
         if progress_callback:
             progress_callback(10)
@@ -1017,17 +1080,45 @@ def run_gemini(
         }
 
 
-def apply_prompt_template(prompt: str, template_id: str) -> str:
-    """Apply a predefined prompt template."""
+def apply_prompt_template(prompt: str, template_id: str,
+                          bbox_field: str = "bbox_2d",
+                          bbox_order: str = "xyxy") -> str:
+    """Apply a predefined prompt template.
+
+    ``bbox_field`` and ``bbox_order`` adapt the ``object_detection`` template to
+    the model's native bounding-box convention so the model is not asked to emit
+    a format it was not trained on. Qwen uses ``bbox_2d`` in xyxy; Gemma/Gemini
+    use ``box_2d`` in yxyx. Both are normalized 0-1000.
+    """
+    if bbox_order == "yxyx":
+        coord_desc = (
+            "bounding box coordinates in [y1, x1, y2, x2], where (y1, x1) is the "
+            "top-left corner and (y2, x2) the bottom-right corner, normalized to "
+            "the 0-1000 range relative to image height/width."
+        )
+        example = f'[{{"label": "object_name", "{bbox_field}": [y1, x1, y2, x2]}}]'
+    else:
+        coord_desc = (
+            "bounding box coordinates in [x1, y1, x2, y2], where (x1, y1) is the "
+            "top-left corner and (x2, y2) the bottom-right corner, normalized to "
+            "the 0-1000 range relative to image width/height."
+        )
+        example = f'[{{"label": "object_name", "{bbox_field}": [x1, y1, x2, y2]}}]'
     templates = {
-        "object_detection": "Analyze this image and detect all objects. For each object, provide the class name and bounding box coordinates in [x1, y1, x2, y2]. x1, y1 are the pixel coordinates of the top left corner of the box and x2, y2 are the pixel coordinates of the bottom right corner of the box. Return the result as a JSON array like: [{\"label\": \"object_name\", \"bbox_2d\": [x1, y1, x2, y2]}].",
+        "object_detection": (
+            "Analyze this image and detect all objects. For each object, provide "
+            "the class name and " + coord_desc + " Return the result as a JSON "
+            "array like: " + example + ". Only report objects you are confident "
+            "are actually present in the image; do not invent objects, and do not "
+            "output duplicate or heavily overlapping boxes for the same object."
+        ),
         "image_captioning": "Describe this image in detail, including all visible objects, their positions, and any actions occurring.",
         "scene_understanding": "Analyze the scene in this image. What is happening? What are the main elements? What is the context?",
         "counting": "Count all objects in this image by category. Provide a detailed breakdown.",
         "spatial_reasoning": "Analyze the spatial relationships between objects in this image. Describe relative positions and distances.",
-        
+
     }
-    
+
     template = templates.get(template_id, "")
     if template:
         return f"{template}\n\nUser request: {prompt}"

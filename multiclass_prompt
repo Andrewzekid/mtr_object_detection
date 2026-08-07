@@ -1,8 +1,0 @@
-
-python scripts/07_run_qwen.py --prompt "Detect all objects: Ceiling light, Exit Sign, Advertisement Board, Ticket Gate, Map, TV.
-TV is a lcd hanging from the ceiling which does not contain directions or symbols. Exit sign contains lime character 出 with letters and arrows and is a hanging monitor.
- Ceiling light are a flat and horizontal rectangular strip, do not detect reflections of lights in the glass or wall. If there are lights in the green wall, they are likely to be reflections. Consider carefully whether or not they are actually reflections. Detect individual ceiling lights and do not cluster them together. 
- Advertisement board are flat lcd screens on the green wall that only display commercial content, not directions. They are not TVs.   
- Maps are posters which show the directions in the MTR and which way to go.
- Ticket gates are turnstiles. Do not classify ticket vending machines as ticket gates.
- " --template object_detection --format json  --use-api --image-folder ./MTR_dataset   --annotations-output ./output/mtr_1k_annotations/   --vis-output ./output/mtr_1k_qwen_vis/   --split-by-class --resume-from 100 --api-key-env PREMIUM_KEY --base-url "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1" --api-model "qwen3.7-plus"
