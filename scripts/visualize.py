@@ -635,9 +635,37 @@ def visualize_predictions(args):
     print(f"Loading model: {model_path}")
     model = YOLO(str(model_path))
     
+    # Force model onto the requested device (e.g. GPU 0) at load time so
+    # nvidia-smi shows utilization and per-image predict() stays on GPU.
+    import torch
+    device = args.device
+    if device is None or device == "":
+        device = "0"
+    try:
+        if device.isdigit() or ":" in device:
+            model.to(f"cuda:{device}" if device.isdigit() else f"cuda:{device.split(':')[1]}")
+        elif device.startswith("cuda"):
+            model.to(device)
+        print(f"Model moved to device: {device}")
+    except Exception as e:
+        print(f"Warning: could not move model to device '{device}': {e}")
+    
     # Get class names from model
     class_names = list(model.names.values()) if hasattr(model, 'names') and model.names else [f"class_{i}" for i in range(10)]
     print(f"Classes: {class_names}")
+    
+    # Parse excluded classes
+    excluded_cls_ids = set()
+    if getattr(args, "exclude_classes", None):
+        tokens = [t.strip() for t in args.exclude_classes.split(",") if t.strip()]
+        for tok in tokens:
+            if tok.isdigit():
+                excluded_cls_ids.add(int(tok))
+            elif tok in class_names:
+                excluded_cls_ids.add(class_names.index(tok))
+            else:
+                print(f"Warning: exclude-classes token '{tok}' did not match any class name or ID; ignoring")
+        print(f"Excluded class IDs: {excluded_cls_ids} ({[class_names[i] for i in sorted(excluded_cls_ids) if i < len(class_names)]})")
     
     # Find images
     image_files = sorted([f for f in images_dir.iterdir() if f.suffix.lower() in IMAGE_EXTENSIONS])
@@ -678,6 +706,9 @@ def visualize_predictions(args):
             for i in range(len(masks)):
                 cls_id = int(boxes.cls[i])
                 conf = float(boxes.conf[i])
+                
+                if cls_id in excluded_cls_ids:
+                    continue
                 
                 if args.color_scheme == "hsv":
                     color = get_hsv_color(cls_id, num_classes)
@@ -801,6 +832,8 @@ Examples:
     parser.add_argument("--color-scheme", type=str, choices=("distinct", "hsv"), 
                         default="distinct",
                         help="Color palette (for predictions mode)")
+    parser.add_argument("--exclude-classes", type=str, default=None,
+                        help="Comma-separated class names or IDs to exclude from visualization (for predictions mode). Example: 'Ticket Gate' or '5' or 'Ticket Gate,TV'")
     
     return parser.parse_args()
 

@@ -630,6 +630,197 @@ def run_qwen(
         }
 
 
+def run_qwen_llamacpp(
+    prompt: str,
+    template_id: Optional[str] = None,
+    output_format: str = "json",
+    image_path: Optional[str | Path | List[str | Path]] = None,
+    conditioning_images: Optional[List[Dict[str, str]]] = None,
+    llamacpp_base_url: str = "http://127.0.0.1:8089",
+    model_name: str = "./Qwen3.6-27B-Q5_K_M.gguf",
+    api_key: str = "local",
+    timeout: int = 600,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
+    bbox_field: str = "bbox_2d",
+    bbox_order: str = "xyxy",
+) -> Dict:
+    """Run Qwen3.6 inference via a llama.cpp server (OpenAI-compatible API).
+
+    llama.cpp's server (started with `--mmproj <mmproj.gguf>`) exposes the
+    OpenAI-compatible ``/v1/chat/completions`` endpoint and reads images through
+    the mmproj vision projector. Images are passed as ``image_url`` content parts
+    using ``data:<mime>;base64,<...>`` URIs, exactly the format the mmproj
+    projector consumes. This mirrors the Ollama ``per_image_labels`` path so
+    conditioning images can be interleaved with per-image text labels.
+
+    Args:
+        prompt: Text prompt for the model.
+        template_id: Optional template identifier for predefined prompts.
+        output_format: Desired output format ('json', 'yaml', 'bbox', 'text').
+        image_path: Optional image path (single or list) for multimodal input.
+        conditioning_images: Optional list of conditioning/reference images (dicts
+                             with 'label' and 'path'), each prepended with a
+                             "Reference image for class: <label>" text part.
+        llamacpp_base_url: Base URL of the llama.cpp server (no /v1 suffix).
+        model_name: Model identifier the server was started with (the .gguf path
+                   or alias). llama.cpp accepts any string here; it's mostly for
+                   logging on the server side.
+        api_key: API key for the server (use any non-empty string for local;
+                 "local" by default).
+        timeout: Request timeout in seconds (llama.cpp can be slower than
+                 Ollama for vision, so the default is 600).
+        progress_callback / status_callback / log_callback / is_cancelled:
+            Optional callbacks (same contract as run_qwen).
+        bbox_field / bbox_order: Bounding-box convention for prompt templating.
+
+    Returns:
+        Same dict shape as :func:`run_qwen`:
+            success, response (raw text), parsed_output, format, model.
+    """
+    if status_callback:
+        status_callback("Preparing llama.cpp request...")
+
+    if log_callback:
+        log_callback(f"Prompt: {prompt[:100]}...")
+        log_callback(f"Model: {model_name}")
+        log_callback(f"Output format: {output_format}")
+
+    # Apply template if provided
+    if template_id:
+        prompt = apply_prompt_template(prompt, template_id,
+                                        bbox_field=bbox_field,
+                                        bbox_order=bbox_order)
+
+    # Add format instruction to prompt
+    format_instruction = get_format_instruction(output_format)
+    full_prompt = f"{prompt}\n\n{format_instruction}"
+
+    try:
+        if progress_callback:
+            progress_callback(10)
+
+        # MIME helper for the OpenAI-compatible image_url data-URI format.
+        def _mime_for(suffix: str) -> str:
+            return {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+                ".tiff": "image/tiff", ".tif": "image/tiff",
+            }.get(suffix.lower(), "image/jpeg")
+
+        def _encode_image(img_path) -> str:
+            with open(img_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+
+        print(f"Sending request to llama.cpp at {llamacpp_base_url} with model {model_name}...")
+
+        # llama.cpp's server is OpenAI-compatible, so we always use the
+        # /v1/chat/completions endpoint with interleaved content parts.
+        # Conditioning images come first, each followed by a "Reference image
+        # for class: <label>" text part, then the main image(s), then the prompt.
+        content_parts = []
+        if conditioning_images:
+            for cond_img in conditioning_images:
+                cond_path = Path(cond_img["path"])
+                if not cond_path.exists():
+                    return {"success": False, "error": f"Conditioning image not found: {cond_path}"}
+                cond_data = _encode_image(cond_path)
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{_mime_for(cond_path.suffix)};base64,{cond_data}"},
+                })
+                content_parts.append({
+                    "type": "text",
+                    "text": f"Reference image for class: {cond_img['label']}",
+                })
+                if log_callback:
+                    log_callback(f"Conditioning image (labeled): {cond_img['label']} -> {cond_path}")
+        if image_path is not None:
+            main_paths = image_path if isinstance(image_path, list) else [image_path]
+            for img_path in main_paths:
+                image_file = Path(img_path)
+                if not image_file.exists():
+                    return {"success": False, "error": f"Image not found: {image_file}"}
+                img_data = _encode_image(image_file)
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{_mime_for(image_file.suffix)};base64,{img_data}"},
+                })
+        content_parts.append({"type": "text", "text": full_prompt})
+
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": content_parts}],
+            "stream": False,
+        }
+        endpoint = f"{llamacpp_base_url}/v1/chat/completions"
+
+        if status_callback:
+            status_callback("Sending request to llama.cpp...")
+
+        if progress_callback:
+            progress_callback(30)
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=timeout)
+
+        if progress_callback:
+            progress_callback(70)
+
+        if response.status_code != 200:
+            return {
+                "success": False,
+                "error": f"llama.cpp API error: {response.status_code} - {response.text}",
+            }
+
+        result = response.json()
+        try:
+            raw_response = result["choices"][0]["message"]["content"]
+        except (KeyError, IndexError):
+            raw_response = result.get("response", "") or json.dumps(result)
+
+        if status_callback:
+            status_callback("Parsing response...")
+
+        parsed_output = parse_output(raw_response, output_format)
+        print(f"Parsed output: {parsed_output}")
+
+        if log_callback:
+            log_callback(f"Response received. Length: {len(raw_response)} chars")
+
+        if progress_callback:
+            progress_callback(100)
+
+        return {
+            "success": True,
+            "response": raw_response,
+            "parsed_output": parsed_output,
+            "format": output_format,
+            "model": model_name,
+        }
+
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "error": f"Request timed out after {timeout} seconds",
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "success": False,
+            "error": f"Could not connect to llama.cpp at {llamacpp_base_url}. Is the server running?",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"llama.cpp inference failed: {str(e)}",
+        }
+
+
 def run_qwen_api(
     prompt: str,
     template_id: Optional[str] = None,

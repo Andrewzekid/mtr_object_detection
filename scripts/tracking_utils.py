@@ -26,6 +26,184 @@ def find_ultralytics_trackers_dir() -> Path:
     return Path(ultralytics.__file__).parent / "cfg" / "trackers"
 
 
+# ---------------------------------------------------------------------------
+# DINO ReID encoder
+# ---------------------------------------------------------------------------
+
+class DinoReIDEncoder:
+    """ReID appearance encoder backed by a DINOv2/DINOv3 ViT.
+
+    Ultralytics' built-in ``ReID`` class only handles YOLO ``.pt`` checkpoints
+    or ONNX-style backends, so DINO ViTs need a small adapter that implements the
+    same ``(img, dets) -> list[np.ndarray]`` callable interface used by
+    BoT-SORT's ``build_encoder``. Each detection crop is resized to the ViT's
+    input size, normalized, and passed through the backbone; the pooled token
+    embedding (CLS or patch average) is returned per detection.
+
+    Two loading paths are supported:
+
+    * **torch.hub** — for public DINOv2 models (e.g. ``dinov2_vits14``)
+      downloaded from the ``facebookresearch/dinov2`` hub repo.
+    * **HuggingFace transformers** — for DINOv3 models stored as
+      ``config.json`` + ``model.safetensors`` in a local directory (e.g. a
+      mirror of a gated repo). Detected when ``model_name`` is a path to a
+      directory containing ``config.json``.
+
+    Args:
+        model_name: either a torch.hub entry point (e.g. ``"dinov2_vits14"``)
+            or a path to a local HuggingFace checkpoint directory.
+        device: torch device string (e.g. ``"cuda"`` or ``"cuda:0"``). Defaults
+            to CUDA if available.
+        imgsz: square input size for the ViT. Defaults to 224 (DINO's native
+            pretraining resolution for the small variants).
+    """
+
+    def __init__(self, model_name: str = "dinov2_vits14", device: str | None = None,
+                 imgsz: int = 224):
+        import torch
+
+        self.model_name = model_name
+        self.imgsz = imgsz
+        self.device = torch.device(
+            device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        model_path = Path(str(model_name))
+        if model_path.is_dir() and (model_path / "config.json").exists():
+            # HuggingFace transformers loading path (DINOv3 local checkpoint).
+            self._load_hf_transformers(model_path)
+        elif model_name.startswith("dinov3"):
+            repo = "facebookresearch/dinov3"
+            self._load_torch_hub(model_name, repo)
+        elif model_name.startswith("dinov2"):
+            repo = "facebookresearch/dinov2"
+            self._load_torch_hub(model_name, repo)
+        else:
+            raise ValueError(
+                f"Unknown DINO model '{model_name}'. Expected a name starting with "
+                "'dinov2', 'dinov3', or a path to a HuggingFace checkpoint directory."
+            )
+
+        # Standard ImageNet normalization (DINO uses the same).
+        self.mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+
+        print(f"[DinoReID] {model_name} ready on {self.device}, embed_dim={self.embed_dim}")
+
+    def _load_torch_hub(self, model_name: str, repo: str):
+        """Load a DINOv2/DINOv3 model via torch.hub."""
+        import torch
+
+        print(f"[DinoReID] Loading {model_name} from {repo} ...")
+        self.model = torch.hub.load(repo, model_name, trust_repo=True)
+        self.model.eval().to(self.device)
+        self.embed_dim = getattr(self.model, "embed_dim", None)
+        self._backend = "torch_hub"
+
+    def _load_hf_transformers(self, model_path: Path):
+        """Load a DINOv3 model from a local HuggingFace checkpoint directory."""
+        import torch
+        from transformers import AutoModel, AutoImageProcessor
+
+        print(f"[DinoReID] Loading DINOv3 from HuggingFace checkpoint: {model_path}")
+        self.model = AutoModel.from_pretrained(
+            str(model_path), trust_remote_code=True
+        ).eval().to(self.device)
+        self.processor = AutoImageProcessor.from_pretrained(str(model_path))
+        self.embed_dim = self.model.config.hidden_size
+        self._backend = "hf_transformers"
+
+    @staticmethod
+    def _crop_detections(img, dets):
+        """Crop detection regions from a BGR image. ``dets`` is xywh (N,>=4)."""
+        import torch
+        from ultralytics.utils.ops import xywh2xyxy
+        from ultralytics.utils.plotting import save_one_box
+
+        return [save_one_box(det, img, save=False)
+                for det in xywh2xyxy(torch.from_numpy(dets[:, :4]))]
+
+    def __call__(self, img, dets):
+        """Extract L2-normalized embeddings for each detection crop.
+
+        Args:
+            img: BGR image (H, W, 3) as a numpy array.
+            dets: (N, >=4) array of detections in xywh format (only first 4
+                  columns are used).
+
+        Returns:
+            list of (embed_dim,) numpy arrays, one per detection.
+        """
+        import torch
+
+        if len(dets) == 0:
+            return []
+
+        crops = self._crop_detections(img, dets)
+
+        if self._backend == "hf_transformers":
+            return self._encode_hf(crops)
+
+        # torch.hub backend
+        batch = torch.empty(len(crops), 3, self.imgsz, self.imgsz,
+                            dtype=torch.float32, device=self.device)
+        for i, c in enumerate(crops):
+            # c is BGR; convert to RGB, to CHW float, normalize, resize.
+            t = torch.from_numpy(np.ascontiguousarray(c[..., ::-1])).permute(2, 0, 1).float() / 255.0
+            t = torch.nn.functional.interpolate(
+                t.unsqueeze(0), size=(self.imgsz, self.imgsz),
+                mode="bilinear", align_corners=False
+            )[0]
+            batch[i] = t
+
+        # Normalize per-channel.
+        batch = (batch - self.mean) / self.std
+
+        with torch.no_grad():
+            out = self.model(batch)
+            if isinstance(out, (tuple, list)):
+                feats = out[0]
+            else:
+                feats = out
+            if feats.ndim == 3:
+                feats = feats[:, 1:].mean(dim=1) if feats.shape[1] > 1 else feats[:, 0]
+            feats = feats.cpu().numpy()
+
+        norms = np.linalg.norm(feats, axis=1, keepdims=True)
+        norms[norms < 1e-12] = 1.0
+        feats = feats / norms
+        return [f for f in feats]
+
+    def _encode_hf(self, crops):
+        """Encode crops using the HuggingFace transformers backend."""
+        import torch
+        from PIL import Image
+
+        pil_crops = [Image.fromarray(c[..., ::-1]) for c in crops]  # BGR -> RGB -> PIL
+        inputs = self.processor(images=pil_crops, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(self.device)
+
+        with torch.no_grad():
+            out = self.model(pixel_values=pixel_values)
+            # last_hidden_state: (B, N_tokens, D); CLS token at index 0.
+            feats = out.last_hidden_state[:, 0]
+            feats = feats.cpu().numpy()
+
+        norms = np.linalg.norm(feats, axis=1, keepdims=True)
+        norms[norms < 1e-12] = 1.0
+        feats = feats / norms
+        return [f for f in feats]
+
+
+def build_dino_reid_encoder(model_name: str, device: str | None = None, imgsz: int = 224):
+    """Convenience factory: return a DinoReIDEncoder or None on failure."""
+    try:
+        return DinoReIDEncoder(model_name=model_name, device=device, imgsz=imgsz)
+    except Exception as e:
+        print(f"[DinoReID] Failed to load {model_name}: {e}")
+        return None
+
+
 def build_runtime_tracker_yaml(
     base_yaml: Path,
     tracker_type: str,
@@ -35,6 +213,7 @@ def build_runtime_tracker_yaml(
     track_high_thresh: float,
     with_reid: bool,
     output_dir: Path,
+    reid_model: str | None = None,
 ) -> Path:
     """Merge CLI overrides into a copy of a tracker YAML for this run.
 
@@ -60,6 +239,13 @@ def build_runtime_tracker_yaml(
         cfg["gmc_method"] = cmc_method
     else:
         cfg["gmc_method"] = "none"
+
+    # Set the ReID model field. "auto" means use the detector's backbone
+    # features; any other value is a model name/path that build_encoder
+    # resolves. For DINO models (dinov2*/dinov3*) the value is passed through
+    # to our patched build_encoder which instantiates DinoReIDEncoder.
+    if reid_model is not None:
+        cfg["model"] = reid_model
 
     with open(runtime_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)

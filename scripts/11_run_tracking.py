@@ -65,6 +65,8 @@ from scripts.tracking_utils import (
     bbox_iou,
     mask_to_polygon,
     polygon_area,
+    DinoReIDEncoder,
+    build_dino_reid_encoder,
 )
 
 
@@ -164,10 +166,70 @@ def _build_tracker_yaml(args, output_dir: Path):
             track_high_thresh=args.track_high_thresh,
             with_reid=args.with_reid,
             output_dir=output_dir,
+            reid_model=getattr(args, "reid_model", None),
         )
         print(f"BoT-SORT: cmc={args.with_cmc} ({args.cmc_method}), buffer={args.track_buffer}, reid={args.with_reid}")
+        if args.with_reid and args.reid_model:
+            print(f"  ReID model: {args.reid_model}")
         return tracker_yaml
     return None
+
+
+def _install_dino_reid(args):
+    """Patch ultralytics' ReID builder to return a DINOv2/DINOv3 encoder.
+
+    Ultralytics' BoT-SORT calls ``build_encoder(with_reid, model)`` at tracker
+    construction time. We monkey-patch that function so that when
+    ``--reid-model dinov2*`` / ``dinov3*`` is requested, a ``DinoReIDEncoder``
+    is returned instead of the built-in ``ReID`` class (which only handles YOLO
+    ``.pt`` checkpoints or ONNX backends).
+
+    Must be called *before* the first ``model.track()`` invocation so the patch
+    is in place when ``on_predict_start`` builds the tracker.
+    """
+    if not args.with_reid or not args.reid_model:
+        return
+    if not args.reid_model.startswith(("dinov2", "dinov3")) and not Path(args.reid_model).is_dir():
+        return  # leave the default behavior for "auto" / .pt / .onnx paths
+
+    from scripts.tracking_utils import build_dino_reid_encoder
+    import ultralytics.trackers.utils.reid as reid_mod
+
+    original_build_encoder = reid_mod.build_encoder
+
+    def patched_build_encoder(with_reid, model):
+        if not with_reid:
+            return None
+        if model in (None, "auto"):
+            # Fall back to the default "auto" path (detector backbone features).
+            return original_build_encoder(with_reid, model)
+        if model == args.reid_model:
+            # Normalize device shorthand: '0' -> 'cuda:0', 'auto' -> None
+            dev = args.device
+            if dev and dev != "auto":
+                if dev.isdigit():
+                    dev = f"cuda:{dev}"
+            else:
+                dev = None
+            encoder = build_dino_reid_encoder(
+                model_name=args.reid_model,
+                device=dev,
+                imgsz=args.reid_imgsz,
+            )
+            if encoder is None:
+                print(f"[ReID] DINO encoder load failed; falling back to '{model}' default path")
+                return original_build_encoder(with_reid, model)
+            return encoder
+        return original_build_encoder(with_reid, model)
+
+    reid_mod.build_encoder = patched_build_encoder
+    # Also patch the reference imported into bot_sort.py at import time.
+    import ultralytics.trackers.bot_sort as bot_sort_mod
+    bot_sort_mod.build_encoder = patched_build_encoder
+    # And the track_tracker.py reference (used by TRACKTRACK).
+    import ultralytics.trackers.track_tracker as track_tracker_mod
+    track_tracker_mod.build_encoder = patched_build_encoder
+    print(f"[ReID] Patched build_encoder to use DINO model '{args.reid_model}'")
 
 
 def run_standard_tracking(args):
@@ -192,6 +254,10 @@ def run_standard_tracking(args):
 
     # Resolve tracker configuration
     tracker_yaml = _build_tracker_yaml(args, output_dir)
+
+    # If a DINO ReID model was requested, patch ultralytics' build_encoder so
+    # BoT-SORT picks up our DinoReIDEncoder. Must happen before model.track().
+    _install_dino_reid(args)
 
     # Load model
     model = YOLO(str(model_path))
@@ -304,6 +370,7 @@ def run_benchmark_tracking(args):
     print("TRACKING + SEGMENTATION BENCHMARK")
     print("=" * 60)
     tracker_yaml = _build_tracker_yaml(args, data_path)
+    _install_dino_reid(args)
 
     print(f"Model:     {model_path}")
     print(f"Tracker:   {args.tracker}")
@@ -570,7 +637,9 @@ def run_detect_then_sam3(args):
         track_high_thresh=args.track_high_thresh,
         with_reid=args.with_reid,
         output_dir=output_dir,
+        reid_model=getattr(args, "reid_model", None),
     )
+    _install_dino_reid(args)
 
     # Load models
     print("Loading YOLO detection model...")
@@ -820,6 +889,23 @@ def parse_args():
     parser.add_argument("--track-buffer", type=int, default=30, help="Lost-track buffer")
     parser.add_argument("--track-high-thresh", type=float, default=0.5, help="First-stage association threshold")
     parser.add_argument("--with-reid", action="store_true", default=False, help="Enable ReID (BoT-SORT only)")
+    parser.add_argument(
+        "--reid-model",
+        type=str,
+        default=None,
+        help="ReID model source. 'auto' uses detector backbone features. "
+             "DINO models: 'dinov2_vits14' (public), 'dinov3_vits16' (requires "
+             "HF access). Loads the ViT via torch.hub and wraps it as a BoT-SORT "
+             "ReID encoder. Overrides the tracker YAML's 'model' field. Only "
+             "used with --tracker botsort --with-reid.",
+    )
+    parser.add_argument(
+        "--reid-imgsz",
+        type=int,
+        default=224,
+        help="Input size for DINO ReID crops (default: 224). Only used with "
+             "--reid-model dinov2*/dinov3*.",
+    )
 
     # SAM3 knobs (for detect-then-sam3)
     parser.add_argument("--sam3-conf", type=float, default=0.25, help="SAM3 mask confidence threshold")

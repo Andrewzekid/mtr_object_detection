@@ -23,14 +23,21 @@ python scripts/11_run_tracking.py \
 ```
 There are two labeling flows:
 
-**Full pipeline** (dense labeling — every frame is labeled):
+**Full pipeline** (dense labeling — every frame is labeled. RECOMMENDED):
 
 ```
 raw images → 07 Qwen VLM auto-label → 08 human review/clean boxes
             → 08b train/val/test split → 09 SAM3 box→mask seg dataset → Review the masks on roboflow and augment data
             → 04 YOLO train → 05 evaluate → 11 tracking on raw frames
 ```
+**Keyframe pipeline** (sparse labeling for near-static cameras — label every
+Nth frame, interpolate the rest.):
 
+```
+12 extract keyframes → 07 Qwen seed boxes on keyframes → 08 review keyframes
+   → 13 KLT optical-flow interpolation to all frames → 08 review all
+   → 09 SAM3 segmentation dataset → Review the masks on roboflow and augment data → 04 YOLO train → 05 evaluate → 11 tracking on raw frames
+```
 
 
 ### Directory layout
@@ -107,6 +114,8 @@ python scripts/07_run_qwen.py \
 
 #Per image labels
 python scripts/07_run_qwen.py   --prompt "Detect all: Ceiling light, Exit Sign, Advertisement Board, Ticket Gate, Map, TV. Ceiling lights are flat, horizontal rectangular strips on the ceiling. Exit signs are hanging LCD screens showing directions. Advertisement boards are flat LCD screens on the green wall showing commercial content. Maps are posters showing MTR directions. Ticket gates are turnstiles. TVs are hanging LCD screens showing general content, not directions."   --template object_detection --format json   --image-folder Datasets/MTR/MTR_new_10_images   --output Datasets/MTR/MTR_new_10_images_annotations   --vis-output output/MTR_new_10_images/qwen_vis --per-class --conditioning-images ./ref_images --per-image-labels 
+
+python scripts/07_run_qwen.py   --prompt "Detect all: Exit Sign, Advertisement Board, Ticket Gate, Map, TV. Ceiling lights are flat, horizontal rectangular strips on the ceiling. Exit signs are hanging LCD screens showing directions. Advertisement boards are flat LCD screens on the green wall showing commercial content. Maps are posters showing MTR directions. Ticket gates are turnstiles. TVs are hanging LCD screens showing general content, not directions."   --template object_detection --format json   --image-folder Datasets/MTR/MTR_new_10_images   --output Datasets/MTR/MTR_new_10_images_annotations   --vis-output output/MTR_new_10_images/qwen_vis --per-class --conditioning-images ./ref_images --per-image-labels 
 
 ```
 

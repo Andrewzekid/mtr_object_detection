@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-Run Qwen3.6 inference via Ollama API.
+Run Qwen3.6 inference via Ollama, llama.cpp, or the Aliyun DashScope API.
 
-This script sends a prompt (with optional image) to Qwen3.6 via Ollama
-and returns structured output in the requested format.
+This script sends a prompt (with optional image) to Qwen3.6 and returns
+structured output in the requested format.
+
+BACKENDS:
+    --backend ollama     Local Ollama server (default).
+                         Prereq: ollama serve  +  ollama pull qwen3.6
+    --backend llamacpp   Local llama.cpp server with an mmproj vision projector
+                         (OpenAI-compatible /v1/chat/completions endpoint).
+                         Prereq: llama-server -m <model.gguf> --mmproj <mmproj.gguf> --port 8089
+    --use-api            Aliyun DashScope cloud API (overrides --backend).
 
 USAGE:
     # Single image mode
@@ -15,20 +23,62 @@ USAGE:
     python scripts/07_run_qwen.py --prompt "Detect all cars" --image-folder ./images/ --output ./output/qwen_results/
     python scripts/07_run_qwen.py --prompt "Describe scene" --image-folder ./photos/ --output ./results/ --vis-output ./vis/
 
+    # llama.cpp backend (mmproj vision projector reads the image files)
+    # First start the server:
+    #   llama-server -m Qwen3.6-27B-Q5_K_M.gguf --mmproj mmproj.gguf --port 8089
+    python scripts/07_run_qwen.py --backend llamacpp --llamacpp-url http://127.0.0.1:8089 \\
+        --llamacpp-model ./Qwen3.6-27B-Q5_K_M.gguf \\
+        --prompt "Detect all: Ceiling light, Exit Sign" --template object_detection \\
+        --format json --image ./sample.jpg --vis-output ./vis.jpg
+
     EXAMPLE:
-     python scripts/07_run_qwen.py --prompt "Detect all objects: Ceiling light, Sign, Advertisement Board, Ticket Gate, Map. 
- Signs are hanging lcd screens from the ceiling which show directions. They can contain arrows, characters like A B C, and X's. Do not categorize the X's on ticket gates as a sign. Do not classify posters as signs. Only hanging monitors can be classified as signs.
- Ceiling light are a flat and horizontal rectangular strip, do not detect reflections of lights in the glass or wall. If there are lights in the green wall, they are likely to be reflections. Consider carefully whether or not they are actually reflections. Detect individual ceiling lights and do not cluster them together. 
- Advertisements are flat lcd screens on the green wall that only display commercial content, not directions. Also do not mistake them for posters.  
- Maps are posters which show the directions in the MTR and which way to go.
- Ticket gates are turnstiles. Do not classify ticket vending machines as ticket gates.
- " --template object_detection --image-folder ./qwen_test --annotations-output ./output/annotations/ --vis-output ./output/vis_qwen_batch/ --split-by-class
+     python scripts/07_run_qwen.py \
+        --prompt "Detect all objects: Ceiling light, Sign, Advertisement Board, Ticket Gate, Map. Signs are hanging lcd screens from the ceiling which show directions. They can contain arrows, characters like A B C, and X's. Do not categorize the X's on ticket gates as a sign. Do not classify posters as signs. Only hanging monitors can be classified as signs. Ceiling light are a flat and horizontal rectangular strip, do not detect reflections of lights in the glass or wall. If there are lights in the green wall, they are likely to be reflections. Consider carefully whether or not they are actually reflections. Detect individual ceiling lights and do not cluster them together. Advertisements are flat lcd screens on the green wall that only display commercial content, not directions. Also do not mistake them for posters. Maps are posters which show the directions in the MTR and which way to go. Ticket gates are turnstiles. Do not classify ticket vending machines as ticket gates." \
+        --template object_detection \
+        --image-folder ./qwen_test \
+        --annotations-output ./output/annotations/ \
+        --vis-output ./output/vis_qwen_batch/ \
+        --split-by-class
+
+    python scripts/07_run_qwen.py \
+    --prompt "Detect any hanging overhead exit signage containing the standard Exit icon: a bright lime green square background displaying the white Chinese character '出' stacked above the white English word 'EXIT', there may or may not be adjacent directional arrows or exit letter identifiers (e.g., A, B, C). Do not classify normal hanging monitors or tvs without the lime '出' and EXIT text as exit signs. Do not classify posters as exit signs. Do not classify platform signs as exit sign. Do not classify advertisement boards as exit signs. Do not classify the fire extinguisher sign as exit sign." \
+    --template object_detection \
+    --image-folder ./Datasets/MTR/MTR_4k_dataset_exit_signs \
+    --resume-from 381 \
+    --output ./output/results/MTR_4k/ \
+    --vis-output ./output/vis/MTR_4k/ \
+    --split-by-class \
+    --annotations-output ./output/annotations/MTR_4k/ \
+    --format json \
+    --per-class \
+    --classes "Exit Sign" \
+    --conditioning-images ./Datasets/MTR/ref_images/
+
+    #API mode (Aliyun DashScope cloud API)
+    python scripts/07_run_qwen.py \
+        --use-api \
+        --base-url "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" \
+        --api-key "sk-ws-H.DMLLILY.FTdA.MEUCIEb-iEdMlxCgMR6KvcS2mymqAEpr8L010TOFDJOdPoL6AiEAjHxQe-XUDpUn1QhXnBJDi-tURMh4FumjXMI7t4C7lVI" \
+        --prompt "Detect any hanging overhead exit signage containing the standard Exit icon: a bright lime green square background displaying the white Chinese character '出' stacked above the white English word 'EXIT', there may or may not be adjacent directional arrows or exit letter identifiers (e.g., A, B, C)." \
+        --template object_detection \
+        --image-folder ./Datasets/MTR/MTR_4k_dataset_exit_signs \
+        --output ./output/results/MTR_4k/ \
+        --vis-output ./output/vis/MTR_4k/ \
+        --split-by-class \
+        --resume-from 380 \
+        --annotations-output ./output/annotations/MTR_4k/ \
+        --format json \
+        --per-class \
+        --classes "Exit Sign" \
+        --api-model "qwen3.8-max" \
+        --conditioning-images ./Datasets/MTR/ref_images/
 
 PREREQUISITES:
-    - Ollama installed and running: ollama serve
-    - Qwen3.6 model pulled: ollama pull qwen3.6
+    - Ollama backend:  ollama serve  &&  ollama pull qwen3.6
+    - llama.cpp backend: llama-server -m Qwen3.6-27B-Q5_K_M.gguf --mmproj mmproj.gguf --port 8089
+    - API backend:     API_KEY env var (or --api-key)
 
-OUTPUT:
+    OUTPUT:
     - Raw model response
     - Parsed output in requested format (json/yaml/bbox/text)
       NOTE: bounding boxes are scaled to PIXEL coordinates (Qwen's raw 0-1000
@@ -36,6 +86,12 @@ OUTPUT:
       W/H) before being saved, so the JSON can be fed directly to SAM3.
     - Optional visualization image with bounding boxes drawn
     - For batch mode: individual JSON files per image + summary.json
+
+    # llama.cpp batch mode (MTR 4k exit-sign dataset)
+                          [--api-model API_MODEL] [--conditioning-images CONDITIONING_IMAGES] [--per-image-labels] [--per-class] [--classes [CLASSES ...]] [--bbox-order {auto,xyxy,yxyx}]
+                      [--bbox-field {auto,bbox_2d,box_2d,bbox}] [--dedup-iou DEDUP_IOU]
+
+   
 """
 
 import argparse
@@ -59,7 +115,7 @@ try:
 except ImportError:
     pass  # python-dotenv not installed, will use os.environ directly
 
-from core.models_inference import run_qwen, run_qwen_api, list_ollama_models
+from core.models_inference import run_qwen, run_qwen_api, run_qwen_llamacpp, list_ollama_models
 
 
 def get_api_key(args):
@@ -92,7 +148,7 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
 MTR_CLASS_DESCRIPTIONS = {
     "ceiling light": "a flat and horizontal rectangular strip light mounted on the ceiling. Do NOT detect reflections of lights in glass or walls — if there are lights visible in the green wall, they are likely reflections. Consider carefully whether each detection is an actual light or a reflection. Detect individual ceiling lights separately; do not cluster them together.",
     "light": "a flat and horizontal rectangular strip light mounted on the ceiling. Do NOT detect reflections of lights in glass or walls — if there are lights visible in the green wall, they are likely reflections. Consider carefully whether each detection is an actual light or a reflection. Detect individual ceiling lights separately; do not cluster them together.",
-    "exit sign": "a hanging monitor/display showing the lime-green character 出 along with letters and arrows indicating directions. It is a hanging LCD screen, not a wall poster.",
+    "exit sign": "a hanging monitor/display showing the lime-green character 出 and text 'EXIT'. It is a hanging LCD screen, not a wall poster.",
     "advertisement board": "a flat LCD screen mounted on the green wall that displays commercial/advertising content only, NOT directions. These are NOT TVs and NOT maps.",
     "ticket gate": "turnstiles/gates that passengers pass through after tapping their ticket/card. Do NOT classify ticket vending machines as ticket gates.",
     "map": "a poster/sign that shows MTR station directions, routes, and which way to go. It is a static poster, not an electronic display.",
@@ -190,7 +246,7 @@ def build_conditioning_prompt(conditioning_images, original_prompt, class_descri
         f"the MAIN image, omit it. Returning fewer boxes — or an empty list — is "
         f"correct and expected when the scene is sparse.\n"
         f"- Report boxes ONLY for the MAIN image (image {main_image_num}). Never "
-        f"report boxes located in a reference image.\n"
+        f"report boxes located in a reference image.\n. If there is nothing to detect, return an empty list.\n"
         f"- Do not report reflections, shadows, glare, or partial/ambiguous matches.\n"
         f"- Do not output duplicate or heavily overlapping boxes for the same object; "
         f"one box per object.\n\n"
@@ -225,7 +281,7 @@ def build_per_class_prompt(class_name, args, has_conditioning=False):
             f'"{class_name}" — use it only to recognize what {class_name} looks '
             f'like. Image 2 is the main scene to analyze. Detect all instances '
             f'of "{class_name}" in Image 2 (the main scene) only. Do NOT report '
-            f'boxes for Image 1.'
+            f'boxes for Image 1. ONLY DETECT objects in Image 2 that look very similar to Image 1.'
         ]
     else:
         parts = [f'Detect all instances of "{class_name}" in the main image.']
@@ -470,7 +526,15 @@ def dedup_cross_class(parsed_output, iou_threshold):
 
 
 def _call_qwen(args, prompt, image_path, conditioning_images):
-    """Dispatch a single Qwen call to the Ollama or DashScope backend."""
+    """Dispatch a single Qwen call to the configured backend.
+
+    Backends:
+        - llamacpp: local llama.cpp server with mmproj vision projector
+                    (OpenAI-compatible /v1/chat/completions)
+        - ollama (default): local Ollama server (/api/generate or
+                    /v1/chat/completions when --per-image-labels)
+        - api: Aliyun DashScope cloud API (--use-api)
+    """
     bbox_order, bbox_field = resolve_bbox_format(args)
     if args.use_api:
         api_key = get_api_key(args)
@@ -486,6 +550,21 @@ def _call_qwen(args, prompt, image_path, conditioning_images):
             timeout=args.timeout,
             log_callback=lambda msg: print(f"  {msg}"),
             per_image_labels=args.per_image_labels,
+            bbox_field=bbox_field,
+            bbox_order=bbox_order,
+        )
+    if args.backend == "llamacpp":
+        return run_qwen_llamacpp(
+            prompt=prompt,
+            template_id=args.template,
+            output_format=args.format,
+            image_path=image_path,
+            conditioning_images=conditioning_images,
+            llamacpp_base_url=args.llamacpp_url,
+            model_name=args.llamacpp_model,
+            api_key=args.llamacpp_api_key,
+            timeout=args.timeout,
+            log_callback=lambda msg: print(f"  {msg}"),
             bbox_field=bbox_field,
             bbox_order=bbox_order,
         )
@@ -558,7 +637,9 @@ def run_qwen_for_image(args, prompt, image_path, conditioning_images):
         "success": True,
         "response": json.dumps(merged),
         "parsed_output": merged,
-        "model": args.api_model if args.use_api else args.model,
+        "model": (args.api_model if args.use_api
+                  else args.llamacpp_model if args.backend == "llamacpp"
+                  else args.model),
         "format": args.format,
     }
 
@@ -614,10 +695,13 @@ Batch Mode (folder of images):
  Ceiling light are a flat and horizontal rectangular strip, do not detect reflections of lights in the glass or wall. If there are lights in the green wall, they are likely to be reflections. Consider carefully whether or not they are actually reflections. Detect individual ceiling lights and do not cluster them together. 
  Advertisement boards are flat lcd screens on the green wall. They are not posters or wall drawings. They only display commercial concent and do not display directions.  
  Maps are posters which show the directions in the MTR and which way to go." --template object_detection --image-folder ./qwen_test --annotations-output ./output/annotations/ --vis-output ./output/vis_qwen_batch/ --split-by-class
+    
     # Batch with visualizations
-    python scripts/07_run_qwen.py --prompt "Detect " \\
-        --template object_detection --image-folder ./photos/ \\
-        --output ./output/results/ --vis-output ./output/vis/ --split-by-class --annotations-output ./output/annotations/
+    python scripts/07_run_qwen.py --prompt "Detect any directional or overhead exit signage containing the standard Exit icon: 
+    a bright lime green square background displaying the white Chinese character '出' stacked above the white English word 'EXIT', 
+    there may or may not be adjacent directional arrows or exit letter identifiers (e.g., A, B, C)." \\
+        --template object_detection --image-folder ./MTR_4k_dataset_exit_signs \\
+        --output ./output/results/MTR_4k/ --vis-output ./output/vis/MTR_4k/ --split-by-class --annotations-output ./output/annotations/MTR_4k/ --format json
 
 Templates:
     object_detection    - Detect objects with bounding boxes
@@ -678,7 +762,40 @@ Templates:
         "--ollama-url",
         type=str,
         default="http://localhost:11434",
-        help="Ollama API base URL (default: http://localhost:11434)",
+        help="Ollama API base URL (default: http://localhost:11434). "
+             "Only used when --backend=ollama.",
+    )
+    # --- llama.cpp backend ------------------------------------------------
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="ollama",
+        choices=["ollama", "llamacpp"],
+        help="Inference backend to use (default: ollama). 'llamacpp' targets a "
+             "local llama.cpp server (started with --mmproj for the vision "
+             "projector) exposing an OpenAI-compatible /v1/chat/completions "
+             "endpoint. --use-api overrides this.",
+    )
+    parser.add_argument(
+        "--llamacpp-url",
+        type=str,
+        default="http://127.0.0.1:8089",
+        help="Base URL of the llama.cpp server (no /v1 suffix). "
+             "Default: http://127.0.0.1:8089",
+    )
+    parser.add_argument(
+        "--llamacpp-model",
+        type=str,
+        default="./Qwen3.6-27B-Q5_K_M.gguf",
+        help="Model identifier passed to the llama.cpp server (the .gguf path "
+             "or alias it was started with). Default: ./Qwen3.6-27B-Q5_K_M.gguf",
+    )
+    parser.add_argument(
+        "--llamacpp-api-key",
+        type=str,
+        default="local",
+        help="API key for the llama.cpp server (any non-empty string for a "
+             "local server; default: local).",
     )
     parser.add_argument(
         "--timeout",
@@ -725,7 +842,8 @@ Templates:
     parser.add_argument(
         "--use-api",
         action="store_true",
-        help="Use Aliyun DashScope API (qwen-vl-plus) instead of local Ollama",
+        help="Use Aliyun DashScope API (qwen-vl-plus) instead of a local "
+             "backend. Overrides --backend.",
     )
     parser.add_argument(
         "--api-key",
@@ -1002,6 +1120,41 @@ def process_single_image(args, image_path, output_dir=None, vis_dir=None, condit
     raw_response = result.get("response", "")
     parsed_output = result.get("parsed_output")
 
+    # Canonicalize labels to the requested --classes when provided.
+    # In single-call (non --per-class) mode Qwen often emits verbose,
+    # description-like labels (e.g. a full sentence describing "exit sign").
+    # If the user passed an explicit --classes list, map each detection's
+    # label to the single matching class name so downstream output (vis,
+    # split-by-class, JSON) uses the short canonical name. Detections that
+    # match no requested class are dropped.
+    if not args.per_class and args.classes:
+        requested = [c.strip() for c in args.classes if c.strip()]
+        if isinstance(parsed_output, list):
+            items = parsed_output
+        elif isinstance(parsed_output, dict):
+            items = [parsed_output]
+        else:
+            items = []
+        canonicalized = []
+        for it in items:
+            if not isinstance(it, dict):
+                canonicalized.append(it)
+                continue
+            model_label = it.get("label")
+            matched = None
+            for cls in requested:
+                if _label_matches(model_label, cls):
+                    matched = cls
+                    break
+            if matched is not None:
+                it["label"] = matched
+                canonicalized.append(it)
+            else:
+                # No requested class matched: drop the detection so an
+                # unrelated verbose label cannot leak into the output.
+                print(f"  Dropping detection with unmatched label: {str(model_label)[:80]}")
+        parsed_output = canonicalized
+
     # Scale Qwen's normalized 0-1000 bounding boxes to pixel coordinates before
     # saving the JSON and before any downstream use (visualization, split-by-class,
     # SAM3). The saved JSON therefore contains pixel-space boxes. First fold any
@@ -1092,9 +1245,23 @@ def split_annotations_by_class(parsed_output, image_path, annotations_dir, img_w
     
     # Save each class's annotations to a separate file
     saved_files = {}
+    seen_safe_names = {}
     for class_name, bboxes in class_bboxes.items():
         # Sanitize class name for filename (replace spaces/special chars with underscores)
         safe_class_name = "".join(c if c.isalnum() else "_" for c in class_name)
+        # Truncate to avoid OS "File name too long" errors (ext4 limit 255 bytes;
+        # leave room for the .json suffix and a uniqueness counter).
+        max_len = 120
+        if len(safe_class_name) > max_len:
+            import hashlib
+            digest = hashlib.md5(class_name.encode("utf-8")).hexdigest()[:8]
+            safe_class_name = f"{safe_class_name[:max_len - 9]}_{digest}"
+        # Disambiguate collisions after truncation.
+        if safe_class_name in seen_safe_names:
+            seen_safe_names[safe_class_name] += 1
+            safe_class_name = f"{safe_class_name}_{seen_safe_names[safe_class_name]}"
+        else:
+            seen_safe_names[safe_class_name] = 1
         annotation_file = image_folder / f"{safe_class_name}.json"
         
         annotation_data = {
@@ -1294,6 +1461,11 @@ def main():
             print(f"Running Qwen API batch inference...")
             print(f"  Model: {args.api_model}")
             print(f"  Mode: Aliyun DashScope API")
+        elif args.backend == "llamacpp":
+            print(f"Running Qwen batch inference...")
+            print(f"  Model: {args.llamacpp_model}")
+            print(f"  Mode: llama.cpp (local, mmproj vision)")
+            print(f"  Server: {args.llamacpp_url}")
         else:
             print(f"Running Qwen3.6 batch inference...")
             print(f"  Model: {args.model}")
@@ -1320,6 +1492,11 @@ def main():
         print(f"Running Qwen API inference...")
         print(f"  Model: {args.api_model}")
         print(f"  Mode: Aliyun DashScope API")
+    elif args.backend == "llamacpp":
+        print(f"Running Qwen inference...")
+        print(f"  Model: {args.llamacpp_model}")
+        print(f"  Mode: llama.cpp (local, mmproj vision)")
+        print(f"  Server: {args.llamacpp_url}")
     else:
         print(f"Running Qwen3.6 inference...")
         print(f"  Model: {args.model}")
