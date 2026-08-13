@@ -175,6 +175,36 @@ Output Structure:
         default=0.25,
         help="Focal Loss alpha parameter - balancing parameter (default: 0.25)",
     )
+    parser.add_argument(
+        "--lr0",
+        type=float,
+        default=0.01,
+        help="Initial learning rate (default: 0.01)",
+    )
+    parser.add_argument(
+        "--lrf",
+        type=float,
+        default=0.01,
+        help="Final learning rate factor: lr0 * lrf = final LR (default: 0.01)",
+    )
+    parser.add_argument(
+        "--cos-lr",
+        action="store_true",
+        default=True,
+        help="Use cosine annealing LR schedule (default: True)",
+    )
+    parser.add_argument(
+        "--no-cos-lr",
+        dest="cos_lr",
+        action="store_false",
+        help="Use linear LR schedule instead of cosine",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=float,
+        default=3.0,
+        help="Warmup epochs (default: 3.0)",
+    )
 
     return parser.parse_args()
 
@@ -217,6 +247,8 @@ def main():
     if args.loss_type == "focal":
         print(f"Focal gamma: {args.focal_gamma}")
         print(f"Focal alpha: {args.focal_alpha}")
+    print(f"Learning rate: {args.lr0} (decay factor: {args.lrf}, final LR: {args.lr0 * args.lrf:.6f})")
+    print(f"LR scheduler: {'cosine' if args.cos_lr else 'linear'}, warmup: {args.warmup_epochs} epochs")
     
     # Create trainer
     trainer = ModelTrainer(
@@ -240,6 +272,10 @@ def main():
         focal_alpha=args.focal_alpha,
         task=args.task,
         checkpoint_path=args.pretrained,
+        lr0=args.lr0,
+        lrf=args.lrf,
+        cos_lr=args.cos_lr,
+        warmup_epochs=args.warmup_epochs,
     )
     
     # Print results
