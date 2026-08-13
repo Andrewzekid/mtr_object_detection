@@ -26,6 +26,13 @@ USAGE:
         --output-dir Datasets/MTR/MTR_keyframes \
         --every 20 --mode copy
 
+    # MTR 4k exit-sign dataset, stride 5 (relaunch with denser keyframes;
+    # overwrites the previous stride-10 manifest, existing symlinks preserved)
+    python scripts/12_extract_keyframes.py \
+        --image-folder Datasets/MTR/MTR_4k_dataset_exit_signs \
+        --output-dir Datasets/MTR/MTR_4k_keyframes \
+        --every 5 --mode symlink
+
 OUTPUT:
     - <output-dir>/*.jpg                 keyframe images (symlinked or copied)
     - <output-dir>/keyframe_manifest.json  manifest for the interpolator

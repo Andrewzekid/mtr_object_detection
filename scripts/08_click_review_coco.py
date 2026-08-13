@@ -1,3 +1,26 @@
+#!/usr/bin/env python3
+"""
+Interactive matplotlib COCO reviewer for cleaning Qwen-seeded bounding boxes.
+
+Loads Qwen annotations (flat ``*_result.json`` or ``--split-by-class`` per-image
+layout) or an existing reviewed COCO (``--json``), lets you delete / add boxes
+with number-key category selection, and exports the cleaned COCO + an optional
+YOLO detection dataset. Progress auto-saves to ``<output>.progress`` and
+``<output>_tmp.json`` so a session can be resumed after Ctrl-C / quit.
+
+USAGE:
+    # Review Qwen-seeded boxes on the 400 NEW keyframes only (stride-5 set,
+    # the other 400 already-reviewed keyframes are kept out so the reviewer
+    # only sees unannotated frames). After review, merge this 400 with the
+    # old 400 into the final 800-keyframe COCO for the interpolator.
+    python scripts/08_click_review_coco.py \
+        --qwen-annotations-dir output/annotations/MTR_4k \
+        --img_dir /tmp/opencode/new_keyframes_only \
+        --output_json output/MTR_4k/MTR_4k_keyframes/coco_reviewed_new400.json \
+        --output-yolo-dir output/MTR_4k/MTR_4k_keyframes/yolo_export_new400 \
+        --data-yaml Datasets/MTR/detect/train_yolo_detection/data.yaml
+"""
+
 import json
 import os
 import argparse
@@ -198,18 +221,28 @@ def build_coco_from_qwen(qwen_dir, img_dir):
     name_to_cat_id = {name: i for i, name in enumerate(sorted_class_names)}
     categories = [{"id": i, "name": name} for i, name in enumerate(sorted_class_names)]
 
-    # Build images and annotations.
+    # Build images and annotations. Include ALL images in img_dir (even
+    # those with no Qwen annotations) so the reviewer can navigate the full
+    # sequence and add boxes where Qwen missed.
     images = []
     annotations = []
     ann_id = 1
 
-    for idx, (stem, boxes) in enumerate(sorted(stem_boxes.items())):
-        # Find the actual image file in img_dir (or img_dir/images) by stem.
-        img_file = _find_image_file(stem, img_dir)
-        if img_file is None:
-            print(f"  Warning: no image found for stem '{stem}', skipping")
-            continue
+    # First, collect all image files in the folder (sorted chronologically).
+    all_img_files = sorted(
+        f for f in img_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in IMAGE_EXTS
+    )
+    if not all_img_files:
+        raise ValueError(f"No images found in {img_dir}")
 
+    # Build a stem -> file map for quick lookup.
+    img_by_stem = {f.stem: f for f in all_img_files}
+
+    # Process images in folder order (not annotation order) so the reviewer
+    # sees the chronological sequence.
+    for idx, img_file in enumerate(all_img_files):
+        stem = img_file.stem
         size = read_image_size(img_file)
         if size is None:
             print(f"  Warning: could not read image size for {img_file}, skipping")
@@ -224,11 +257,9 @@ def build_coco_from_qwen(qwen_dir, img_dir):
             "height": h,
         })
 
-        for class_name, (x1, y1, x2, y2) in boxes:
+        # Add any Qwen annotations for this image.
+        for class_name, (x1, y1, x2, y2) in stem_boxes.get(stem, []):
             x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
-            # 07_run_qwen.py already scales Qwen's 0-1000 normalized coords to
-            # pixel coordinates before saving the JSON, so the boxes here are in
-            # pixel space. Just clamp to the image bounds.
             x1 = max(0.0, min(x1, w))
             x2 = max(0.0, min(x2, w))
             y1 = max(0.0, min(y1, h))
@@ -556,9 +587,9 @@ class ProReviewer:
             plt.pause(0.1)
         else:
             # 已经处在阻塞的 plt.show(block=True) 事件循环中（由 n/b 键触发）。
-            # 这里不能再调用 plt.show / plt.pause，否则会启动嵌套事件循环并
-            # 导致窗口冻结。直接强制重绘即可。
-            self.fig.canvas.draw()
+            # 用 draw_idle + flush_events 保证重绘不阻塞事件循环。
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
         return True
 
     def redraw(self):
@@ -583,9 +614,10 @@ class ProReviewer:
         if self.waiting_category:
             help_text = "Choose category: press number key (0-9) or ESC to cancel"
         else:
-            help_text = "[D]elete  [A]dd  [N]ext  [B]ack  [S]ave & quit  [Q]uit"
+            help_text = "[D]elete  [A]dd  [N]ext  [B]ack  [X]Discard all  [S]ave & quit  [Q]uit"
         self.ax.set_xlabel(help_text)
         self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
 
     def on_key(self, event):
         if self.waiting_category:
@@ -637,6 +669,27 @@ class ProReviewer:
                     'button_release_event', self.on_draw_end)
             else:
                 print("Already in drawing mode")
+
+        elif event.key in ('x', 'X'):
+            # Discard ALL annotations on the current image and move to next.
+            if self.current_anns:
+                for ann in self.current_anns:
+                    self.removed_ids.add(ann['id'])
+                n = len(self.current_anns)
+                self.current_anns = []
+                self.selected_idx = -1
+                print(f"🗑️ Discarded {n} box(es) on this image")
+            else:
+                print("ℹ️ No boxes to discard on this image")
+            self.save_progress(is_final=False)
+            self.current_idx += 1
+            if self.current_idx >= self.total:
+                print("🏁 Reached last image, finishing")
+                self.save_progress(is_final=True)
+                plt.close()
+                exit(0)
+            else:
+                self.load_image(self.current_idx)
 
         elif event.key in ('n', 'N'):
             self.save_progress(is_final=False)

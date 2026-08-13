@@ -76,8 +76,16 @@ from scripts.tracking_utils import (
 
 def process_frame(result, img_h, img_w, image_id, annotation_id, class_names):
     """Extract COCO annotations and annotated frame from a tracking result."""
-    annotated_frame = result.plot() if result is not None else None
+    annotated_frame = None
     annotations = []
+
+    if result is not None:
+        # Move result tensors to CPU before plotting to avoid GPU OOM from
+        # the mask rendering path in result.plot() (which does cumulative
+        # alpha compositing on the GPU and can exhaust memory on large frames
+        # or when another process shares the GPU).
+        result = result.cpu()
+        annotated_frame = result.plot()
 
     if (
         result is not None
@@ -150,29 +158,48 @@ def process_frame(result, img_h, img_w, image_id, annotation_id, class_names):
 
 
 def _build_tracker_yaml(args, output_dir: Path):
-    """Return the path to a runtime tracker YAML if BoT-SORT is requested."""
-    if args.tracker == "botsort":
-        trackers_dir = find_ultralytics_trackers_dir()
-        base_yaml = trackers_dir / "botsort.yaml"
-        if not base_yaml.exists():
-            print(f"Error: botsort.yaml not found at {base_yaml}")
-            sys.exit(1)
-        tracker_yaml = build_runtime_tracker_yaml(
-            base_yaml,
-            tracker_type="botsort",
-            with_cmc=args.with_cmc,
-            cmc_method=args.cmc_method,
-            track_buffer=args.track_buffer,
-            track_high_thresh=args.track_high_thresh,
-            with_reid=args.with_reid,
-            output_dir=output_dir,
-            reid_model=getattr(args, "reid_model", None),
-        )
-        print(f"BoT-SORT: cmc={args.with_cmc} ({args.cmc_method}), buffer={args.track_buffer}, reid={args.with_reid}")
-        if args.with_reid and args.reid_model:
-            print(f"  ReID model: {args.reid_model}")
-        return tracker_yaml
-    return None
+    """Return the path to a runtime tracker YAML for the requested tracker.
+
+    Supports BoT-SORT, OC-SORT, and Deep OC-SORT. ByteTrack uses its own base
+    yaml and is handled by ultralytics directly (no runtime override needed).
+    """
+    # Map tracker name -> base yaml filename.
+    tracker_yamls = {
+        "botsort": "botsort.yaml",
+        "ocsort": "ocsort.yaml",
+        "deepocsort": "deepocsort.yaml",
+    }
+    if args.tracker not in tracker_yamls:
+        return None
+
+    trackers_dir = find_ultralytics_trackers_dir()
+    base_yaml = trackers_dir / tracker_yamls[args.tracker]
+    if not base_yaml.exists():
+        print(f"Error: {base_yaml.name} not found at {base_yaml}")
+        sys.exit(1)
+
+    tracker_yaml = build_runtime_tracker_yaml(
+        base_yaml,
+        tracker_type=args.tracker,
+        with_cmc=args.with_cmc,
+        cmc_method=args.cmc_method,
+        track_buffer=args.track_buffer,
+        track_high_thresh=args.track_high_thresh,
+        with_reid=args.with_reid,
+        output_dir=output_dir,
+        reid_model=getattr(args, "reid_model", None),
+        match_thresh=getattr(args, "match_thresh", None),
+        new_track_thresh=getattr(args, "new_track_thresh", None),
+        inertia=getattr(args, "inertia", None),
+        delta_t=getattr(args, "delta_t", None),
+        proximity_thresh=getattr(args, "proximity_thresh", None),
+        appearance_thresh=getattr(args, "appearance_thresh", None),
+    )
+    reid_str = f", reid={args.with_reid}" if args.tracker in ("botsort", "deepocsort") else ""
+    print(f"{args.tracker.upper()}: cmc={args.with_cmc} ({args.cmc_method}), buffer={args.track_buffer}{reid_str}")
+    if args.with_reid and args.reid_model:
+        print(f"  ReID model: {args.reid_model}")
+    return tracker_yaml
 
 
 def _install_dino_reid(args):
@@ -226,6 +253,9 @@ def _install_dino_reid(args):
     # Also patch the reference imported into bot_sort.py at import time.
     import ultralytics.trackers.bot_sort as bot_sort_mod
     bot_sort_mod.build_encoder = patched_build_encoder
+    # And the deep_oc_sort.py reference (used by DeepOCSORT).
+    import ultralytics.trackers.deep_oc_sort as deep_oc_sort_mod
+    deep_oc_sort_mod.build_encoder = patched_build_encoder
     # And the track_tracker.py reference (used by TRACKTRACK).
     import ultralytics.trackers.track_tracker as track_tracker_mod
     track_tracker_mod.build_encoder = patched_build_encoder
@@ -638,6 +668,12 @@ def run_detect_then_sam3(args):
         with_reid=args.with_reid,
         output_dir=output_dir,
         reid_model=getattr(args, "reid_model", None),
+        match_thresh=getattr(args, "match_thresh", None),
+        new_track_thresh=getattr(args, "new_track_thresh", None),
+        inertia=getattr(args, "inertia", None),
+        delta_t=getattr(args, "delta_t", None),
+        proximity_thresh=getattr(args, "proximity_thresh", None),
+        appearance_thresh=getattr(args, "appearance_thresh", None),
     )
     _install_dino_reid(args)
 
@@ -806,8 +842,12 @@ def parse_args():
         "--tracker",
         type=str,
         default="bytetrack",
-        choices=["bytetrack", "botsort", "detect-then-sam3", "benchmark"],
-        help="Tracker to use (default: bytetrack). Use 'benchmark' to run YOLO tracking+segmentation without saving any outputs and report timing.",
+        choices=["bytetrack", "botsort", "ocsort", "deepocsort", "detect-then-sam3", "benchmark"],
+        help="Tracker to use (default: bytetrack). 'ocsort' = OC-SORT "
+             "(robust to non-linear motion/sudden turns). 'deepocsort' = "
+             "OC-SORT + appearance features (ReID). Use 'benchmark' to run "
+             "YOLO tracking+segmentation without saving any outputs and "
+             "report timing.",
     )
 
     # Benchmark tracking arguments
@@ -815,7 +855,7 @@ def parse_args():
         "--benchmark-tracker",
         type=str,
         default="bytetrack",
-        choices=["bytetrack", "botsort"],
+        choices=["bytetrack", "botsort", "ocsort", "deepocsort"],
         help="Underlying tracker used when --tracker benchmark (default: bytetrack)",
     )
 
@@ -876,7 +916,7 @@ def parse_args():
         help="In benchmark mode, skip reading segmentation masks from results (default: False)",
     )
 
-    # BoT-SORT knobs
+    # BoT-SORT / Deep OC-SORT knobs
     parser.add_argument("--with-cmc", dest="with_cmc", action="store_true", default=True)
     parser.add_argument("--no-cmc", dest="with_cmc", action="store_false")
     parser.add_argument(
@@ -884,11 +924,57 @@ def parse_args():
         type=str,
         default="sparseOptFlow",
         choices=["sparseOptFlow", "orb", "sift", "ecc", "none"],
-        help="Global motion compensation method (BoT-SORT only)",
+        help="Global motion compensation method (BoT-SORT / Deep OC-SORT)",
     )
-    parser.add_argument("--track-buffer", type=int, default=30, help="Lost-track buffer")
+    parser.add_argument("--track-buffer", type=int, default=30, help="Lost-track buffer (frames to keep lost tracks alive)")
     parser.add_argument("--track-high-thresh", type=float, default=0.5, help="First-stage association threshold")
-    parser.add_argument("--with-reid", action="store_true", default=False, help="Enable ReID (BoT-SORT only)")
+    parser.add_argument("--with-reid", action="store_true", default=False, help="Enable ReID (BoT-SORT / Deep OC-SORT)")
+    # Deep OC-SORT specific knobs
+    parser.add_argument(
+        "--match-thresh",
+        type=float,
+        default=0.8,
+        help="Association similarity threshold (IoU/cost). Lower = more tolerant "
+             "of prediction errors during turns. (BoT-SORT / Deep OC-SORT)",
+    )
+    parser.add_argument(
+        "--new-track-thresh",
+        type=float,
+        default=0.3,
+        help="Minimum confidence to start a new track. Higher = harder to spawn "
+             "new tracks (helps prevent the same object getting a new ID after a "
+             "turn). (Deep OC-SORT)",
+    )
+    parser.add_argument(
+        "--inertia",
+        type=float,
+        default=0.2,
+        help="Weight of velocity consistency cost in association (OC-SORT / Deep "
+             "OC-SORT). Lower = less penalty for direction changes, better for "
+             "sudden turns. Default 0.2; try 0.05 for sharp turns.",
+    )
+    parser.add_argument(
+        "--delta-t",
+        type=int,
+        default=3,
+        help="Temporal window for velocity direction computation (OC-SORT / Deep "
+             "OC-SORT). Shorter = faster adaptation to direction changes. "
+             "Default 3; try 1 for sharp turns.",
+    )
+    parser.add_argument(
+        "--proximity-thresh",
+        type=float,
+        default=0.5,
+        help="Min IoU to consider tracks proximate for ReID. Lower = allow ReID "
+             "to compensate for poor IoU during turns. (BoT-SORT / Deep OC-SORT)",
+    )
+    parser.add_argument(
+        "--appearance-thresh",
+        type=float,
+        default=0.9,
+        help="Min appearance similarity for ReID. Lower = more aggressive ReID "
+             "re-acquisition after track loss. (BoT-SORT / Deep OC-SORT)",
+    )
     parser.add_argument(
         "--reid-model",
         type=str,

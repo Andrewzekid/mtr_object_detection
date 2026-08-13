@@ -214,6 +214,12 @@ def build_runtime_tracker_yaml(
     with_reid: bool,
     output_dir: Path,
     reid_model: str | None = None,
+    match_thresh: float | None = None,
+    new_track_thresh: float | None = None,
+    inertia: float | None = None,
+    delta_t: int | None = None,
+    proximity_thresh: float | None = None,
+    appearance_thresh: float | None = None,
 ) -> Path:
     """Merge CLI overrides into a copy of a tracker YAML for this run.
 
@@ -246,6 +252,20 @@ def build_runtime_tracker_yaml(
     # to our patched build_encoder which instantiates DinoReIDEncoder.
     if reid_model is not None:
         cfg["model"] = reid_model
+
+    # Optional Deep OC-SORT / BoT-SORT tuning knobs.
+    if match_thresh is not None:
+        cfg["match_thresh"] = float(match_thresh)
+    if new_track_thresh is not None:
+        cfg["new_track_thresh"] = float(new_track_thresh)
+    if inertia is not None:
+        cfg["inertia"] = float(inertia)
+    if delta_t is not None:
+        cfg["delta_t"] = int(delta_t)
+    if proximity_thresh is not None:
+        cfg["proximity_thresh"] = float(proximity_thresh)
+    if appearance_thresh is not None:
+        cfg["appearance_thresh"] = float(appearance_thresh)
 
     with open(runtime_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)

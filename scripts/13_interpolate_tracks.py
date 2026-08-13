@@ -8,7 +8,7 @@ is used to review the keyframe boxes. This script reads that reviewed keyframe
 COCO plus the manifest and produces a COCO file with boxes for **every** frame,
 which is then handed back to `08_click_review_coco.py` for a final full review.
 
-Method (anchored KLT):
+Method (anchored optical flow):
     For each adjacent keyframe pair (a, b) the reviewed boxes are matched by
     class + nearest center. For each matched pair, Lucas-Kanade optical flow
     (`goodFeaturesToTrack` inside the box, `calcOpticalFlowPyrLK` frame-by-frame)
@@ -18,6 +18,15 @@ Method (anchored KLT):
     This keeps the flow's motion shape while guaranteeing the reviewed endpoints
     are respected (no drift accumulation across the whole video).
 
+Method (Kalman, ``--interp-method kalman``):
+    Same per-frame optical-flow median displacement is fed as the measurement
+    into a constant-velocity Kalman filter (one per axis). The KF denoises
+    jittery flow and, when the flow track is temporarily lost, predicts
+    forward with the learned velocity instead of bailing out. The smoothed
+    trajectory is then endpoint-anchored the same way as the raw method so it
+    still starts at keyframe a and lands at keyframe b. Process/measurement
+    noise are tunable via ``--kf-q`` / ``--kf-r``.
+
 USAGE:
     python scripts/13_interpolate_tracks.py \
         --keyframes-coco output/MTR_keyframes/reviewed/coco_reviewed.json \
@@ -25,6 +34,27 @@ USAGE:
         --image-folder Datasets/MTR/rosbags/MTR_metacam_right \
         --output-coco output/MTR_full/interpolated.coco.json \
         --vis-output output/MTR_full/vis
+
+    # MTR 4k exit-sign dataset, 800 keyframes (stride 5) merged COCO;
+    # overwrites previous interpolation results + vis
+    python scripts/13_interpolate_tracks.py \
+        --keyframes-coco output/MTR_4k/MTR_4k_keyframes/coco_reviewed_800_final.json \
+        --manifest Datasets/MTR/MTR_4k_keyframes/keyframe_manifest.json \
+        --image-folder Datasets/MTR/MTR_4k_dataset_exit_signs \
+        --output-coco output/MTR_4k/interpolated_all_coco.json \
+        --vis-output output/MTR_4k/interpolated_vis
+
+    # Same but with the Kalman-filter interpolator (constant-velocity smoothing
+    # of the optical-flow measurements; better jitter handling and short-gap
+    # extrapolation). Dis flow + tuned process/measurement noise.
+    python scripts/13_interpolate_tracks.py \
+        --keyframes-coco output/MTR_4k/MTR_4k_keyframes/coco_reviewed_800_final.json \
+        --manifest Datasets/MTR/MTR_4k_keyframes/keyframe_manifest.json \
+        --image-folder Datasets/MTR/MTR_4k_dataset_exit_signs \
+        --output-coco output/MTR_4k/interpolated_kalman_coco.json \
+        --vis-output output/MTR_4k/interpolated_kalman_vis \
+        --interp-method kalman --flow-method dis \
+        --kf-q 1.0 --kf-r 4.0
 
 OUTPUT:
     - <output-coco>        COCO with boxes for every frame (keyframes reviewed,
@@ -174,7 +204,7 @@ class UnionFind:
 
 
 # ---------------------------------------------------------------------------
-# KLT optical flow
+# Optical flow: sparse KLT and dense DIS/Farnebäck
 # ---------------------------------------------------------------------------
 
 def _seed_points(gray, xyxy, min_points=8):
@@ -216,25 +246,170 @@ def _lk_step(prev_gray, curr_gray, points):
     return next_pts, ok, med
 
 
-def interpolate_span(image_folder, frames, a, b, box_a, box_b,
-                     min_valid=2, max_step_frac=0.3):
-    """Anchored KLT for one matched pair between keyframe a and keyframe b.
+# ---------------------------------------------------------------------------
+# Dense optical flow (DIS / Farnebäck)
+# ---------------------------------------------------------------------------
+
+_dense_flow_cache = {}  # (prev_name, curr_name) -> flow (H, W, 2)
+
+
+def _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name, method="dis"):
+    """Compute dense optical flow between two frames, with caching.
+
+    Returns (H, W, 2) float32 array. Uses DIS (fast, good for real-time) or
+    Farnebäck (more accurate, slower) depending on ``method``.
+    """
+    cache_key = (prev_name, curr_name, method)
+    if cache_key in _dense_flow_cache:
+        return _dense_flow_cache[cache_key]
+
+    if method == "farneback":
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_gray, curr_gray, None,
+            pyr_scale=0.5, levels=5, winsize=21,
+            iterations=3, poly_n=5, poly_sigma=1.1,
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+        )
+    else:
+        # DIS: Dense Inverse Search. Fast and handles large displacements
+        # much better than sparse KLT, ideal for handheld/unstable camera.
+        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
+        flow = dis.calc(prev_gray, curr_gray, None)
+
+    if len(_dense_flow_cache) > 64:
+        _dense_flow_cache.clear()
+    _dense_flow_cache[cache_key] = flow
+    return flow
+
+
+def _box_median_flow(flow, xyxy):
+    """Median (dx, dy) of the dense flow field inside a box region."""
+    x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
+    h, w = flow.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return None
+    region = flow[y1:y2, x1:x2]
+    dx = np.median(region[:, :, 0])
+    dy = np.median(region[:, :, 1])
+    if not (np.isfinite(dx) and np.isfinite(dy)):
+        return None
+    return np.array([dx, dy], dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Kalman-filter smoothing (constant-velocity model)
+# ---------------------------------------------------------------------------
+
+class _ConstantVelocityKF:
+    """A minimal 1-D constant-velocity Kalman filter (state [pos, vel]).
+
+    Used to smooth noisy optical-flow center trajectories. Operates on scalar
+    position per axis; instantiate two (x and y) for a 2-D center.
+    """
+
+    def __init__(self, x0, q=1.0, r=4.0):
+        # State: [pos, vel], measurement: [pos]
+        self.x = np.array([x0, 0.0], dtype=np.float64)
+        self.P = np.array([[10.0, 0.0], [0.0, 10.0]], dtype=np.float64)
+        self.F = np.array([[1.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+        self.H = np.array([[1.0, 0.0]], dtype=np.float64)
+        self.Q = np.diag([q, q * 0.25])
+        self.R = np.array([[r]], dtype=np.float64)
+
+    def predict(self):
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def update(self, z):
+        if z is None:
+            # No measurement: pure prediction step.
+            return
+        z = np.array([z], dtype=np.float64)
+        y = z - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + (K @ y).flatten()
+        I = np.eye(2)
+        self.P = (I - K @ self.H) @ self.P
+
+    @property
+    def pos(self):
+        return float(self.x[0])
+
+    @property
+    def vel(self):
+        return float(self.x[1])
+
+
+def _run_kf_span(raw_centers, a, b, center_a, center_b,
+                 q=1.0, r=4.0, anchor=True):
+    """Smooth a raw optical-flow trajectory with a constant-velocity KF.
+
+    Parameters
+    ----------
+    raw_centers : dict {p: np.array([cx, cy])}
+        Raw center positions from optical flow (may be missing for lost frames).
+    a, b : int
+        Span endpoint frame indices (keyframes).
+    center_a, center_b : np.array([cx, cy])
+        Reviewed endpoint centers (ground truth).
+    q : float
+        Process noise covariance scale.
+    r : float
+        Measurement noise covariance scale.
+    anchor : bool
+        If True, apply endpoint anchoring so the smoothed trajectory starts at
+        ``center_a`` and lands at ``center_b`` (same correction philosophy as the
+        optical-flow interpolator).
+
+    Returns
+    -------
+    dict {p: np.array([cx, cy])} for p in (a, b) — smoothed centers.
+    """
+    kfx = _ConstantVelocityKF(center_a[0], q=q, r=r)
+    kfy = _ConstantVelocityKF(center_a[1], q=q, r=r)
+
+    smoothed = {a: center_a.copy()}
+    for p in range(a + 1, b + 1):
+        kfx.predict()
+        kfy.predict()
+        if p in raw_centers:
+            kfx.update(float(raw_centers[p][0]))
+            kfy.update(float(raw_centers[p][1]))
+        smoothed[p] = np.array([kfx.pos, kfy.pos], dtype=np.float64)
+
+    if anchor:
+        # Endpoint correction identical to the optical-flow anchoring:
+        # blend raw smoothed with a linear correction so endpoints are exact.
+        raw_b = smoothed.get(b, center_a)
+        for p in range(a + 1, b):
+            t = (p - a) / (b - a) if b > a else 0.0
+            raw = smoothed.get(p, center_a + t * (raw_b - center_a))
+            smoothed[p] = raw + t * (center_b - raw_b)
+        smoothed[b] = center_b.copy()
+
+    # Strip endpoints (caller only wants interior frames).
+    return {p: smoothed[p] for p in smoothed if a < p < b}
+
+
+def interpolate_span_kalman(image_folder, frames, a, b, box_a, box_b,
+                            min_valid=2, max_step_frac=0.3, flow_method="dis",
+                            kf_q=1.0, kf_r=4.0):
+    """Kalman-filtered optical flow for one matched pair between keyframe a and b.
+
+    Feeds the same per-frame optical-flow median displacement used by
+    :func:`interpolate_span` into a constant-velocity Kalman filter (one per
+    axis), then applies the same reviewed-endpoint anchoring. Compared to the
+    plain accumulator, the KF denoises jittery flow (acceleration model + gain
+    on the measurement) and extrapolates gracefully through short flow-dropout
+    gaps where the KLT/DIS track is temporarily lost, instead of bailing out.
 
     Returns {p: [x1,y1,x2,y2]} for interior frames p in (a, b).
-
-    Per-step displacement is clamped to ``max_step_frac * min(box_a w,h)`` so
-    unreliable features cannot run away; the endpoint anchor then guarantees
-    the trajectory starts exactly at box_a and lands exactly at box_b. When the
-    flow has nothing real to follow, the clamped raw trajectory stays near
-    box_a and the anchor term reduces the result to ~linear interpolation.
     """
     gray_a = _read_gray(image_folder, frames[a])
     if gray_a is None:
-        return {}
-
-    pts = _seed_points(gray_a, box_a["xyxy"])
-    if pts is None:
-        # No features: fall back to pure linear interpolation.
         return _linear_span(a, b, box_a, box_b)
 
     center_a = box_a["center"].copy()
@@ -243,19 +418,187 @@ def interpolate_span(image_folder, frames, a, b, box_a, box_b,
     wh_b = np.array([box_b["xywh"][2], box_b["xywh"][3]])
     max_step = max_step_frac * float(min(wh_a[0], wh_a[1]))
 
+    cur_pts = None
+    if flow_method == "klt":
+        cur_pts = _seed_points(gray_a, box_a["xyxy"])
+        if cur_pts is None:
+            return _linear_span(a, b, box_a, box_b)
+
     raw_centers = {a: center_a.copy()}
     prev_gray = gray_a
-    cur_pts = pts
+    prev_name = frames[a]
+    for p in range(a + 1, b + 1):
+        curr_gray = _read_gray(image_folder, frames[p])
+        if curr_gray is None:
+            # Frame missing: leave a gap; the KF will predict through it.
+            continue
+        curr_name = frames[p]
+
+        if flow_method == "klt":
+            next_pts, ok, med = _lk_step(prev_gray, curr_gray, cur_pts)
+            if med is not None and int(ok.sum()) >= min_valid:
+                cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
+            else:
+                med = None
+        else:
+            flow = _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name,
+                                       method=flow_method)
+            med = _box_median_flow(flow, box_a["xyxy"] if p == a + 1 else
+                                   _center_wh_to_xyxy(
+                                       raw_centers[list(raw_centers)[-1]], wh_a))
+            if med is None:
+                continue
+
+        if med is not None:
+            mag = float(np.hypot(med[0], med[1]))
+            if mag > max_step and mag > 0:
+                med = med * (max_step / mag)
+            prev_center = raw_centers[list(raw_centers)[-1]]
+            raw_centers[p] = prev_center + med
+        prev_gray = curr_gray
+        prev_name = curr_name
+
+    # Smooth + anchor with the Kalman filter.
+    kf_centers = _run_kf_span(raw_centers, a, b, center_a, center_b,
+                              q=kf_q, r=kf_r, anchor=True)
+
+    result = {}
+    for p in range(a + 1, b):
+        center = kf_centers.get(p, center_a)
+        wh = wh_a + (wh_b - wh_a) * ((p - a) / (b - a) if b > a else 0.0)
+        result[p] = _center_wh_to_xyxy(center, wh)
+    return result
+
+
+def track_forward_kalman(image_folder, frames, a, b, box_a,
+                         min_valid=2, max_step_frac=0.3, flow_method="dis",
+                         kf_q=1.0, kf_r=4.0):
+    """Forward Kalman-filtered tracking for an unmatched-at-a box.
+
+    Same measurement pipeline as :func:`track_forward`, but the center is
+    smoothed by a constant-velocity KF which keeps predicting (extrapolating
+    with the learned velocity) through short flow-dropout gaps instead of
+    stopping immediately. Emits boxes for p in (a, b). Size stays at box_a's.
+    """
+    gray_a = _read_gray(image_folder, frames[a])
+    if gray_a is None:
+        return {}
+
+    center = box_a["center"].copy()
+    wh = np.array([box_a["xywh"][2], box_a["xywh"][3]])
+    max_step = max_step_frac * float(min(wh[0], wh[1]))
+    kfx = _ConstantVelocityKF(center[0], q=kf_q, r=kf_r)
+    kfy = _ConstantVelocityKF(center[1], q=kf_q, r=kf_r)
+
+    result = {}
+    prev_gray = gray_a
+    prev_name = frames[a]
+    cur_pts = None
+    if flow_method == "klt":
+        cur_pts = _seed_points(gray_a, box_a["xyxy"])
+        if cur_pts is None:
+            return {}
+
+    for p in range(a + 1, b):
+        curr_gray = _read_gray(image_folder, frames[p])
+        if curr_gray is None:
+            kfx.predict(); kfy.predict()
+            result[p] = _center_wh_to_xyxy(np.array([kfx.pos, kfy.pos]), wh)
+            continue
+        curr_name = frames[p]
+
+        med = None
+        if flow_method == "klt":
+            next_pts, ok, m = _lk_step(prev_gray, curr_gray, cur_pts)
+            if m is not None and int(ok.sum()) >= min_valid:
+                med = m
+                cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
+        else:
+            flow = _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name,
+                                       method=flow_method)
+            med = _box_median_flow(flow, _center_wh_to_xyxy(center, wh))
+
+        kfx.predict(); kfy.predict()
+        if med is not None:
+            mag = float(np.hypot(med[0], med[1]))
+            if mag > float(max(wh)):
+                break  # jumped to junk
+            if mag > max_step and mag > 0:
+                med = med * (max_step / mag)
+            new_center = np.array([kfx.pos, kfy.pos]) + med
+            kfx.update(float(new_center[0]))
+            kfy.update(float(new_center[1]))
+            center = np.array([kfx.pos, kfy.pos])
+        else:
+            center = np.array([kfx.pos, kfy.pos])
+
+        result[p] = _center_wh_to_xyxy(center, wh)
+        prev_gray = curr_gray
+        prev_name = curr_name
+    return result
+
+
+def interpolate_span(image_folder, frames, a, b, box_a, box_b,
+                     min_valid=2, max_step_frac=0.3, flow_method="klt"):
+    """Anchored optical flow for one matched pair between keyframe a and b.
+
+    Returns {p: [x1,y1,x2,y2]} for interior frames p in (a, b).
+
+    Per-step displacement is clamped to ``max_step_frac * min(box_a w,h)`` so
+    unreliable features cannot run away; the endpoint anchor then guarantees
+    the trajectory starts exactly at box_a and lands exactly at box_b. When the
+    flow has nothing real to follow, the clamped raw trajectory stays near
+    box_a and the anchor term reduces the result to ~linear interpolation.
+
+    Args:
+        flow_method: "klt" (sparse Lucas-Kanade, default), "dis" (dense
+            inverse search — handles large displacements from handheld camera
+            shake), or "farneback" (dense, more accurate but slower).
+    """
+    gray_a = _read_gray(image_folder, frames[a])
+    if gray_a is None:
+        return {}
+
+    center_a = box_a["center"].copy()
+    center_b = box_b["center"].copy()
+    wh_a = np.array([box_a["xywh"][2], box_a["xywh"][3]])
+    wh_b = np.array([box_b["xywh"][2], box_b["xywh"][3]])
+    max_step = max_step_frac * float(min(wh_a[0], wh_a[1]))
+
+    # KLT needs seed points; dense flow doesn't.
+    cur_pts = None
+    if flow_method == "klt":
+        cur_pts = _seed_points(gray_a, box_a["xyxy"])
+        if cur_pts is None:
+            return _linear_span(a, b, box_a, box_b)
+
+    raw_centers = {a: center_a.copy()}
+    prev_gray = gray_a
+    prev_name = frames[a]
     lost = False
     for p in range(a + 1, b + 1):
         curr_gray = _read_gray(image_folder, frames[p])
         if curr_gray is None:
             lost = True
             break
-        next_pts, ok, med = _lk_step(prev_gray, curr_gray, cur_pts)
-        if med is None or int(ok.sum()) < min_valid:
-            lost = True
-            break
+        curr_name = frames[p]
+
+        if flow_method == "klt":
+            next_pts, ok, med = _lk_step(prev_gray, curr_gray, cur_pts)
+            if med is None or int(ok.sum()) < min_valid:
+                lost = True
+                break
+            cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
+        else:
+            flow = _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name,
+                                       method=flow_method)
+            med = _box_median_flow(flow, box_a["xyxy"] if p == a + 1 else
+                                   _center_wh_to_xyxy(
+                                       raw_centers[list(raw_centers)[-1]], wh_a))
+            if med is None:
+                lost = True
+                break
+
         # Clamp per-step displacement to keep unreliable features bounded.
         mag = float(np.hypot(med[0], med[1]))
         if mag > max_step and mag > 0:
@@ -263,8 +606,8 @@ def interpolate_span(image_folder, frames, a, b, box_a, box_b,
         # Accumulate the per-step median displacement into the raw trajectory.
         prev_center = raw_centers[list(raw_centers)[-1]]
         raw_centers[p] = prev_center + med
-        cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
         prev_gray = curr_gray
+        prev_name = curr_name
 
     result = {}
     if lost:
@@ -294,8 +637,8 @@ def interpolate_span(image_folder, frames, a, b, box_a, box_b,
 
 
 def track_forward(image_folder, frames, a, b, box_a,
-                  min_valid=2, max_step_frac=0.3):
-    """Forward KLT for an unmatched-at-a box. Returns {p: [x1,y1,x2,y2]}.
+                   min_valid=2, max_step_frac=0.3, flow_method="klt"):
+    """Forward optical flow for an unmatched-at-a box. Returns {p: [x1,y1,x2,y2]}.
 
     Emits boxes until the track is lost or the next keyframe is reached. Size
     stays at box_a's; per-step displacement is clamped to bound drift.
@@ -303,22 +646,38 @@ def track_forward(image_folder, frames, a, b, box_a,
     gray_a = _read_gray(image_folder, frames[a])
     if gray_a is None:
         return {}
-    pts = _seed_points(gray_a, box_a["xyxy"])
-    if pts is None:
-        return {}
+
     center = box_a["center"].copy()
     wh = np.array([box_a["xywh"][2], box_a["xywh"][3]])
     max_step = max_step_frac * float(min(wh[0], wh[1]))
     result = {}
     prev_gray = gray_a
-    cur_pts = pts
+    prev_name = frames[a]
+
+    cur_pts = None
+    if flow_method == "klt":
+        cur_pts = _seed_points(gray_a, box_a["xyxy"])
+        if cur_pts is None:
+            return {}
+
     for p in range(a + 1, b):  # stop before the next keyframe (it's reviewed)
         curr_gray = _read_gray(image_folder, frames[p])
         if curr_gray is None:
             break
-        next_pts, ok, med = _lk_step(prev_gray, curr_gray, cur_pts)
-        if med is None or int(ok.sum()) < min_valid:
-            break
+        curr_name = frames[p]
+
+        if flow_method == "klt":
+            next_pts, ok, med = _lk_step(prev_gray, curr_gray, cur_pts)
+            if med is None or int(ok.sum()) < min_valid:
+                break
+            cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
+        else:
+            flow = _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name,
+                                       method=flow_method)
+            med = _box_median_flow(flow, _center_wh_to_xyxy(center, wh))
+            if med is None:
+                break
+
         mag = float(np.hypot(med[0], med[1]))
         # A step larger than the whole box means the track jumped to junk: stop.
         if mag > float(max(wh)):
@@ -326,8 +685,8 @@ def track_forward(image_folder, frames, a, b, box_a,
         if mag > max_step and mag > 0:
             med = med * (max_step / mag)
         center = center + med
-        cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
         prev_gray = curr_gray
+        prev_name = curr_name
         result[p] = _center_wh_to_xyxy(center, wh)
     return result
 
@@ -401,8 +760,28 @@ def main():
                         help="Min goodFeatures to seed a KLT track (default: 8).")
     parser.add_argument("--max-step-frac", type=float, default=0.3,
                         help="Max per-frame box displacement as a fraction of "
-                             "the smaller box dimension; clamps KLT drift "
+                             "the smaller box dimension; clamps flow drift "
                              "(default: 0.3).")
+    parser.add_argument("--flow-method", choices=["klt", "dis", "farneback"],
+                        default="dis",
+                        help="Optical flow method for interpolation: 'klt' "
+                             "(sparse Lucas-Kanade, fast but fails on large "
+                             "displacements), 'dis' (dense inverse search, "
+                             "handles handheld camera shake, default), "
+                             "'farneback' (dense, most accurate but slowest).")
+    parser.add_argument("--interp-method", choices=["flow", "kalman"],
+                        default="flow",
+                        help="Interpolation strategy: 'flow' (raw optical-flow "
+                             "accumulator with endpoint anchoring, default) or "
+                             "'kalman' (constant-velocity Kalman filter fed with "
+                             "the same flow measurements; smooths jitter and "
+                             "predicts through short flow dropouts).")
+    parser.add_argument("--kf-q", type=float, default=1.0,
+                        help="Kalman process-noise scale (default: 1.0). Only "
+                             "used with --interp-method kalman.")
+    parser.add_argument("--kf-r", type=float, default=4.0,
+                        help="Kalman measurement-noise scale (default: 4.0). "
+                             "Only used with --interp-method kalman.")
     parser.add_argument("--device", default="cuda",
                         help="Unused placeholder (KLT runs on CPU). Kept for "
                              "pipeline consistency with other scripts.")
@@ -453,14 +832,30 @@ def main():
         # Interpolate matched pairs.
         interp = {}
         for i, j, _ in matches:
-            interp[i] = interpolate_span(image_folder, frames, a, b, ba[i], bb[j],
-                                         max_step_frac=args.max_step_frac)
+            if args.interp_method == "kalman":
+                interp[i] = interpolate_span_kalman(
+                    image_folder, frames, a, b, ba[i], bb[j],
+                    max_step_frac=args.max_step_frac,
+                    flow_method=args.flow_method,
+                    kf_q=args.kf_q, kf_r=args.kf_r)
+            else:
+                interp[i] = interpolate_span(image_folder, frames, a, b, ba[i], bb[j],
+                                             max_step_frac=args.max_step_frac,
+                                             flow_method=args.flow_method)
         span_interp[(a, b)] = interp
         # Forward-track unmatched-at-a boxes.
         fwd = {}
         for i in un_a:
-            fwd[i] = track_forward(image_folder, frames, a, b, ba[i],
-                                   max_step_frac=args.max_step_frac)
+            if args.interp_method == "kalman":
+                fwd[i] = track_forward_kalman(
+                    image_folder, frames, a, b, ba[i],
+                    max_step_frac=args.max_step_frac,
+                    flow_method=args.flow_method,
+                    kf_q=args.kf_q, kf_r=args.kf_r)
+            else:
+                fwd[i] = track_forward(image_folder, frames, a, b, ba[i],
+                                       max_step_frac=args.max_step_frac,
+                                       flow_method=args.flow_method)
         span_forward[(a, b)] = fwd
 
     # Assign track ids (0..N-1) in first-seen order across all reviewed boxes.

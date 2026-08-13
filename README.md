@@ -133,11 +133,11 @@ Output:
 
 ```
 python scripts/08_click_review_coco.py \
-  --qwen-annotations-dir Datasets/MTR/mtr_new_1k_annotations \
-  --img_dir Datasets/MTR/MTR_new_1k \
-  --output_json output/MTR_new_1k/reviewed/coco_reviewed.json \
-  --output-yolo-dir output/MTR_new_1k/reviewed/yolo_reviewed \
-  --data-yaml Datasets/MTR/detect/train_yolo_detection/data.yaml
+  --qwen-annotations-dir output/annotations/MTR_4k \
+  --img_dir Datasets/MTR/MTR_4k_dataset_exit_signs \
+  --output_json output/MTR_4k/reviewed/coco_reviewed.json \
+  --output-yolo-dir output/MTR_4k/reviewed/yolo_reviewed \
+  --data-yaml Datasets/MTR/MTR_4k/detect/train_yolo_detection/data.yaml
 
 python scripts/08_click_review_coco.py \
   --qwen-annotations-dir Datasets/MTR/MTR_new_10_images_annotations \
