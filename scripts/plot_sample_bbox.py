@@ -1,13 +1,13 @@
 from PIL import Image, ImageDraw, ImageFont
 
 # 1. Load your image
-image_name = "test8"
-image_path = f"{image_name}.jpg"  # Replace with your image path
+image_name = "test9"
+image_path = f"scripts/{image_name}.jpg"  # Replace with your image path
 image = Image.open(image_path)
 width, height = image.size
 
 # 2. Bounding box data in xyxy format normalized 0-1000
-data = [{"bbox_2d": [103, 427, 151, 450], "label": "Exit Sign"}]
+data = [{"bbox_2d": [596, 483, 627, 1000], "label": "Exit Sign"}]
 
 draw = ImageDraw.Draw(image)
 
