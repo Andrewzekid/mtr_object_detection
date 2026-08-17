@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
 """
-Rerun-based interactive 2D bbox reviewer for an existing .rrd recording.
+Interactive 2D bbox reviewer for a Rerun .rrd recording OR a folder of images.
+
+Run it
+------
+    # Rerun mode (recording + embedded Rerun web viewer):
+    python scripts/09_rerun_label_review.py \
+        --rrd complete3/output.rrd \
+        --output_json output/complete3/coco_fresh.json \
+        --db complete3/inspection_v2.db --no-seed --sam3-device cpu
+
+    # Image mode (plain files, no Rerun viewer):
+    python scripts/09_rerun_label_review.py \
+        --images /path/to/folder_or_image.jpg \
+        --output_json output/my_labels/coco.json
 
 What this does
 ---------------
-* Opens an existing Rerun ``.rrd`` recording.
+* Opens an existing Rerun ``.rrd`` recording — or, with ``--images``, a set
+  of plain image files (one or more files/folders; folders are scanned for
+  jpg/jpeg/png/bmp/webp/tif, sorted by name). In image mode there is no
+  Rerun viewer; navigation is via the N/B keys, the slider, or Space.
 * Embeds the official Rerun *web* viewer inside a PyQt6 window using
   ``QWebEngineView`` pointed at a locally hosted ``rerun.serve_web_viewer()``
   instance. The viewer shows the full 3D world + camera images, and you can
@@ -64,6 +80,11 @@ USAGE
         [--timeline ros_time] \
         [--output-yolo-dir ...] [--data-yaml ...] \
         [--grpc-port 9876] [--web-port 9090]
+
+    # or, without an .rrd (mutually exclusive with --rrd):
+    python scripts/09_rerun_label_review.py \
+        --images <folder | image file> [more paths ...] \
+        --output_json output/my_labels/coco.json
 
 Key bindings (in the 2D canvas, when it has focus — click it once):
     D / del  : delete selected box
@@ -767,6 +788,67 @@ class RrdFrameIndex:
 
 
 # ---------------------------------------------------------------------------
+# Image-folder frame index — same interface as RrdFrameIndex, backed by
+# plain image files instead of an .rrd recording (used with --images).
+# ---------------------------------------------------------------------------
+
+class ImageFolderIndex:
+    """Frame index over plain image files.
+
+    Accepts a mix of image files and folders; folders are scanned
+    (non-recursively) for common image extensions and sorted by name.
+    Timestamps are synthetic (1 ms per frame) so frames stay in file order.
+    Exposes the same interface as RrdFrameIndex: ``__len__``, ``frame_at``,
+    ``decode_image``, ``find_idx_by_timestamp``, and a ``.frames`` list with
+    timestamp_ns / log_time_ns / frame_idx / existing_boxes / image_blob keys.
+    """
+
+    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+    def __init__(self, paths: List[str]):
+        files: List[str] = []
+        for p in paths:
+            if os.path.isdir(p):
+                for name in sorted(os.listdir(p)):
+                    if os.path.splitext(name)[1].lower() in self.IMG_EXTS:
+                        files.append(os.path.join(p, name))
+            elif os.path.isfile(p):
+                files.append(p)
+            else:
+                raise FileNotFoundError(f"--images path not found: {p}")
+        if not files:
+            raise RuntimeError(f"No image files found under: {paths}")
+        self.files = files
+        self.frames: List[Dict[str, Any]] = []
+        for idx, fp in enumerate(files):
+            ts = idx * 1_000_000  # synthetic: 1 ms per frame
+            self.frames.append({
+                "frame_idx": idx,
+                "timestamp_ns": ts,
+                "log_time_ns": ts,
+                "image_blob": None,
+                "media_type": None,
+                "existing_boxes": [],
+                "file_path": fp,
+                "file_name": os.path.basename(fp),
+            })
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    def frame_at(self, idx: int) -> Dict[str, Any]:
+        return self.frames[idx]
+
+    def decode_image(self, idx: int) -> np.ndarray:
+        with Image.open(self.frames[idx]["file_path"]) as im:
+            return np.array(im.convert("RGB"))
+
+    def find_idx_by_timestamp(self, ts_ns: int) -> int:
+        # Synthetic timestamps are idx * 1 ms; snap to the nearest frame.
+        return min(max(round(ts_ns / 1_000_000), 0), len(self.frames) - 1)
+
+
+# ---------------------------------------------------------------------------
 # Undo stack — keeps a bounded history of inverse operations.
 # ---------------------------------------------------------------------------
 
@@ -1011,7 +1093,7 @@ class CocoState:
         img_id = len(self.images) + 1
         img_rec = {
             "id": img_id,
-            "file_name": f"{frame['frame_idx']:06d}.jpg",
+            "file_name": frame.get("file_name") or f"{frame['frame_idx']:06d}.jpg",
             "width": width,
             "height": height,
             "timestamp_ns": ts,
@@ -2221,13 +2303,15 @@ class TimeBridge(QObject):
 
 class ReviewWindow(QMainWindow):
 
-    def __init__(self, rrd_index: RrdFrameIndex, coco: CocoState,
+    def __init__(self, rrd_index: "RrdFrameIndex | ImageFolderIndex",
+                 coco: CocoState,
                  grpc_uri: str, web_port: int,
                  sam3_model: Optional[str] = None,
                  sam3_device: str = "cuda",
                  sam3_conf: float = 0.25,
                  auto_segment: bool = False,
                  seed_from_rrd: bool = True,
+                 has_viewer: bool = True,
                  parent=None):
         super().__init__(parent)
         self.rrd_index = rrd_index
@@ -2302,18 +2386,25 @@ class ReviewWindow(QMainWindow):
         self.web_view: Optional[QWebEngineView] = None
         self.bridge: Optional[TimeBridge] = None
         self.channel: Optional[QWebChannel] = None
-        if _HAS_WEBENGINE:
+        if _HAS_WEBENGINE and has_viewer:
             self.web_view = QWebEngineView()
             rerun_layout.addWidget(self.web_view, 1)
             right_split.addWidget(self.rerun_container)
             right_split.setSizes([700, 600])
             self._setup_web_bridge()
         else:
-            placeholder = QLabel(
-                "PyQt6-WebEngine not installed.\n"
-                "Install with: pip install PyQt6-WebEngine\n"
-                "Run `rerun` separately and scrub its timeline."
-            )
+            if has_viewer:
+                placeholder_text = (
+                    "PyQt6-WebEngine not installed.\n"
+                    "Install with: pip install PyQt6-WebEngine\n"
+                    "Run `rerun` separately and scrub its timeline."
+                )
+            else:
+                placeholder_text = (
+                    "Image mode (--images): no Rerun viewer.\n"
+                    "Navigate with N / B, the slider, or Space to play."
+                )
+            placeholder = QLabel(placeholder_text)
             placeholder.setAlignment(Qt.AlignCenter)
             rerun_layout.addWidget(placeholder, 1)
             right_split.addWidget(self.rerun_container)
@@ -3410,10 +3501,16 @@ def _seed_categories(rrd_index: RrdFrameIndex,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Rerun-based 2D bbox reviewer for an existing .rrd recording.",
+        description="Interactive 2D bbox reviewer for a .rrd recording "
+                    "or a folder of images.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--rrd", required=True, help="Path to the .rrd recording.")
+    parser.add_argument("--rrd", help="Path to the .rrd recording "
+                        "(mutually exclusive with --images).")
+    parser.add_argument("--images", nargs="+", metavar="PATH",
+                        help="Image files and/or folders to review instead of "
+                             "an .rrd (folders are scanned for "
+                             "jpg/jpeg/png/bmp/webp/tif, sorted by name).")
     parser.add_argument("--output_json", required=True,
                         help="Output COCO JSON path (progress file is auto-saved).")
     parser.add_argument("--json", help="Seed COCO JSON for categories / existing labels.")
@@ -3441,26 +3538,35 @@ def main():
                              "Boxes2D track (start with a blank canvas).")
     args = parser.parse_args()
 
-    rrd_path = os.path.abspath(args.rrd)
-    if not os.path.exists(rrd_path):
-        print(f"❌ .rrd not found: {rrd_path}")
-        sys.exit(1)
+    if not args.rrd and not args.images:
+        parser.error("one of --rrd or --images is required")
+    if args.rrd and args.images:
+        parser.error("--rrd and --images are mutually exclusive")
 
-    # ---------- 1. Index the .rrd ----------
-    print(f"🔍 Scanning {rrd_path} (this can take a minute for big recordings)…")
-    rrd_index = RrdFrameIndex(
-        rrd_path,
-        image_entity=args.image_entity,
-        bboxes_entity=args.bboxes_entity,
-        timeline=args.timeline,
-        progress_cb=lambda n_chunks, n_imgs: print(
-            f"  scanned {n_chunks} chunks, {n_imgs} unique image timestamps",
-            end="\r"),
-    )
-    print(f"\n✅ Indexed {len(rrd_index)} frames "
-          f"(image entity: {rrd_index.image_entity}, "
-          f"bboxes entity: {rrd_index.bboxes_entity}, "
-          f"timeline: {rrd_index.timeline})")
+    # ---------- 1. Index the frame source ----------
+    if args.images:
+        print(f"🖼️  Loading images from: {args.images}")
+        rrd_index = ImageFolderIndex(args.images)
+        print(f"✅ Indexed {len(rrd_index)} images")
+    else:
+        rrd_path = os.path.abspath(args.rrd)
+        if not os.path.exists(rrd_path):
+            print(f"❌ .rrd not found: {rrd_path}")
+            sys.exit(1)
+        print(f"🔍 Scanning {rrd_path} (this can take a minute for big recordings)…")
+        rrd_index = RrdFrameIndex(
+            rrd_path,
+            image_entity=args.image_entity,
+            bboxes_entity=args.bboxes_entity,
+            timeline=args.timeline,
+            progress_cb=lambda n_chunks, n_imgs: print(
+                f"  scanned {n_chunks} chunks, {n_imgs} unique image timestamps",
+                end="\r"),
+        )
+        print(f"\n✅ Indexed {len(rrd_index)} frames "
+              f"(image entity: {rrd_index.image_entity}, "
+              f"bboxes entity: {rrd_index.bboxes_entity}, "
+              f"timeline: {rrd_index.timeline})")
     if len(rrd_index) == 0:
         print("❌ No image frames found.")
         sys.exit(1)
@@ -3472,8 +3578,10 @@ def main():
     coco.load_existing()
     coco.current_idx = coco.load_progress(len(rrd_index))
 
-    # ---------- 3. Spawn the Rerun web viewer ----------
-    proc = _spawn_rerun_web_viewer(rrd_path, args.web_port, args.grpc_port)
+    # ---------- 3. Spawn the Rerun web viewer (rrd mode only) ----------
+    proc = None
+    if args.rrd:
+        proc = _spawn_rerun_web_viewer(rrd_path, args.web_port, args.grpc_port)
 
     # ---------- 4. Qt app ----------
     app = QApplication.instance() or QApplication(sys.argv)
@@ -3482,7 +3590,7 @@ def main():
     # Clean up the spawned rerun process on exit.
     def _shutdown():
         try:
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 proc.terminate()
         except Exception:
             pass
@@ -3490,13 +3598,15 @@ def main():
     signal.signal(signal.SIGINT, lambda *a: app.quit())
 
     win = ReviewWindow(rrd_index, coco,
-                       grpc_uri=f"rerun+http://127.0.0.1:{args.grpc_port}/proxy",
+                       grpc_uri=(f"rerun+http://127.0.0.1:{args.grpc_port}/proxy"
+                                 if args.rrd else ""),
                        web_port=args.web_port,
                        sam3_model=args.sam3_model,
                        sam3_device=args.sam3_device,
                        sam3_conf=args.sam3_conf,
                        auto_segment=args.auto_segment,
-                       seed_from_rrd=not args.no_seed)
+                       seed_from_rrd=not args.no_seed and bool(args.rrd),
+                       has_viewer=bool(args.rrd))
     win.show()
     exit_code = app.exec()
 
@@ -3520,7 +3630,8 @@ def main():
                     ],
                     "categories": coco.categories,
                 }
-                # Write images to a temp dir from the .rrd blobs.
+                # Write images to a temp dir: from the .rrd blobs, or copy
+                # the source files directly in --images mode.
                 tmp_img_dir = Path(args.output_yolo_dir) / "_src_images"
                 tmp_img_dir.mkdir(parents=True, exist_ok=True)
                 for img in coco.images:
@@ -3529,6 +3640,10 @@ def main():
                     if blob:
                         with open(tmp_img_dir / img["file_name"], "wb") as f:
                             f.write(blob)
+                    elif frame.get("file_path"):
+                        with open(frame["file_path"], "rb") as src, \
+                                open(tmp_img_dir / img["file_name"], "wb") as dst:
+                            dst.write(src.read())
                 mod.export_yolo_from_coco(
                     final_coco, img_dir=tmp_img_dir,
                     output_dir=args.output_yolo_dir,
