@@ -89,6 +89,7 @@ import argparse
 import bisect
 import json
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 import cv2
@@ -97,6 +98,16 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.tracking_utils import create_tracking_video
+
+
+# Fixed palette for visualization (BGR for OpenCV). Deterministic across runs
+# so the same category always gets the same color when comparing outputs.
+_VIS_PALETTE = [
+    (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+    (255, 0, 255), (0, 255, 255), (128, 0, 255), (255, 128, 0),
+    (0, 128, 255), (128, 255, 0), (255, 0, 128), (0, 255, 128),
+    (128, 128, 255), (255, 128, 128), (128, 255, 128), (255, 255, 128),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -306,17 +317,19 @@ def _lk_step(prev_gray, curr_gray, points):
 # Dense optical flow (DIS / Farnebäck)
 # ---------------------------------------------------------------------------
 
-_dense_flow_cache = {}  # (prev_name, curr_name) -> flow (H, W, 2)
+_dense_flow_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+_DENSE_FLOW_CACHE_MAX = 64
 
 
 def _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name, method="dis"):
-    """Compute dense optical flow between two frames, with caching.
+    """Compute dense optical flow between two frames, with LRU caching.
 
     Returns (H, W, 2) float32 array. Uses DIS (fast, good for real-time) or
     Farnebäck (more accurate, slower) depending on ``method``.
     """
     cache_key = (prev_name, curr_name, method)
     if cache_key in _dense_flow_cache:
+        _dense_flow_cache.move_to_end(cache_key)
         return _dense_flow_cache[cache_key]
 
     if method == "farneback":
@@ -324,7 +337,7 @@ def _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name, method="dis"
             prev_gray, curr_gray, None,
             pyr_scale=0.5, levels=5, winsize=21,
             iterations=3, poly_n=5, poly_sigma=1.1,
-            flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+            flags=0,
         )
     else:
         # DIS: Dense Inverse Search. Fast and handles large displacements
@@ -332,9 +345,9 @@ def _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name, method="dis"
         dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
         flow = dis.calc(prev_gray, curr_gray, None)
 
-    if len(_dense_flow_cache) > 64:
-        _dense_flow_cache.clear()
     _dense_flow_cache[cache_key] = flow
+    while len(_dense_flow_cache) > _DENSE_FLOW_CACHE_MAX:
+        _dense_flow_cache.popitem(last=False)
     return flow
 
 
@@ -577,7 +590,7 @@ class _ConstantVelocityKF:
 
 
 def interpolate_span_kalman(image_folder, frames, a, b, box_a, box_b,
-                            min_valid=2, max_step_frac=0.3, flow_method="dis",
+                            min_valid=2, min_points=8, max_step_frac=0.3, flow_method="dis",
                             kf_q=1.0, kf_r=4.0, camera_model="none",
                             gf_quality=0.02, ransac_px=2.0):
     """Kalman-filtered optical flow for one matched pair between keyframe a and b.
@@ -627,7 +640,7 @@ def interpolate_span_kalman(image_folder, frames, a, b, box_a, box_b,
 
     cur_pts = None
     if flow_method == "klt":
-        cur_pts = _seed_points(gray_a, box_a["xyxy"])
+        cur_pts = _seed_points(gray_a, box_a["xyxy"], min_points=min_points)
         if cur_pts is None:
             return _linear_span(a, b, box_a, box_b)
 
@@ -652,7 +665,7 @@ def interpolate_span_kalman(image_folder, frames, a, b, box_a, box_b,
                 reseed_streak = 0
             else:
                 pred = _predict_next(raw_centers, last_disp, cam_pos, p)
-                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh_a))
+                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh_a), min_points=min_points)
                 if new_pts is not None and reseed_streak < 2:
                     cur_pts = new_pts
                     prev_center = raw_centers[max(raw_centers)]
@@ -717,7 +730,7 @@ def interpolate_span_kalman(image_folder, frames, a, b, box_a, box_b,
 
 
 def track_forward_kalman(image_folder, frames, a, b, box_a,
-                         min_valid=2, max_step_frac=0.3, flow_method="dis",
+                         min_valid=2, min_points=8, max_step_frac=0.3, flow_method="dis",
                          kf_q=1.0, kf_r=4.0, camera_model="none",
                          gf_quality=0.02, ransac_px=2.0):
     """Forward Kalman-filtered tracking for an unmatched-at-a box.
@@ -770,7 +783,7 @@ def track_forward_kalman(image_folder, frames, a, b, box_a,
     prev_name = frames[a]
     cur_pts = None
     if flow_method == "klt":
-        cur_pts = _seed_points(gray_a, box_a["xyxy"])
+        cur_pts = _seed_points(gray_a, box_a["xyxy"], min_points=min_points)
         if cur_pts is None:
             return {}
 
@@ -796,7 +809,7 @@ def track_forward_kalman(image_folder, frames, a, b, box_a,
                 reseed_streak = 0
             else:
                 pred = _predict_next(raw, last_disp, cam_pos, p)
-                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh))
+                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh), min_points=min_points)
                 if new_pts is not None and reseed_streak < 2:
                     cur_pts = new_pts
                     prev_center = raw[max(raw)]
@@ -838,7 +851,7 @@ def track_forward_kalman(image_folder, frames, a, b, box_a,
 
 
 def interpolate_span(image_folder, frames, a, b, box_a, box_b,
-                     min_valid=2, max_step_frac=0.3, flow_method="klt",
+                     min_valid=2, min_points=8, max_step_frac=0.3, flow_method="klt",
                      camera_model="none", gf_quality=0.02, ransac_px=2.0):
     """Anchored optical flow for one matched pair between keyframe a and b.
 
@@ -894,7 +907,7 @@ def interpolate_span(image_folder, frames, a, b, box_a, box_b,
     # KLT needs seed points; dense flow doesn't.
     cur_pts = None
     if flow_method == "klt":
-        cur_pts = _seed_points(gray_a, box_a["xyxy"])
+        cur_pts = _seed_points(gray_a, box_a["xyxy"], min_points=min_points)
         if cur_pts is None:
             return _linear_span(a, b, box_a, box_b)
 
@@ -920,7 +933,7 @@ def interpolate_span(image_folder, frames, a, b, box_a, box_b,
                 # Track failed: re-seed at the predicted position (camera
                 # model preferred) so a single bad frame does not kill the span.
                 pred = _predict_next(raw_centers, last_disp, cam_pos, p)
-                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh_a))
+                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh_a), min_points=min_points)
                 if new_pts is not None and reseed_streak < 2:
                     cur_pts = new_pts
                     prev_center = raw_centers[max(raw_centers)]
@@ -993,7 +1006,7 @@ def interpolate_span(image_folder, frames, a, b, box_a, box_b,
 
 
 def track_forward(image_folder, frames, a, b, box_a,
-                    min_valid=2, max_step_frac=0.3, flow_method="klt",
+                    min_valid=2, min_points=8, max_step_frac=0.3, flow_method="klt",
                     camera_model="none", gf_quality=0.02, ransac_px=2.0):
     """Forward optical flow for an unmatched-at-a box.
 
@@ -1033,7 +1046,7 @@ def track_forward(image_folder, frames, a, b, box_a,
 
     cur_pts = None
     if flow_method == "klt":
-        cur_pts = _seed_points(gray_a, box_a["xyxy"])
+        cur_pts = _seed_points(gray_a, box_a["xyxy"], min_points=min_points)
         if cur_pts is None:
             return {}
 
@@ -1052,7 +1065,7 @@ def track_forward(image_folder, frames, a, b, box_a,
                 reseed_streak = 0
             else:
                 pred = _predict_next(raw, last_disp, cam_pos, p)
-                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh))
+                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh), min_points=min_points)
                 if new_pts is not None and reseed_streak < 2:
                     cur_pts = new_pts
                     prev_center = raw[max(raw)]
@@ -1089,7 +1102,7 @@ def track_forward(image_folder, frames, a, b, box_a,
 
 
 def track_backward(image_folder, frames, a, b, box_b,
-                   min_valid=2, max_step_frac=0.3, flow_method="klt",
+                   min_valid=2, min_points=8, max_step_frac=0.3, flow_method="klt",
                    camera_model="none", gf_quality=0.02, ransac_px=2.0):
     """Backward optical flow for a box that first appears at keyframe b.
 
@@ -1099,20 +1112,22 @@ def track_backward(image_folder, frames, a, b, box_b,
     """
     rev = frames[:b + 1][::-1]
     res = track_forward(image_folder, rev, 0, b - a, box_b,
-                        min_valid=min_valid, max_step_frac=max_step_frac,
+                        min_valid=min_valid, min_points=min_points,
+                        max_step_frac=max_step_frac,
                         flow_method=flow_method, camera_model=camera_model,
                         gf_quality=gf_quality, ransac_px=ransac_px)
     return {b - p: v for p, v in res.items()}
 
 
 def track_backward_kalman(image_folder, frames, a, b, box_b,
-                          min_valid=2, max_step_frac=0.3, flow_method="dis",
+                          min_valid=2, min_points=8, max_step_frac=0.3, flow_method="dis",
                           kf_q=1.0, kf_r=4.0, camera_model="none",
                           gf_quality=0.02, ransac_px=2.0):
     """Kalman-filtered :func:`track_backward` (see its docstring)."""
     rev = frames[:b + 1][::-1]
     res = track_forward_kalman(image_folder, rev, 0, b - a, box_b,
-                               min_valid=min_valid, max_step_frac=max_step_frac,
+                               min_valid=min_valid, min_points=min_points,
+                               max_step_frac=max_step_frac,
                                flow_method=flow_method, kf_q=kf_q, kf_r=kf_r,
                                camera_model=camera_model,
                                gf_quality=gf_quality, ransac_px=ransac_px)
@@ -1140,21 +1155,23 @@ def _center_wh_to_xyxy(center, wh):
     return [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0]
 
 
-_gray_cache = {}
+_gray_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+_GRAY_CACHE_MAX = 64
 
 
 def _read_gray(image_folder, name):
     """Read a frame as grayscale (small LRU cache keyed by name)."""
     if name in _gray_cache:
+        _gray_cache.move_to_end(name)
         return _gray_cache[name]
     path = Path(image_folder) / name
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
         return None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if len(_gray_cache) > 64:
-        _gray_cache.clear()
     _gray_cache[name] = gray
+    while len(_gray_cache) > _GRAY_CACHE_MAX:
+        _gray_cache.popitem(last=False)
     return gray
 
 
@@ -1186,7 +1203,10 @@ def main():
                         help="How to handle frames after the last keyframe "
                              "(default: hold last keyframe boxes).")
     parser.add_argument("--min-track-points", type=int, default=8,
-                        help="Min goodFeatures to seed a KLT track (default: 8).")
+                        help="Min goodFeatures to seed a KLT track AND min "
+                             "surviving inliers per LK step (default: 8). "
+                             "Lower = more tolerant of texture-poor boxes; "
+                             "higher = stricter tracking.")
     parser.add_argument("--max-step-frac", type=float, default=0.3,
                         help="Max per-frame box displacement as a fraction of "
                              "the smaller box dimension; clamps flow drift "
@@ -1238,7 +1258,7 @@ def main():
         manifest = json.load(f)
     frames = manifest["frames"]
     total = manifest["total_frames"]
-    keyframe_idxs = [kf["frame_idx"] for kf in manifest["keyframes"]]
+    keyframe_idxs = sorted(kf["frame_idx"] for kf in manifest["keyframes"])
     frame_idx_by_name = {kf["file_name"]: kf["frame_idx"]
                          for kf in manifest["keyframes"]}
 
@@ -1285,11 +1305,15 @@ def main():
             if args.interp_method == "kalman":
                 interp[i] = interpolate_span_kalman(
                     image_folder, frames, a, b, ba[i], bb[j],
+                    min_valid=args.min_track_points,
+                    min_points=args.min_track_points,
                     max_step_frac=args.max_step_frac,
                     flow_method=args.flow_method,
                     kf_q=args.kf_q, kf_r=args.kf_r, **cam_kwargs)
             else:
                 interp[i] = interpolate_span(image_folder, frames, a, b, ba[i], bb[j],
+                                             min_valid=args.min_track_points,
+                                             min_points=args.min_track_points,
                                              max_step_frac=args.max_step_frac,
                                              flow_method=args.flow_method,
                                              **cam_kwargs)
@@ -1300,11 +1324,15 @@ def main():
             if args.interp_method == "kalman":
                 fwd[i] = track_forward_kalman(
                     image_folder, frames, a, b, ba[i],
+                    min_valid=args.min_track_points,
+                    min_points=args.min_track_points,
                     max_step_frac=args.max_step_frac,
                     flow_method=args.flow_method,
                     kf_q=args.kf_q, kf_r=args.kf_r, **cam_kwargs)
             else:
                 fwd[i] = track_forward(image_folder, frames, a, b, ba[i],
+                                       min_valid=args.min_track_points,
+                                       min_points=args.min_track_points,
                                        max_step_frac=args.max_step_frac,
                                        flow_method=args.flow_method,
                                        **cam_kwargs)
@@ -1315,11 +1343,15 @@ def main():
             if args.interp_method == "kalman":
                 back[j] = track_backward_kalman(
                     image_folder, frames, a, b, bb[j],
+                    min_valid=args.min_track_points,
+                    min_points=args.min_track_points,
                     max_step_frac=args.max_step_frac,
                     flow_method=args.flow_method,
                     kf_q=args.kf_q, kf_r=args.kf_r, **cam_kwargs)
             else:
                 back[j] = track_backward(image_folder, frames, a, b, bb[j],
+                                         min_valid=args.min_track_points,
+                                         min_points=args.min_track_points,
                                          max_step_frac=args.max_step_frac,
                                          flow_method=args.flow_method,
                                          **cam_kwargs)
@@ -1429,7 +1461,7 @@ def main():
         vis_dir.mkdir(parents=True, exist_ok=True)
         cat_colors = {}
         for cat in categories:
-            cat_colors[cat["id"]] = tuple(int(c) for c in np.random.randint(0, 255, 3))
+            cat_colors[cat["id"]] = _VIS_PALETTE[cat["id"] % len(_VIS_PALETTE)]
         anns_by_img = {}
         for a in annotations_out:
             anns_by_img.setdefault(a["image_id"], []).append(a)
