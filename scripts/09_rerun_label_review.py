@@ -1146,7 +1146,18 @@ class CocoState:
                 data = json.load(f)
             self.images = data.get("images", [])
             self.annotations = data.get("annotations", [])
-            self.categories = data.get("categories", self.categories)
+            # Merge categories instead of replacing: the saved file may
+            # predate categories added later to the db/seed (e.g. a new
+            # class inserted into inspection_v2.db between sessions).
+            saved_cats = data.get("categories", [])
+            if saved_cats:
+                have_ids = {c["id"] for c in saved_cats}
+                have_names = {c["name"] for c in saved_cats}
+                merged = list(saved_cats)
+                for c in self.categories:
+                    if c["id"] not in have_ids and c["name"] not in have_names:
+                        merged.append(c)
+                self.categories = merged
             self.cat_map = {c["id"]: c["name"] for c in self.categories}
             self.cat_name_to_id = {c["name"]: c["id"] for c in self.categories}
             for ann in self.annotations:
