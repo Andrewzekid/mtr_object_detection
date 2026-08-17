@@ -885,6 +885,14 @@ class CocoState:
         # Frame indices the user has explicitly reviewed (N forward-nav or
         # X discard). Persisted in the .progress sidecar.
         self.reviewed: set = set()
+        # Frames the user marked as interpolation keyframes (K key / button).
+        # Persisted in the .progress sidecar like `reviewed`.
+        self.keyframes: set = set()
+        # Per-category auto-increment for track ids: the next number to assign.
+        # Drawing (or seeding) a box of category C auto-assigns track id
+        # _track_counter[C] then increments, so the first "Exit Sign" drawn is
+        # "Exit Sign 1", the next "Exit Sign 2", and so on across frames.
+        self._track_counter: Dict[int, int] = {}
         self._img_id_by_ts: Dict[int, int] = {}
         self._img_id_by_idx: Dict[int, int] = {}
         self._ann_id_next = 1
@@ -2232,7 +2240,7 @@ class ReviewWindow(QMainWindow):
         self.sam3_conf = sam3_conf
         self.auto_segment = auto_segment
 
-        self.setWindowTitle("Rerun Label Review")
+        self.setWindowTitle("Computer Vision Label Review Tool")
         self.resize(1600, 900)
 
         self._current_idx = coco.current_idx
@@ -3469,7 +3477,7 @@ def main():
 
     # ---------- 4. Qt app ----------
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("Rerun Label Review")
+    app.setApplicationName("Computer Vision Label Review Tool")
 
     # Clean up the spawned rerun process on exit.
     def _shutdown():
