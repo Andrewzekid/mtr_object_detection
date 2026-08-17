@@ -33,6 +33,9 @@ SAM3 segmentation
   R while it's selected to regenerate the mask.
 * ``--auto-segment`` runs SAM3 automatically right after each new bbox is
   drawn, so you don't need to press anything.
+  While SAM3 runs, the side panel shows per-concept progress and a Cancel
+  button (cooperative — the in-flight concept finishes first). The mask
+  overlay opacity is adjustable via the slider next to the mask toggle.
 
 The .rrd must contain at least one ``EncodedImage`` entity (auto-detected).
 The script auto-detects:
@@ -253,10 +256,17 @@ class SAM3Worker(QThread):
       finished_signal(list_of_dicts) where each dict is
         {ann_id: int|None, bbox_xyxy: [...], mask: HxW bool array|None,
          label: str, area: float, success: bool, error: str|None}
+      progress_signal(done, total, concept) after each concept group.
+      cancelled_signal() when cancel() was requested (results discarded).
+
+    cancel() is cooperative: it is checked between concept groups, so a
+    long-running in-flight run_sam3 call always completes first.
     """
 
     finished_signal = pyqtSignal(list)
     failed_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int, str)  # done, total, concept
+    cancelled_signal = pyqtSignal()
 
     def __init__(self, image_path: str, bboxes_xyxy: list,
                  concepts: list, ann_ids: list,
@@ -270,6 +280,14 @@ class SAM3Worker(QThread):
         self.model_path = model_path
         self.device = device
         self.conf = conf
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Ask the worker to stop after the current concept group."""
+        self._cancel_requested = True
+
+    def was_cancelled(self) -> bool:
+        return self._cancel_requested
 
     def run(self) -> None:  # noqa: D401 (QThread override)
         if not _SAM3_AVAILABLE:
@@ -286,7 +304,18 @@ class SAM3Worker(QThread):
             per_concept[c].append(i)
 
         results: List[Dict[str, Any]] = []
+        total = len(per_concept)
+        done = 0
+
+        def _progress(concept: str) -> None:
+            nonlocal done
+            done += 1
+            self.progress_signal.emit(done, total, concept)
+
         for concept, idxs in per_concept.items():
+            if self._cancel_requested:
+                self.cancelled_signal.emit()
+                return
             bxs = [self.bboxes_xyxy[i] for i in idxs]
             try:
                 res = run_sam3(
@@ -308,6 +337,7 @@ class SAM3Worker(QThread):
                         "success": False,
                         "error": str(e),
                     })
+                _progress(concept)
                 continue
 
             if not res.get("success"):
@@ -321,6 +351,7 @@ class SAM3Worker(QThread):
                         "success": False,
                         "error": res.get("error", "SAM3 failed"),
                     })
+                _progress(concept)
                 continue
 
             masks = res.get("masks", []) or []
@@ -350,7 +381,11 @@ class SAM3Worker(QThread):
                     "success": best_mask is not None,
                     "error": None if best_mask is not None else "no matching mask",
                 })
+            _progress(concept)
 
+        if self._cancel_requested:
+            self.cancelled_signal.emit()
+            return
         self.finished_signal.emit(results)
 
 
@@ -1117,6 +1152,7 @@ class CanvasWidget(QWidget):
         self._image_size: Tuple[int, int] = (0, 0)  # (w, h)
         self._boxes: List[Dict[str, Any]] = []  # see set_boxes
         self._masks_visible: bool = True
+        self._mask_alpha: int = 120  # 0-255 overlay alpha for mask fill
         self._selected_idx: int = -1
         self._drawing: bool = False
         self._draw_start: Optional[Tuple[float, float]] = None
@@ -1171,6 +1207,14 @@ class CanvasWidget(QWidget):
 
     def masks_visible(self) -> bool:
         return self._masks_visible
+
+    def set_mask_alpha(self, alpha: int) -> None:
+        """Set mask overlay alpha (0-255)."""
+        self._mask_alpha = max(0, min(255, int(alpha)))
+        self.update()
+
+    def mask_alpha(self) -> int:
+        return self._mask_alpha
 
     def set_info(self, text: str) -> None:
         self._info_text = text
@@ -1273,7 +1317,7 @@ class CanvasWidget(QWidget):
             rgba[..., 0] = r
             rgba[..., 1] = g
             rgba[..., 2] = b
-            rgba[..., 3] = (mask.astype(np.uint8) * 120)  # 47% alpha
+            rgba[..., 3] = (mask.astype(np.uint8) * self._mask_alpha)
             qimg = QtGui.QImage(rgba.data, w, h, 4 * w,
                                QtGui.QImage.Format.Format_RGBA8888)
             mask_pixmap = QPixmap.fromImage(qimg.copy())
@@ -1624,6 +1668,8 @@ class SidePanel(QWidget):
     play_speed_changed = pyqtSignal(int)  # ms-per-frame
     box_selected = pyqtSignal(int)       # box list row clicked → canvas selection
     preselect_cat = pyqtSignal(int)      # category preselected for next draw
+    mask_opacity_changed = pyqtSignal(int)  # 0-100 percent
+    cancel_sam3_clicked = pyqtSignal()   # "Cancel SAM3" button
 
     def __init__(self, coco: CocoState, parent=None):
         super().__init__(parent)
@@ -1675,6 +1721,12 @@ class SidePanel(QWidget):
         self.btn_reseg.setToolTip("Re-run SAM3 on the selected bbox only.")
         self.btn_reseg.clicked.connect(self.resegment_clicked.emit)
         sam_layout.addWidget(self.btn_reseg)
+        self.btn_cancel_sam3 = QPushButton("Cancel")
+        self.btn_cancel_sam3.setToolTip(
+            "Stop the running SAM3 job (finishes the current concept first).")
+        self.btn_cancel_sam3.setEnabled(False)
+        self.btn_cancel_sam3.clicked.connect(self.cancel_sam3_clicked.emit)
+        sam_layout.addWidget(self.btn_cancel_sam3)
         layout.addLayout(sam_layout)
 
         self.btn_masks = QPushButton("Masks: ON")
@@ -1683,6 +1735,22 @@ class SidePanel(QWidget):
         self.btn_masks.setToolTip("Toggle mask overlay visibility (M).")
         self.btn_masks.clicked.connect(self._on_masks_toggled)
         layout.addWidget(self.btn_masks)
+
+        # Mask overlay opacity (percent).
+        op_row = QHBoxLayout()
+        op_row.addWidget(QLabel("Mask opacity:"))
+        self.opacity_slider = QSlider(_QT_HORZ)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(47)  # matches canvas default alpha 120/255
+        self.opacity_slider.setToolTip("Mask overlay opacity (0-100%).")
+        self.opacity_slider.valueChanged.connect(self.mask_opacity_changed.emit)
+        op_row.addWidget(self.opacity_slider, 1)
+        self.opacity_value_label = QLabel("47%")
+        self.opacity_value_label.setMinimumWidth(36)
+        op_row.addWidget(self.opacity_value_label)
+        self.opacity_slider.valueChanged.connect(
+            lambda v: self.opacity_value_label.setText(f"{v}%"))
+        layout.addLayout(op_row)
 
         self.sam3_status = QLabel("SAM3: idle")
         layout.addWidget(self.sam3_status)
@@ -1768,6 +1836,19 @@ class SidePanel(QWidget):
 
     def set_sam3_status(self, text: str) -> None:
         self.sam3_status.setText(text)
+
+    def set_sam3_running(self, running: bool) -> None:
+        """Enable Cancel and disable the run buttons while SAM3 is busy."""
+        self.btn_run_sam3.setEnabled(not running)
+        self.btn_reseg.setEnabled(not running)
+        self.btn_cancel_sam3.setEnabled(running)
+
+    def set_mask_opacity(self, pct: int) -> None:
+        """Sync the opacity slider without re-emitting (e.g. on restore)."""
+        self.opacity_slider.blockSignals(True)
+        self.opacity_slider.setValue(pct)
+        self.opacity_value_label.setText(f"{pct}%")
+        self.opacity_slider.blockSignals(False)
 
     # ---- categories ---- #
 
@@ -2037,6 +2118,8 @@ class ReviewWindow(QMainWindow):
         self.side.play_speed_changed.connect(self._on_play_speed_changed)
         self.side.box_selected.connect(self._on_box_list_selected)
         self.side.preselect_cat.connect(self._on_preselect_cat)
+        self.side.mask_opacity_changed.connect(self._on_mask_opacity_changed)
+        self.side.cancel_sam3_clicked.connect(self._on_cancel_sam3)
 
         if self.bridge is not None:
             self.bridge.time_changed.connect(self._on_viewer_time_changed)
@@ -2156,12 +2239,7 @@ class ReviewWindow(QMainWindow):
                 w.setVisible(not collapsed)
         self.btn_toggle_rerun.setText("Show Rerun ▸" if collapsed else "Hide Rerun ▾")
         # Save preference.
-        try:
-            self._ui_state_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._ui_state_path, "w") as f:
-                json.dump({"web_collapsed": collapsed}, f)
-        except Exception:
-            pass
+        self._write_ui_state(web_collapsed=collapsed)
         # Force the splitter to give the freed space to the canvas.
         rs = self.centralWidget()
         if isinstance(rs, QSplitter):
@@ -2181,8 +2259,30 @@ class ReviewWindow(QMainWindow):
             if state.get("web_collapsed") and self.btn_toggle_rerun.isEnabled():
                 self.btn_toggle_rerun.setChecked(True)
                 self._on_toggle_rerun()
+            opacity = state.get("mask_opacity")
+            if isinstance(opacity, int) and 0 <= opacity <= 100:
+                self.canvas.set_mask_alpha(round(opacity * 255 / 100))
+                self.side.set_mask_opacity(opacity)
         except Exception:
             pass
+
+    def _write_ui_state(self, **updates) -> None:
+        """Merge `updates` into the persisted UI state file."""
+        try:
+            state = {}
+            if self._ui_state_path.exists():
+                with open(self._ui_state_path, "r") as f:
+                    state = json.load(f)
+            state.update(updates)
+            self._ui_state_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._ui_state_path, "w") as f:
+                json.dump(state, f)
+        except Exception:
+            pass
+
+    def _on_mask_opacity_changed(self, pct: int) -> None:
+        self.canvas.set_mask_alpha(round(pct * 255 / 100))
+        self._write_ui_state(mask_opacity=int(pct))
 
     # ----------------------- frame playback ----------------------------- #
 
@@ -2693,6 +2793,7 @@ class ReviewWindow(QMainWindow):
         self.side.set_sam3_status(
             f"SAM3: running on {len(bboxes_xyxy)} box(es)…"
         )
+        self.side.set_sam3_running(True)
         self.canvas.setEnabled(False)
         self._sam3_worker = SAM3Worker(
             image_path=img_path,
@@ -2706,10 +2807,30 @@ class ReviewWindow(QMainWindow):
         )
         self._sam3_worker.finished_signal.connect(self._on_sam3_finished)
         self._sam3_worker.failed_signal.connect(self._on_sam3_failed)
+        self._sam3_worker.progress_signal.connect(self._on_sam3_progress)
+        self._sam3_worker.cancelled_signal.connect(self._on_sam3_cancelled)
         self._sam3_worker.start()
+
+    def _on_sam3_progress(self, done: int, total: int, concept: str) -> None:
+        self.side.set_sam3_status(
+            f"SAM3: {done}/{total} concept(s) done — last: {concept}"
+        )
+
+    def _on_cancel_sam3(self) -> None:
+        if self._sam3_worker is not None and self._sam3_worker.isRunning():
+            self._sam3_worker.cancel()
+            self.side.set_sam3_status("SAM3: cancelling…")
+            self.side.btn_cancel_sam3.setEnabled(False)
+
+    def _on_sam3_cancelled(self) -> None:
+        self.canvas.setEnabled(True)
+        self.side.set_sam3_running(False)
+        self.side.set_sam3_status("SAM3: cancelled — no masks applied")
+        self.statusBar().showMessage("SAM3 cancelled", 2500)
 
     def _on_sam3_finished(self, results: list) -> None:
         self.canvas.setEnabled(True)
+        self.side.set_sam3_running(False)
         n_ok = sum(1 for r in results if r.get("success"))
         n_fail = len(results) - n_ok
         self.side.set_sam3_status(
@@ -2730,6 +2851,7 @@ class ReviewWindow(QMainWindow):
 
     def _on_sam3_failed(self, msg: str) -> None:
         self.canvas.setEnabled(True)
+        self.side.set_sam3_running(False)
         self.side.set_sam3_status(f"SAM3: failed — {msg}")
         QMessageBox.warning(self, "SAM3 failed", msg)
 
@@ -2746,16 +2868,26 @@ class ReviewWindow(QMainWindow):
 
     def closeEvent(self, ev: QtGui.QCloseEvent) -> None:
         # _on_quit / _on_save_quit already confirmed + saved; don't ask twice.
-        if self._quit_confirmed:
-            super().closeEvent(ev)
-            return
-        res = self._confirm_quit()
-        if res is None:
-            ev.ignore()
-            return
-        if res:
-            self.coco.save(is_final=False)
+        if not self._quit_confirmed:
+            res = self._confirm_quit()
+            if res is None:
+                ev.ignore()
+                return
+            if res:
+                self.coco.save(is_final=False)
+        self._shutdown_sam3_worker()
         super().closeEvent(ev)
+
+    def _shutdown_sam3_worker(self) -> None:
+        """Cancel and reap the SAM3 thread so it isn't killed mid-run."""
+        w = self._sam3_worker
+        if w is None or not w.isRunning():
+            return
+        w.cancel()
+        if not w.wait(2000):
+            # run_sam3 call still in flight — last resort before exit.
+            w.terminate()
+            w.wait(1000)
 
 
 # ---------------------------------------------------------------------------
