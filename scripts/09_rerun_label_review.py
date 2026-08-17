@@ -1807,6 +1807,7 @@ class SidePanel(QWidget):
 
     cat_clicked = pyqtSignal(int)  # cat_id
     slider_moved = pyqtSignal(int)  # frame_idx
+    nav_delta = pyqtSignal(int)     # +5 / +10 frame jump buttons
     run_sam3_clicked = pyqtSignal()      # "Run SAM3 (all)" button
     toggle_masks_clicked = pyqtSignal()  # "Masks: on/off" button
     resegment_clicked = pyqtSignal()     # "Re-segment selected" button
@@ -1871,6 +1872,17 @@ class SidePanel(QWidget):
         self.combo_speed.currentIndexChanged.connect(self._on_speed_changed)
         play_row.addWidget(self.combo_speed, 1)
         layout.addLayout(play_row)
+
+        # Big forward jumps.
+        jump_row = QHBoxLayout()
+        jump_row.addWidget(QLabel("Jump:"))
+        for delta in (5, 10):
+            btn = QPushButton(f"+{delta} frames")
+            btn.setToolTip(f"Jump forward {delta} frames.")
+            btn.clicked.connect(lambda _c=False, d=delta: self.nav_delta.emit(d))
+            jump_row.addWidget(btn)
+        jump_row.addStretch(1)
+        layout.addLayout(jump_row)
 
         # SAM3 controls
         sam_layout = QHBoxLayout()
@@ -2308,6 +2320,7 @@ class ReviewWindow(QMainWindow):
         self.canvas.next_unlabeled.connect(self._on_next_unlabeled)
         self.side.cat_clicked.connect(self._on_side_cat_clicked)
         self.side.slider_moved.connect(self._on_slider_moved)
+        self.side.nav_delta.connect(self._on_frame_nav)
         self.side.run_sam3_clicked.connect(self._on_run_sam3_all)
         self.side.toggle_masks_clicked.connect(self._on_toggle_masks)
         self.side.resegment_clicked.connect(self._on_resegment_selected)
