@@ -75,6 +75,11 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
     arrows   : pan (when zoomed)
     Ctrl+Z   : undo last edit (add/delete/move/resize/mask/discard-all)
     Ctrl+Shift+Z / Ctrl+Y : redo
+    U        : jump to the next unlabeled frame (no boxes, not yet reviewed)
+
+Reviewed frames (marked on N forward-nav and X discard) are tracked in the
+.progress sidecar and shown in the status bar; X, S and quitting with
+unsaved changes ask for confirmation first.
 """
 
 from __future__ import annotations
@@ -162,7 +167,7 @@ QtGui.QImage.Format_ARGB32 = QtGui.QImage.Format.Format_ARGB32  # type: ignore[a
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QSlider,
-    QSplitter, QFrame, QSizePolicy, QMessageBox,
+    QSplitter, QFrame, QSizePolicy, QMessageBox, QCheckBox,
 )
 # QSizePolicy scoped enum alias
 QSizePolicy.Expanding = QSizePolicy.Policy.Expanding  # type: ignore[attr-defined]
@@ -725,6 +730,9 @@ class CocoState:
         self.annotations: List[Dict[str, Any]] = []
         self.removed_ids: set = set()
         self.current_idx = 0
+        # Frame indices the user has explicitly reviewed (N forward-nav or
+        # X discard). Persisted in the .progress sidecar.
+        self.reviewed: set = set()
         self._img_id_by_ts: Dict[int, int] = {}
         self._img_id_by_idx: Dict[int, int] = {}
         self._ann_id_next = 1
@@ -772,6 +780,7 @@ class CocoState:
                 with open(self.progress_file, "r") as f:
                     data = json.load(f)
                 idx = data.get("last_index", 0)
+                self.reviewed = set(data.get("reviewed", []))
                 if 0 <= idx < total_frames:
                     print(f"⏳ Resuming from frame {idx + 1}/{total_frames}")
                     return idx
@@ -804,12 +813,22 @@ class CocoState:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         with open(self.progress_file, "w") as f:
-            json.dump({"last_index": self.current_idx + 1}, f)
+            json.dump({"last_index": self.current_idx + 1,
+                       "reviewed": sorted(self.reviewed)}, f)
         self.dirty = False
         print(f"✅ Saved {'final' if is_final else 'progress'} → {path} "
               f"(idx {self.current_idx + 1})")
 
     # ------------------------- mutation -------------------------------- #
+
+    def mark_reviewed(self, frame_idx: int) -> None:
+        """Record that the user has reviewed frame `frame_idx` (0-based).
+
+        Called on explicit forward navigation (N) and discard-all (X).
+        Not a COCO mutation, so it does not set dirty or push undo — but it
+        is persisted in the .progress sidecar on the next save().
+        """
+        self.reviewed.add(frame_idx)
 
     def ensure_image(self, frame: Dict[str, Any], width: int, height: int) -> int:
         ts = frame["timestamp_ns"]
@@ -1085,6 +1104,7 @@ class CanvasWidget(QWidget):
     fit_view = pyqtSignal()            # F key
     selection_changed = pyqtSignal(int)  # selected box index (or -1)
     zoom_to_selected = pyqtSignal()    # Z key
+    next_unlabeled = pyqtSignal()      # U key
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1577,6 +1597,8 @@ class CanvasWidget(QWidget):
             self._fit_to_view()
         elif k == Qt.Key_Z:
             self.zoom_to_selected.emit()
+        elif k == Qt.Key_U:
+            self.next_unlabeled.emit()
         elif k in (Qt.Key_Plus, Qt.Key_Equal):
             self._scale = min(40.0, self._scale * 1.2); self.update()
         elif k == Qt.Key_Minus:
@@ -1682,6 +1704,7 @@ class SidePanel(QWidget):
             "0-9 = pick cat (when drawing) &nbsp; + / - = zoom &nbsp; F = fit<br>"
             "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause<br>"
             "Z = zoom to sel &nbsp; Ctrl+Z = undo &nbsp; Ctrl+Shift+Z = redo<br>"
+            "U = jump to next unlabeled frame<br>"
             "<i>Click a category first to preselect it for the next draw.</i>"
         )
         self.help_label.setWordWrap(True)
@@ -1913,10 +1936,14 @@ class ReviewWindow(QMainWindow):
 
         # Frame playback timer.
         self._play_timer = QTimer(self)
-        self._play_timer.setTimerType(Qt.PreciseTimer)
+        self._play_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._play_timer.timeout.connect(self._on_play_tick)
         self._play_interval_ms: int = 1000  # 1x default
         self._playing: bool = False
+        # Session-only opt-out from the X discard-all confirmation dialog.
+        self._skip_discard_confirm: bool = False
+        # Set once quit has been confirmed, so closeEvent doesn't ask twice.
+        self._quit_confirmed: bool = False
 
         # ---------- layout ----------
         splitter = QSplitter(_QT_HORZ)
@@ -1974,6 +2001,9 @@ class ReviewWindow(QMainWindow):
         self._save_indicator = QLabel("✓ Saved")
         self._save_indicator.setStyleSheet("padding: 0 6px;")
         self.statusBar().addPermanentWidget(self._save_indicator)
+        self._reviewed_label = QLabel("Reviewed: 0/0")
+        self._reviewed_label.setStyleSheet("padding: 0 6px;")
+        self.statusBar().addPermanentWidget(self._reviewed_label)
         self.statusBar().showMessage("Ready", 3000)
         # Refresh the indicator whenever the dirty flag may have changed.
         # We piggyback on a 250ms timer instead of patching every mutation site.
@@ -1997,6 +2027,7 @@ class ReviewWindow(QMainWindow):
         self.canvas.fit_view.connect(lambda: self.canvas._fit_to_view())
         self.canvas.selection_changed.connect(self.side.highlight_box_row)
         self.canvas.zoom_to_selected.connect(self._on_zoom_to_selected)
+        self.canvas.next_unlabeled.connect(self._on_next_unlabeled)
         self.side.cat_clicked.connect(self._on_side_cat_clicked)
         self.side.slider_moved.connect(self._on_slider_moved)
         self.side.run_sam3_clicked.connect(self._on_run_sam3_all)
@@ -2032,6 +2063,7 @@ class ReviewWindow(QMainWindow):
             (Qt.Key_M, self._on_toggle_masks),
             (Qt.Key_R, self._on_resegment_selected),
             (Qt.Key_Z, self._on_zoom_to_selected),
+            (Qt.Key_U, self._on_next_unlabeled),
         ]:
             sc = QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(slot)
@@ -2104,6 +2136,9 @@ class ReviewWindow(QMainWindow):
         else:
             self._save_indicator.setText("✓ Saved")
             self._save_indicator.setStyleSheet("padding: 0 6px; color: #40c060;")
+        self._reviewed_label.setText(
+            f"Reviewed: {len(self.coco.reviewed)}/{len(self.rrd_index)}"
+        )
 
     def _on_toggle_rerun(self) -> None:
         """Collapse or expand the embedded Rerun web viewer."""
@@ -2261,6 +2296,9 @@ class ReviewWindow(QMainWindow):
     # ----------------------- event handlers ---------------------------- #
 
     def _on_frame_nav(self, delta: int) -> None:
+        # Forward nav (N) means "this frame is reviewed" — record it.
+        if delta > 0:
+            self.coco.mark_reviewed(self._current_idx)
         new_idx = self._current_idx + delta
         if 0 <= new_idx < len(self.rrd_index):
             self._current_idx = new_idx
@@ -2403,8 +2441,12 @@ class ReviewWindow(QMainWindow):
             return
         anns = list(self.coco.anns_for_image(self._current_image_id))
         if not anns:
+            self.coco.mark_reviewed(self._current_idx)
             self._on_frame_nav(+1)
             return
+        if not self._confirm_discard(len(anns)):
+            return
+        self.coco.mark_reviewed(self._current_idx)
         idx = self._current_idx
 
         def _jump_back(i: int = idx) -> None:
@@ -2424,13 +2466,88 @@ class ReviewWindow(QMainWindow):
         self.canvas.set_boxes([])
         self._on_frame_nav(+1)
 
+    def _confirm_discard(self, n_boxes: int) -> bool:
+        """Confirm the X discard-all. Returns True to proceed."""
+        if self._skip_discard_confirm:
+            return True
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Discard all boxes?")
+        msg.setText(f"Discard all {n_boxes} box(es) on frame "
+                    f"{self._current_idx + 1}?\n(Ctrl+Z restores them.)")
+        msg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+        msg.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        cb = QCheckBox("Don't ask again this session")
+        msg.setCheckBox(cb)
+        if msg.exec() != QMessageBox.StandardButton.Yes:
+            return False
+        if cb.isChecked():
+            self._skip_discard_confirm = True
+        return True
+
+    def _on_next_unlabeled(self) -> None:
+        """Jump to the next frame that is neither reviewed nor has boxes.
+
+        Scans forward from the current frame, wrapping around once. A frame
+        counts as unlabeled when it has no live annotations AND is not in
+        the reviewed set (so discarded frames are skipped too).
+        """
+        total = len(self.rrd_index)
+        for step in range(1, total + 1):
+            idx = (self._current_idx + step) % total
+            if idx in self.coco.reviewed:
+                continue
+            img_id = self.coco._img_id_by_idx.get(idx)
+            if img_id is not None and self.coco.anns_for_image(img_id):
+                continue
+            self._current_idx = idx
+            self._load_current()
+            self.statusBar().showMessage(
+                f"Next unlabeled: frame {idx + 1}/{total}", 2500)
+            return
+        self.statusBar().showMessage("No unlabeled frames left 🎉", 3000)
+
     def _on_save_quit(self) -> None:
+        ret = QMessageBox.question(
+            self, "Save final output and quit?",
+            f"Write the final COCO JSON to\n{self.coco.output_json}\nand quit?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
         self.coco.save(is_final=True)
+        self._quit_confirmed = True
         QtWidgets.QApplication.quit()
 
     def _on_quit(self) -> None:
-        self.coco.save(is_final=False)
+        res = self._confirm_quit()
+        if res is None:
+            return
+        if res:
+            self.coco.save(is_final=False)
+        self._quit_confirmed = True
         QtWidgets.QApplication.quit()
+
+    def _confirm_quit(self) -> Optional[bool]:
+        """Ask before quitting with unsaved changes.
+
+        Returns True = save progress and quit, False = quit without saving,
+        None = cancel (stay). Returns True immediately when nothing is dirty.
+        """
+        if not self.coco.dirty:
+            return True
+        ret = QMessageBox.question(
+            self, "Quit label review?",
+            "You have unsaved changes since the last save.",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save)
+        if ret == QMessageBox.StandardButton.Save:
+            return True
+        if ret == QMessageBox.StandardButton.Discard:
+            return False
+        return None
 
     # -------------- category assignment for pending rect -------------- #
 
@@ -2628,7 +2745,16 @@ class ReviewWindow(QMainWindow):
     # ----------------------- shutdown ---------------------------------- #
 
     def closeEvent(self, ev: QtGui.QCloseEvent) -> None:
-        self.coco.save(is_final=False)
+        # _on_quit / _on_save_quit already confirmed + saved; don't ask twice.
+        if self._quit_confirmed:
+            super().closeEvent(ev)
+            return
+        res = self._confirm_quit()
+        if res is None:
+            ev.ignore()
+            return
+        if res:
+            self.coco.save(is_final=False)
         super().closeEvent(ev)
 
 
