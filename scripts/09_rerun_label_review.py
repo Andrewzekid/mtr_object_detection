@@ -73,6 +73,8 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
     R        : re-segment the selected bbox with SAM3 (replaces its mask)
     + / =    : zoom in   |  -  : zoom out  |  0 : reset zoom
     arrows   : pan (when zoomed)
+    Ctrl+Z   : undo last edit (add/delete/move/resize/mask/discard-all)
+    Ctrl+Shift+Z / Ctrl+Y : redo
 """
 
 from __future__ import annotations
@@ -88,6 +90,7 @@ import threading
 import time
 import warnings
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -607,6 +610,99 @@ class RrdFrameIndex:
 
 
 # ---------------------------------------------------------------------------
+# Undo stack — keeps a bounded history of inverse operations.
+# ---------------------------------------------------------------------------
+
+class UndoStack:
+    """A small stack of (description, undo_callable, redo_callable) tuples.
+
+    Each mutation in CocoState pushes an entry here. Ctrl+Z pops and runs
+    the undo callable; Ctrl+Shift+Z / Ctrl+Y pops and runs the redo callable
+    (the redo stack is cleared on any new mutation).
+
+    Use ``with stack.group("...")`` around a multi-step mutation (e.g.
+    discard-all) so it undoes/redoes as a single entry.
+
+    Callables are zero-arg. They run on the main thread synchronously.
+    """
+
+    MAX_DEPTH = 100
+
+    def __init__(self) -> None:
+        self._undo: List[Tuple[str, Any, Any]] = []
+        self._redo: List[Tuple[str, Any, Any]] = []
+        # When not None, push() collects entries here instead of pushing
+        # them directly; group() flushes the batch as one composite entry.
+        self._batch: Optional[List[Tuple[str, Any, Any]]] = None
+
+    def push(self, description: str, undo: Any, redo: Any) -> None:
+        """Push an (undo, redo) pair. Clears the redo stack."""
+        if self._batch is not None:
+            self._batch.append((description, undo, redo))
+            self._redo.clear()
+            return
+        self._undo.append((description, undo, redo))
+        if len(self._undo) > self.MAX_DEPTH:
+            self._undo.pop(0)
+        self._redo.clear()
+
+    @contextmanager
+    def group(self, description: str):
+        """Coalesce every push inside the block into one undo/redo entry.
+
+        Nested groups merge into the outermost one. Undo runs the collected
+        undo callables in reverse order; redo runs them in original order.
+        """
+        outer = self._batch
+        self._batch = []
+        try:
+            yield
+        finally:
+            entries = self._batch
+            self._batch = outer
+        if not entries:
+            return
+        if outer is not None:
+            outer.extend(entries)
+            return
+
+        def undo_all(entries=tuple(entries)) -> None:
+            for _desc, undo, _redo in reversed(entries):
+                undo()
+
+        def redo_all(entries=tuple(entries)) -> None:
+            for _desc, _undo, redo in entries:
+                redo()
+
+        self.push(description, undo_all, redo_all)
+
+    def pop_undo(self) -> Optional[Tuple[str, Any, Any]]:
+        if not self._undo:
+            return None
+        entry = self._undo.pop()
+        # Move to redo stack so Ctrl+Shift+Z can re-apply.
+        self._redo.append(entry)
+        return entry
+
+    def pop_redo(self) -> Optional[Tuple[str, Any, Any]]:
+        if not self._redo:
+            return None
+        entry = self._redo.pop()
+        self._undo.append(entry)
+        return entry
+
+    def can_undo(self) -> bool:
+        return bool(self._undo)
+
+    def can_redo(self) -> bool:
+        return bool(self._redo)
+
+    def clear(self) -> None:
+        self._undo.clear()
+        self._redo.clear()
+
+
+# ---------------------------------------------------------------------------
 # COCO state
 # ---------------------------------------------------------------------------
 
@@ -618,7 +714,8 @@ class CocoState:
     area, iscrowd. Tracks removed ids so the seed boxes can be 'deleted'.
     """
 
-    def __init__(self, output_json: str, categories: List[Dict[str, Any]]):
+    def __init__(self, output_json: str, categories: List[Dict[str, Any]],
+                 undo_stack: Optional[UndoStack] = None):
         self.output_json = output_json
         self.progress_file = output_json.replace(".json", ".progress")
         self.categories = categories
@@ -634,6 +731,7 @@ class CocoState:
         # Dirty flag — True when there are unsaved mutations since the last
         # successful save(). Cleared by save(). UI shows a "●" indicator.
         self.dirty: bool = False
+        self.undo_stack: UndoStack = undo_stack or UndoStack()
 
     # ------------------------- persistence ---------------------------- #
 
@@ -756,6 +854,10 @@ class CocoState:
         self.annotations.append(ann)
         self._ann_id_next += 1
         self.dirty = True
+        # No undo entry: seeding happens automatically on first frame visit,
+        # so undoable seeds would (a) evict real user history from the
+        # bounded stack and (b) let Ctrl+Z mutate frames the user isn't
+        # looking at. Deleting a seeded box is itself undoable.
 
     def add_box(self, image_id: int, x: float, y: float,
                 w: float, h: float, cat_id: int) -> int:
@@ -770,43 +872,159 @@ class CocoState:
         self.annotations.append(ann)
         self._ann_id_next += 1
         self.dirty = True
+        new_id = ann["id"]
+        # Undo: remove the added box.
+        self.undo_stack.push(
+            f"add box #{new_id}",
+            undo=lambda: self._undo_remove(new_id),
+            redo=lambda: self._redo_add(ann),
+        )
         return ann["id"]
 
     def remove_box(self, ann_id: int) -> None:
+        # Snapshot the annotation so undo can restore it (including mask).
+        prev = None
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                prev = dict(ann)
+                if "_mask" in prev and isinstance(prev["_mask"], np.ndarray):
+                    prev["_mask"] = prev["_mask"].copy()
+                break
         self.removed_ids.add(ann_id)
         self.dirty = True
+        # Undo: re-add the box (un-remove).
+        self.undo_stack.push(
+            f"delete box #{ann_id}",
+            undo=lambda: self._undo_restore(ann_id, prev),
+            redo=lambda: self._redo_remove(ann_id),
+        )
 
     def set_mask(self, ann_id: int, mask: Optional[np.ndarray]) -> None:
         """Attach (or clear) a SAM3 mask to an annotation, in-memory only."""
+        prev_mask = None
         for ann in self.annotations:
             if ann["id"] == ann_id:
+                prev_mask = ann.get("_mask")
+                if isinstance(prev_mask, np.ndarray):
+                    prev_mask = prev_mask.copy()
                 if mask is None:
                     ann.pop("_mask", None)
                 else:
                     ann["_mask"] = mask
                 self.dirty = True
+                # Undo: restore the previous mask (or None).
+                mask_copy = mask.copy() if isinstance(mask, np.ndarray) else None
+                self.undo_stack.push(
+                    f"set mask #{ann_id}",
+                    undo=lambda: self._undo_set_mask(ann_id, prev_mask),
+                    redo=lambda: self._redo_set_mask(ann_id, mask_copy),
+                )
                 return
 
     def move_box(self, ann_id: int, new_x: float, new_y: float,
                  w: float, h: float) -> None:
         """Update an annotation's bbox position (size unchanged)."""
+        prev_bbox = None
         for ann in self.annotations:
             if ann["id"] == ann_id:
+                prev_bbox = list(ann["bbox"])
                 ann["bbox"] = [float(new_x), float(new_y), float(w), float(h)]
                 ann["area"] = float(w * h)
                 self.dirty = True
+                self.undo_stack.push(
+                    f"move box #{ann_id}",
+                    undo=lambda: self._undo_set_bbox(ann_id, prev_bbox),
+                    redo=lambda: self._redo_set_bbox(ann_id, [new_x, new_y, w, h]),
+                )
                 return
 
     def resize_box(self, ann_id: int, new_x: float, new_y: float,
                    new_w: float, new_h: float) -> None:
         """Update an annotation's bbox size and position (corner drag)."""
+        prev_bbox = None
         for ann in self.annotations:
             if ann["id"] == ann_id:
+                prev_bbox = list(ann["bbox"])
                 ann["bbox"] = [float(new_x), float(new_y),
                                float(new_w), float(new_h)]
                 ann["area"] = float(new_w * new_h)
                 self.dirty = True
+                self.undo_stack.push(
+                    f"resize box #{ann_id}",
+                    undo=lambda: self._undo_set_bbox(ann_id, prev_bbox),
+                    redo=lambda: self._redo_set_bbox(
+                        ann_id, [new_x, new_y, new_w, new_h]
+                    ),
+                )
                 return
+
+    # ---- undo/redo primitives (called via lambdas on the stack) ---- #
+
+    def _undo_remove(self, ann_id: int) -> None:
+        """Inverse of add_box / seed_box — remove the box."""
+        self.removed_ids.add(ann_id)
+        self.dirty = True
+
+    def _redo_add(self, ann_snapshot: Dict[str, Any]) -> None:
+        """Re-apply an add_box — re-insert the snapshot and un-remove."""
+        ann_id = ann_snapshot["id"]
+        # If the annotation still exists (just was removed), un-remove it.
+        if ann_id in self.removed_ids:
+            self.removed_ids.discard(ann_id)
+        else:
+            # Append a fresh copy (mask included if present).
+            new = dict(ann_snapshot)
+            if "_mask" in new and isinstance(new["_mask"], np.ndarray):
+                new["_mask"] = new["_mask"].copy()
+            self.annotations.append(new)
+        self.dirty = True
+
+    def _undo_restore(self, ann_id: int, prev: Optional[Dict[str, Any]]) -> None:
+        """Inverse of remove_box — restore the box."""
+        if prev is None:
+            return
+        # Un-remove if currently removed.
+        if ann_id in self.removed_ids:
+            self.removed_ids.discard(ann_id)
+        else:
+            # Re-append a copy.
+            new = dict(prev)
+            if "_mask" in new and isinstance(new["_mask"], np.ndarray):
+                new["_mask"] = new["_mask"].copy()
+            self.annotations.append(new)
+        self.dirty = True
+
+    def _redo_remove(self, ann_id: int) -> None:
+        self.removed_ids.add(ann_id)
+        self.dirty = True
+
+    def _undo_set_bbox(self, ann_id: int, prev_bbox: Optional[List[float]]) -> None:
+        if prev_bbox is None:
+            return
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                ann["bbox"] = list(prev_bbox)
+                ann["area"] = float(prev_bbox[2] * prev_bbox[3])
+                self.dirty = True
+                return
+
+    def _redo_set_bbox(self, ann_id: int, new_bbox: List[float]) -> None:
+        self._undo_set_bbox(ann_id, new_bbox)
+
+    def _undo_set_mask(self, ann_id: int,
+                       prev_mask: Optional[np.ndarray]) -> None:
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                if prev_mask is None:
+                    ann.pop("_mask", None)
+                else:
+                    ann["_mask"] = prev_mask.copy() if isinstance(prev_mask, np.ndarray) else prev_mask
+                self.dirty = True
+                return
+
+    def _redo_set_mask(self, ann_id: int,
+                       new_mask: Optional[np.ndarray]) -> None:
+        self._undo_set_mask(ann_id, new_mask)
 
     def get_box(self, ann_id: int) -> Optional[Dict[str, Any]]:
         for ann in self.annotations:
@@ -1463,6 +1681,7 @@ class SidePanel(QWidget):
             "X = discard all &nbsp; S = save+quit &nbsp; Q = quit<br>"
             "0-9 = pick cat (when drawing) &nbsp; + / - = zoom &nbsp; F = fit<br>"
             "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause<br>"
+            "Z = zoom to sel &nbsp; Ctrl+Z = undo &nbsp; Ctrl+Shift+Z = redo<br>"
             "<i>Click a category first to preselect it for the next draw.</i>"
         )
         self.help_label.setWordWrap(True)
@@ -1816,6 +2035,14 @@ class ReviewWindow(QMainWindow):
         ]:
             sc = QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(slot)
+        # Ctrl+Z = undo, Ctrl+Shift+Z / Ctrl+Y = redo. These need the
+        # Control modifier, so they can't share the simple-key loop above.
+        sc_undo = QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
+        sc_undo.activated.connect(self._on_undo)
+        sc_redo = QShortcut(QtGui.QKeySequence("Ctrl+Shift+Z"), self)
+        sc_redo.activated.connect(self._on_redo)
+        sc_redo_y = QShortcut(QtGui.QKeySequence("Ctrl+Y"), self)
+        sc_redo_y.activated.connect(self._on_redo)
 
         # Load first frame, then restore persisted UI state.
         QTimer.singleShot(50, self._load_current)
@@ -2109,6 +2336,36 @@ class ReviewWindow(QMainWindow):
             f"Zoomed to box #{self.canvas._boxes[sel]['id']}", 2000
         )
 
+    # ----------------------- undo / redo -------------------------------- #
+
+    def _on_undo(self) -> None:
+        entry = self.coco.undo_stack.pop_undo()
+        if entry is None:
+            self.statusBar().showMessage("Nothing to undo", 1500)
+            return
+        desc, undo, _redo = entry
+        try:
+            undo()
+        except Exception as e:
+            self.statusBar().showMessage(f"Undo failed: {e}", 3000)
+            return
+        self._refresh_boxes()
+        self.statusBar().showMessage(f"Undid: {desc}", 2500)
+
+    def _on_redo(self) -> None:
+        entry = self.coco.undo_stack.pop_redo()
+        if entry is None:
+            self.statusBar().showMessage("Nothing to redo", 1500)
+            return
+        desc, _undo, redo = entry
+        try:
+            redo()
+        except Exception as e:
+            self.statusBar().showMessage(f"Redo failed: {e}", 3000)
+            return
+        self._refresh_boxes()
+        self.statusBar().showMessage(f"Redid: {desc}", 2500)
+
     def _on_box_added(self, image_id: int, x: float, y: float,
                       w: float, h: float, cat_id: int) -> None:
         new_ann_id = self.coco.add_box(image_id, x, y, w, h, cat_id)
@@ -2144,8 +2401,26 @@ class ReviewWindow(QMainWindow):
     def _on_discard_all(self) -> None:
         if self._current_image_id is None:
             return
-        for ann in self.coco.anns_for_image(self._current_image_id):
-            self.coco.remove_box(ann["id"])
+        anns = list(self.coco.anns_for_image(self._current_image_id))
+        if not anns:
+            self._on_frame_nav(+1)
+            return
+        idx = self._current_idx
+
+        def _jump_back(i: int = idx) -> None:
+            if 0 <= i < len(self.rrd_index) and i != self._current_idx:
+                self._current_idx = i
+                self._load_current()
+
+        # One undo entry for the whole discard: Ctrl+Z restores every box
+        # and jumps back to this frame (the view advances after discard,
+        # so without the jump the undo would look like a no-op).
+        with self.coco.undo_stack.group(
+                f"discard {len(anns)} box(es) on frame {idx + 1}"):
+            self.coco.undo_stack.push(
+                "jump back", undo=_jump_back, redo=lambda: None)
+            for ann in anns:
+                self.coco.remove_box(ann["id"])
         self.canvas.set_boxes([])
         self._on_frame_nav(+1)
 
