@@ -1528,8 +1528,8 @@ class CanvasWidget(QWidget):
                         self.parent_window._pending_cat_id = None
                         # Don't clear the preselection visual in the side panel;
                         # the user can click again to re-preselect.
-                        self.parent_window().box_added.emit(
-                            self.parent_window()._current_image_id or 0,
+                        self.box_added.emit(
+                            self.parent_window._current_image_id or 0,
                             x, y, w, h, pre,
                         )
                         self.update()
@@ -1616,7 +1616,7 @@ class CanvasWidget(QWidget):
             # number keys
             txt = ev.text()
             if txt.isdigit():
-                self.parent_window()._assign_pending_cat(int(txt))
+                self.parent_window._assign_pending_cat(int(txt))
             return
 
         if k in (Qt.Key_D, Qt.Key_Delete):
