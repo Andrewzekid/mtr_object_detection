@@ -15,16 +15,27 @@ Run it
         --images /path/to/folder_or_image.jpg \
         --output_json output/my_labels/coco.json
 
+    # Idle mode (default when no source is given) — pick a source from the
+    # File menu once the window is up:
+    python scripts/09_rerun_label_review.py
+
 What this does
 ---------------
 * Opens an existing Rerun ``.rrd`` recording — or, with ``--images``, a set
   of plain image files (one or more files/folders; folders are scanned for
-  jpg/jpeg/png/bmp/webp/tif, sorted by name). In image mode there is no
-  Rerun viewer; navigation is via the N/B keys, the slider, or Space.
-* The File menu (``Ctrl+O`` open image files, ``Ctrl+Shift+O`` open folder)
-  switches to image mode at runtime: the current session is saved, and a
-  fresh session starts writing ``labels_coco.json`` next to the chosen
-  images, keeping the category list.
+  jpg/jpeg/png/bmp/webp/tif, sorted by name). If every file stem is a bare
+  integer (e.g. ``1712345678901234567.jpg``), the filenames are treated as
+  nanosecond timestamps: frames sort by timestamp and the slider/info show
+  them; otherwise the UI shows the plain image index. Without ``--rrd`` or
+  ``--images`` the app starts idle (no Rerun viewer) until you load a
+  source from the File menu.
+* The File menu switches the frame source at runtime (the current session
+  is saved first, categories are kept): ``Ctrl+O`` open image files,
+  ``Ctrl+Shift+O`` open folder, ``Ctrl+R`` load a Rerun .rrd (indexes it,
+  spawns the web viewer, and embeds it on the spot). ``Ctrl+G`` loads a
+  JSON config at runtime. Image sessions write ``labels_coco.json`` next to
+  the chosen images; rrd sessions write ``<name>_labels.json`` beside the
+  recording unless ``--output_json`` is given.
 * Embeds the official Rerun *web* viewer inside a PyQt6 window using
   ``QWebEngineView`` pointed at a locally hosted ``rerun.serve_web_viewer()``
   instance. The viewer shows the full 3D world + camera images, and you can
@@ -90,6 +101,9 @@ USAGE
         --images <folder | image file> [more paths ...] \
         --output_json output/my_labels/coco.json
 
+    # or with no source at all (idle; pick one later from the File menu):
+    python scripts/09_rerun_label_review.py
+
 Key bindings (in the 2D canvas, when it has focus — click it once):
     D / del  : delete selected box
     A        : toggle draw mode (click-drag a new box)
@@ -113,7 +127,8 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
                (e.g. 13) and press Enter to reassign the selected box
     T        : focus the "Track of selected" field — type a track id and
                press Enter to set it (clear the field to unset). Track ids
-               are auto-assigned per category in draw order (T1, T2, ...)
+               are auto-assigned globally in creation order (1, 2, 3, ...)
+               across categories and frames
     K        : toggle keyframe on the current frame (anchors for
                interpolation; keyframes with boxes take priority over
                other labeled frames)
@@ -974,7 +989,11 @@ class ImageFolderIndex:
 
     Accepts a mix of image files and folders; folders are scanned
     (non-recursively) for common image extensions and sorted by name.
-    Timestamps are synthetic (1 ms per frame) so frames stay in file order.
+    If every file stem is a bare integer (e.g. ``1712345678901234567.jpg``),
+    the filenames are treated as nanosecond timestamps: frames are sorted
+    by timestamp and the slider/info show the real timestamps. Otherwise
+    timestamps are synthetic (1 ms per frame) and the UI shows the image
+    index instead.
     Exposes the same interface as RrdFrameIndex: ``__len__``, ``frame_at``,
     ``decode_image``, ``find_idx_by_timestamp``, and a ``.frames`` list with
     timestamp_ns / log_time_ns / frame_idx / existing_boxes / image_blob keys.
@@ -982,7 +1001,7 @@ class ImageFolderIndex:
 
     IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
-    def __init__(self, paths: List[str]):
+    def __init__(self, paths: List[str], allow_empty: bool = False):
         files: List[str] = []
         for p in paths:
             if os.path.isdir(p):
@@ -993,12 +1012,22 @@ class ImageFolderIndex:
                 files.append(p)
             else:
                 raise FileNotFoundError(f"--images path not found: {p}")
-        if not files:
+        if not files and not allow_empty:
             raise RuntimeError(f"No image files found under: {paths}")
+        # Timestamp-named series? Only when EVERY stem is a bare integer.
+        stems = [os.path.splitext(os.path.basename(fp))[0] for fp in files]
+        self.timestamps_real = bool(stems) and all(s.isdigit() for s in stems)
+        if self.timestamps_real:
+            files = sorted(files,
+                           key=lambda fp: (int(os.path.splitext(
+                               os.path.basename(fp))[0]), fp))
         self.files = files
         self.frames: List[Dict[str, Any]] = []
         for idx, fp in enumerate(files):
-            ts = idx * 1_000_000  # synthetic: 1 ms per frame
+            if self.timestamps_real:
+                ts = int(os.path.splitext(os.path.basename(fp))[0])
+            else:
+                ts = idx * 1_000_000  # synthetic: 1 ms per frame
             self.frames.append({
                 "frame_idx": idx,
                 "timestamp_ns": ts,
@@ -1021,8 +1050,49 @@ class ImageFolderIndex:
             return np.array(im.convert("RGB"))
 
     def find_idx_by_timestamp(self, ts_ns: int) -> int:
-        # Synthetic timestamps are idx * 1 ms; snap to the nearest frame.
-        return min(max(round(ts_ns / 1_000_000), 0), len(self.frames) - 1)
+        if not self.frames:
+            return -1
+        if not self.timestamps_real:
+            # Synthetic timestamps are idx * 1 ms; snap to the nearest frame.
+            return min(max(round(ts_ns / 1_000_000), 0),
+                       len(self.frames) - 1)
+        # Binary search the sorted real timestamps; snap to nearest.
+        lo, hi = 0, len(self.frames) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            v = self.frames[mid]["timestamp_ns"]
+            if v == ts_ns:
+                return mid
+            elif v < ts_ns:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if lo >= len(self.frames):
+            return len(self.frames) - 1
+        if hi < 0:
+            return 0
+        return lo if abs(self.frames[lo]["timestamp_ns"] - ts_ns) < \
+                    abs(self.frames[hi]["timestamp_ns"] - ts_ns) else hi
+
+
+class EmptyIndex:
+    """Zero-frame index used when the app starts with no source (idle mode;
+    the user picks a source via the File menu)."""
+
+    timestamps_real = False
+    frames: List[Dict[str, Any]] = []
+
+    def __len__(self) -> int:
+        return 0
+
+    def frame_at(self, idx: int) -> Dict[str, Any]:
+        raise IndexError(idx)
+
+    def decode_image(self, idx: int) -> np.ndarray:
+        raise IndexError(idx)
+
+    def find_idx_by_timestamp(self, ts_ns: int) -> int:
+        return -1
 
 
 # ---------------------------------------------------------------------------
@@ -1147,11 +1217,10 @@ class CocoState:
         # Frames the user marked as interpolation keyframes (K key / button).
         # Persisted in the .progress sidecar like `reviewed`.
         self.keyframes: set = set()
-        # Per-category auto-increment for track ids: the next number to assign.
-        # Drawing (or seeding) a box of category C auto-assigns track id
-        # _track_counter[C] then increments, so the first "Exit Sign" drawn is
-        # "Exit Sign 1", the next "Exit Sign 2", and so on across frames.
-        self._track_counter: Dict[int, int] = {}
+        # Global auto-increment for track ids, in creation order: box 1 gets
+        # id 1, box 2 gets id 2, the first box on frame 2 gets id 3, and so
+        # on across categories and frames. Deleted ids are never recycled.
+        self._track_next: int = 1
         self._img_id_by_ts: Dict[int, int] = {}
         self._img_id_by_idx: Dict[int, int] = {}
         self._ann_id_next = 1
@@ -1191,13 +1260,11 @@ class CocoState:
             self.cat_name_to_id = {c["name"]: c["id"] for c in self.categories}
             for ann in self.annotations:
                 self._ann_id_next = max(self._ann_id_next, ann["id"] + 1)
-                # Rebuild the per-category track-id counter so new boxes
-                # continue the existing numbering without reusing ids.
+                # Rebuild the global track-id counter so new boxes continue
+                # the existing numbering without reusing ids.
                 tid = ann.get("track_id")
                 if isinstance(tid, int) and not isinstance(tid, bool):
-                    cat = ann["category_id"]
-                    self._track_counter[cat] = max(
-                        self._track_counter.get(cat, 0), tid)
+                    self._track_next = max(self._track_next, tid + 1)
                 # Decode any persisted mask (base64-encoded PNG).
                 mask_b64 = ann.get("mask")
                 if isinstance(mask_b64, str) and mask_b64:
@@ -1443,14 +1510,15 @@ class CocoState:
         return False
 
     def _next_track_id(self, cat_id: int) -> int:
-        """Assign the next sequential track id for a category (1-based).
+        """Assign the next track id in global creation order (1-based).
 
-        The first "Exit Sign" box drawn becomes "Exit Sign 1", the next
-        "Exit Sign 2", and so on — across frames. Deleted boxes do not
-        recycle their ids (the counter only moves forward).
+        Box 1 drawn gets id 1, box 2 gets id 2, the first box on frame 2
+        gets id 3, etc. — across categories and frames. Deleted boxes do
+        not recycle their ids (the counter only moves forward). ``cat_id``
+        is accepted for call-site compatibility and ignored.
         """
-        n = self._track_counter.get(cat_id, 0) + 1
-        self._track_counter[cat_id] = n
+        n = self._track_next
+        self._track_next += 1
         return n
 
     def set_track_id(self, ann_id: int, value: Optional[int]) -> bool:
@@ -2606,19 +2674,21 @@ class SidePanel(QWidget):
     }
 
     def set_hidden_groups(self, groups: List[str]) -> None:
-        """Hide widget groups named in `groups` (see _HIDEABLE)."""
-        for g in groups:
-            attrs = self._HIDEABLE.get(g)
-            if attrs is None:
-                print(f"⚠️ Unknown ui.hide group: {g!r} "
-                      f"(known: {sorted(self._HIDEABLE)})")
-                continue
+        """Hide the widget groups named in `groups` (see _HIDEABLE) and
+        re-show any known group not listed, so a runtime config reload can
+        both hide and un-hide. ``rerun_toggle`` is valid but handled by the
+        main window, not this panel."""
+        want = set(groups)
+        for g, attrs in self._HIDEABLE.items():
             for attr in attrs:
                 w = getattr(self, attr, None)
                 if w is None:
                     continue
                 for widget in (w if isinstance(w, list) else [w]):
-                    widget.hide()
+                    widget.setVisible(g not in want)
+        for g in sorted(want - set(self._HIDEABLE) - {"rerun_toggle"}):
+            print(f"⚠️ Unknown ui.hide group: {g!r} "
+                  f"(known: {sorted(self._HIDEABLE)}, rerun_toggle)")
 
     def set_slider_max(self, n: int) -> None:
         self.frame_slider.setMaximum(max(0, n - 1))
@@ -2629,10 +2699,13 @@ class SidePanel(QWidget):
         self.frame_slider.blockSignals(False)
 
     def set_info(self, idx: int, total: int, ts_ns: int,
-                 boxes: int) -> None:
+                 boxes: int, ts_real: bool = True) -> None:
+        # Timestamp-named image series show the real timestamp; otherwise
+        # the synthetic ts is meaningless, so show the plain image index.
+        pos = f"ts_ns: {ts_ns}" if ts_real else f"index: {idx}"
         self.info_label.setText(
             f"Frame: {idx + 1}/{total}<br>"
-            f"ts_ns: {ts_ns}<br>"
+            f"{pos}<br>"
             f"Boxes on frame: {boxes}"
         )
 
@@ -2737,6 +2810,7 @@ class ReviewWindow(QMainWindow):
                   has_viewer: bool = True,
                   ui_hide: Optional[List[str]] = None,
                   mask_opacity: Optional[int] = None,
+                  grpc_port: int = 9876,
                   parent=None):
         super().__init__(parent)
         self.rrd_index = rrd_index
@@ -2756,6 +2830,9 @@ class ReviewWindow(QMainWindow):
         # Whether to show the track-id mismatch confirmation dialog before
         # interpolating.
         self.interp_confirm_mismatch = interp_confirm_mismatch
+        self.grpc_port = grpc_port
+        # Rerun viewer subprocess spawned at runtime (File → Load from rrd).
+        self._rerun_proc = None
 
         self.setWindowTitle("Computer Vision Label Review Tool")
         self.resize(1600, 900)
@@ -2804,6 +2881,7 @@ class ReviewWindow(QMainWindow):
         # Rerun viewer wrapped in a container with a toggle button.
         self.rerun_container = QWidget()
         rerun_layout = QVBoxLayout(self.rerun_container)
+        self._rerun_layout = rerun_layout  # kept for runtime rrd loading
         rerun_layout.setContentsMargins(0, 0, 0, 0)
         rerun_layout.setSpacing(0)
         # Toggle toolbar.
@@ -2835,8 +2913,9 @@ class ReviewWindow(QMainWindow):
                 )
             else:
                 placeholder_text = (
-                    "Image mode (--images): no Rerun viewer.\n"
-                    "Navigate with N / B, the slider, or Space to play."
+                    "No Rerun viewer (idle / image mode).\n"
+                    "File → Open image file(s) / Open folder /\n"
+                    "Load from rrd to pick a source."
                 )
             placeholder = QLabel(placeholder_text)
             placeholder.setAlignment(Qt.AlignCenter)
@@ -2849,8 +2928,7 @@ class ReviewWindow(QMainWindow):
 
         # Config-driven UI tweaks: hide button groups, preset mask opacity.
         if ui_hide:
-            side_groups = [g for g in ui_hide if g != "rerun_toggle"]
-            self.side.set_hidden_groups(side_groups)
+            self.side.set_hidden_groups(ui_hide)
             if "rerun_toggle" in ui_hide:
                 self.btn_toggle_rerun.hide()
         if mask_opacity is not None:
@@ -3090,6 +3168,159 @@ class ReviewWindow(QMainWindow):
         act_dir.setShortcut("Ctrl+Shift+O")
         act_dir.triggered.connect(self._open_image_folder)
         m.addAction(act_dir)
+        act_rrd = QAction("Load from rrd…", self)
+        act_rrd.setShortcut("Ctrl+R")
+        act_rrd.setToolTip("Open a Rerun .rrd recording and embed its viewer.")
+        act_rrd.triggered.connect(self._load_rrd_dialog)
+        m.addAction(act_rrd)
+        m.addSeparator()
+        act_cfg = QAction("Load config…", self)
+        act_cfg.setShortcut("Ctrl+G")
+        act_cfg.setToolTip(
+            "Apply a JSON config at runtime (interpolation / SAM3 / "
+            "UI hide / mask opacity).")
+        act_cfg.triggered.connect(self._load_config_dialog)
+        m.addAction(act_cfg)
+
+    def _switch_source(self, new_index, out_json: str, label: str) -> None:
+        """Shared source-switch: save the current session, swap the frame
+        index, and start a fresh COCO session at `out_json`, keeping the
+        current category list."""
+        # Save the current session before switching away from it.
+        try:
+            self.coco.save(is_final=False)
+        except Exception:
+            pass
+        self._stop_playback()
+        self.side.set_playing(False)
+        self.rrd_index = new_index
+        self.coco = CocoState(out_json, self.coco.categories)
+        self.coco.load_existing()
+        self.side.coco = self.coco  # side panel keeps its own reference
+        self._current_idx = self.coco.load_progress(len(self.rrd_index))
+        self._current_image_id = None
+        self._last_cat_id = None
+        self._pending_cat_id = None
+        self.canvas.reset_state()
+        self.side.set_slider_max(len(self.rrd_index))
+        self.setWindowTitle(f"Computer Vision Label Review Tool — {label}")
+        self._load_current()
+        self.statusBar().showMessage(
+            f"Loaded {len(self.rrd_index)} frame(s) — saving to {out_json}",
+            5000)
+
+    def _load_config_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load config", "scripts/config", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Load config", str(e))
+            return
+        self._apply_runtime_config(cfg)
+        self.statusBar().showMessage(f"Config applied: {path}", 4000)
+
+    def _apply_runtime_config(self, cfg: Dict[str, Any]) -> None:
+        """Apply a config dict to the running window. Interpolation/SAM3
+        values affect subsequent operations; ui.hide both hides and
+        un-hides groups; mask_opacity applies immediately."""
+        interp_cfg = cfg.get("interpolation", {})
+        fm = interp_cfg.get("flow_method")
+        if fm in ("dis", "klt", "farneback"):
+            self.interp_flow_method = fm
+        cm = interp_cfg.get("camera_model")
+        if cm in ("none", "global"):
+            self.interp_camera_model = cm
+        if "match_max_dist_frac" in interp_cfg:
+            self.interp_match_frac = float(interp_cfg["match_max_dist_frac"])
+        if "confirm_mismatch" in interp_cfg:
+            self.interp_confirm_mismatch = bool(
+                interp_cfg["confirm_mismatch"])
+        sam3_cfg = cfg.get("sam3", {})
+        dev = sam3_cfg.get("device")
+        if dev in ("cuda", "cpu"):
+            self.sam3_device = dev
+        if "conf" in sam3_cfg:
+            self.sam3_conf = float(sam3_cfg["conf"])
+        if "auto_segment" in sam3_cfg:
+            self.auto_segment = bool(sam3_cfg["auto_segment"])
+        ui_cfg = cfg.get("ui", {})
+        if "hide" in ui_cfg:
+            groups = ui_cfg["hide"] or []
+            self.side.set_hidden_groups(groups)
+            self.btn_toggle_rerun.setVisible("rerun_toggle" not in groups)
+        if "mask_opacity" in ui_cfg:
+            pct = max(0, min(100, int(ui_cfg["mask_opacity"])))
+            # Signals are connected by now, so this also updates the canvas.
+            self.side.opacity_slider.setValue(pct)
+
+    def _load_rrd_dialog(self) -> None:
+        """File → Load from rrd: index a recording, spawn its web viewer,
+        and switch the session to it."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load RRD recording", "", "Rerun recordings (*.rrd)")
+        if not path:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.statusBar().showMessage(
+            f"Indexing {path} — can take a minute for big recordings…")
+        QApplication.processEvents()
+        try:
+            new_index = RrdFrameIndex(
+                path,
+                progress_cb=lambda n_chunks, n_imgs: print(
+                    f"  scanned {n_chunks} chunks, {n_imgs} unique image "
+                    "timestamps", end="\r"),
+            )
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Load rrd", str(e))
+            return
+        QApplication.restoreOverrideCursor()
+        if len(new_index) == 0:
+            QMessageBox.warning(self, "Load rrd", "No image frames found.")
+            return
+        # Replace any previously spawned viewer and start a new one.
+        if self._rerun_proc is not None:
+            try:
+                self._rerun_proc.terminate()
+            except Exception:
+                pass
+        self._rerun_proc = _spawn_rerun_web_viewer(
+            path, self.web_port, self.grpc_port)
+        QApplication.instance().aboutToQuit.connect(
+            lambda: self._rerun_proc is not None
+            and self._rerun_proc.poll() is None
+            and self._rerun_proc.terminate())
+        # Create the embedded web view now if we started without one.
+        if _HAS_WEBENGINE and self.web_view is None:
+            while self._rerun_layout.count() > 1:
+                item = self._rerun_layout.takeAt(1)
+                if item.widget() is not None:
+                    item.widget().deleteLater()
+            self.web_view = QWebEngineView()
+            self._rerun_layout.addWidget(self.web_view, 1)
+            self._setup_web_bridge()
+            if self.bridge is not None:
+                self.bridge.time_changed.connect(
+                    self._on_viewer_time_changed)
+        self.btn_toggle_rerun.setEnabled(True)
+        # If categories are still the untouched placeholder, seed them from
+        # the recording's labels instead.
+        cats = self.coco.categories
+        if cats == [{"id": 0, "name": "object"}]:
+            seeded = _seed_categories(new_index, None, None)
+            if seeded != cats:
+                self.coco.categories = seeded
+                self.coco.cat_map = {c["id"]: c["name"] for c in seeded}
+                self.coco.cat_name_to_id = {c["name"]: c["id"]
+                                            for c in seeded}
+                self.side._rebuild_cat_list()
+        out_json = os.path.splitext(path)[0] + "_labels.json"
+        self._switch_source(new_index, out_json, os.path.dirname(path))
 
     def _open_image_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -3106,40 +3337,19 @@ class ReviewWindow(QMainWindow):
     def _switch_to_images(self, paths: List[str]) -> None:
         """Replace the frame source with plain image files/folders.
 
-        Saves the current session first, then starts a fresh COCO session
-        next to the source (``labels_coco.json`` in the folder, or beside
-        the first file), keeping the current category list.
+        Starts a fresh COCO session next to the source (``labels_coco.json``
+        in the folder, or beside the first file), keeping the current
+        category list.
         """
         try:
             new_index = ImageFolderIndex(paths)
         except (FileNotFoundError, RuntimeError) as e:
             QMessageBox.warning(self, "Open images", str(e))
             return
-        # Save the current session before switching away from it.
-        try:
-            self.coco.save(is_final=False)
-        except Exception:
-            pass
-        self._stop_playback()
-        self.side.set_playing(False)
-        self.rrd_index = new_index
         out_dir = (paths[0] if os.path.isdir(paths[0])
                    else os.path.dirname(os.path.abspath(paths[0])))
         out_json = os.path.join(out_dir, "labels_coco.json")
-        self.coco = CocoState(out_json, self.coco.categories)
-        self.coco.load_existing()
-        self.side.coco = self.coco  # side panel keeps its own reference
-        self._current_idx = self.coco.load_progress(len(self.rrd_index))
-        self._current_image_id = None
-        self._last_cat_id = None
-        self._pending_cat_id = None
-        self.canvas.reset_state()
-        self.side.set_slider_max(len(self.rrd_index))
-        self.setWindowTitle(f"Computer Vision Label Review Tool — {out_dir}")
-        self._load_current()
-        self.statusBar().showMessage(
-            f"Loaded {len(self.rrd_index)} image(s) — saving to {out_json}",
-            5000)
+        self._switch_source(new_index, out_json, out_dir)
 
     # ----------------------- frame playback ----------------------------- #
 
@@ -3239,12 +3449,15 @@ class ReviewWindow(QMainWindow):
         self.canvas.set_boxes(boxes)
         self.side.set_boxes(boxes)
         self.side.highlight_box_row(-1)
+        ts_real = getattr(self.rrd_index, "timestamps_real", True)
+        pos = (f"ts={frame['timestamp_ns']}" if ts_real else f"index={idx}")
         self.canvas.set_info(
-            f"Frame {idx + 1}/{len(self.rrd_index)}  |  ts={frame['timestamp_ns']}"
+            f"Frame {idx + 1}/{len(self.rrd_index)}  |  {pos}"
         )
         self.side.set_slider(idx)
         self.side.set_info(idx, len(self.rrd_index),
-                           frame["timestamp_ns"], len(boxes))
+                           frame["timestamp_ns"], len(boxes),
+                           ts_real=ts_real)
         # Update current index for save paths. We do NOT autosave on every
         # frame navigation (it would write the JSON every tick when the
         # embedded Rerun viewer autoplays the timeline). Progress is saved:
@@ -3274,10 +3487,10 @@ class ReviewWindow(QMainWindow):
             self.coco.save(is_final=False)
 
     def _on_viewer_time_changed(self, ts_ns: int) -> None:
-        # Ignore the embedded viewer after switching to --images mode — it
-        # still shows the old recording, whose timestamps are meaningless
-        # for the image index.
-        if isinstance(self.rrd_index, ImageFolderIndex):
+        # Only an RrdFrameIndex is backed by the embedded viewer. After
+        # switching to images (or in idle mode) the viewer still shows the
+        # old recording, whose timestamps are meaningless for the new index.
+        if not isinstance(self.rrd_index, RrdFrameIndex):
             return
         # If the user manually scrubs the Rerun viewer while our play timer
         # is running, stop our playback so the two timelines don't fight.
@@ -4339,8 +4552,11 @@ def main():
                         help="Image files and/or folders to review instead of "
                              "an .rrd (folders are scanned for "
                              "jpg/jpeg/png/bmp/webp/tif, sorted by name).")
-    parser.add_argument("--output_json", required=True,
-                        help="Output COCO JSON path (progress file is auto-saved).")
+    parser.add_argument("--output_json",
+                        help="Output COCO JSON path (progress file is "
+                             "auto-saved). Default: <source>/labels_coco.json "
+                             "for --images, <rrd>_labels.json for --rrd, "
+                             "./untitled_labels_coco.json in idle mode.")
     parser.add_argument("--json", help="Seed COCO JSON for categories / existing labels.")
     parser.add_argument("--db", help="SQLite inspection DB (e.g. complete3/inspection_v2.db) "
                         "to read categories from when --json is not given.")
@@ -4382,10 +4598,10 @@ def main():
                              "label_review.example.json.")
     args = parser.parse_args()
 
-    if not args.rrd and not args.images:
-        parser.error("one of --rrd or --images is required")
     if args.rrd and args.images:
         parser.error("--rrd and --images are mutually exclusive")
+    # Neither source given → start idle; the user picks a source from the
+    # File menu (Open image file(s) / Open folder / Load from rrd).
 
     # Optional JSON config; its values override the corresponding CLI flags.
     cfg: Dict[str, Any] = {}
@@ -4418,11 +4634,19 @@ def main():
         sam3_device = args.sam3_device
 
     # ---------- 1. Index the frame source ----------
+    rrd_path = None
     if args.images:
         print(f"🖼️  Loading images from: {args.images}")
         rrd_index = ImageFolderIndex(args.images)
         print(f"✅ Indexed {len(rrd_index)} images")
-    else:
+        if rrd_index.timestamps_real:
+            print("🕒 Filenames look like timestamps — "
+                  "slider/info will show them.")
+        if not args.output_json:
+            base = (args.images[0] if os.path.isdir(args.images[0])
+                    else os.path.dirname(os.path.abspath(args.images[0])))
+            args.output_json = os.path.join(base, "labels_coco.json")
+    elif args.rrd:
         rrd_path = os.path.abspath(args.rrd)
         if not os.path.exists(rrd_path):
             print(f"❌ .rrd not found: {rrd_path}")
@@ -4441,7 +4665,16 @@ def main():
               f"(image entity: {rrd_index.image_entity}, "
               f"bboxes entity: {rrd_index.bboxes_entity}, "
               f"timeline: {rrd_index.timeline})")
-    if len(rrd_index) == 0:
+        if not args.output_json:
+            args.output_json = os.path.splitext(rrd_path)[0] + "_labels.json"
+    else:
+        # Idle start — no source; pick one from the File menu.
+        rrd_index = EmptyIndex()
+        if not args.output_json:
+            args.output_json = os.path.abspath("untitled_labels_coco.json")
+        print("💤 No source given — idle mode. Use File → Open image "
+              "file(s) / Open folder / Load from rrd to begin.")
+    if len(rrd_index) == 0 and (args.rrd or args.images):
         print("❌ No image frames found.")
         sys.exit(1)
 
@@ -4489,7 +4722,8 @@ def main():
                         interp_confirm_mismatch=bool(interp_cfg.get(
                             "confirm_mismatch", True)),
                         ui_hide=ui_cfg.get("hide") or None,
-                        mask_opacity=ui_cfg.get("mask_opacity"))
+                        mask_opacity=ui_cfg.get("mask_opacity"),
+                        grpc_port=args.grpc_port)
     win.show()
     exit_code = app.exec()
 
