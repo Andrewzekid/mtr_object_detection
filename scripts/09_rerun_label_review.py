@@ -779,8 +779,15 @@ class CocoState:
     # ------------------------- persistence ---------------------------- #
 
     def load_existing(self) -> None:
-        if os.path.exists(self.output_json):
-            with open(self.output_json, "r", encoding="utf-8") as f:
+        # Prefer the newest of the final JSON and the _tmp progress JSON —
+        # quitting with Q saves to _tmp only, so without this the previous
+        # session's edits would be silently ignored on relaunch.
+        tmp_json = self.output_json.replace(".json", "_tmp.json")
+        candidates = [p for p in (self.output_json, tmp_json)
+                      if os.path.exists(p)]
+        if candidates:
+            path = max(candidates, key=os.path.getmtime)
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.images = data.get("images", [])
             self.annotations = data.get("annotations", [])
@@ -806,7 +813,7 @@ class CocoState:
                 if ts is not None:
                     self._img_id_by_ts[ts] = img["id"]
                 self._img_id_by_idx[img.get("frame_idx", 0)] = img["id"]
-            print(f"📂 Loaded existing COCO: {self.output_json} "
+            print(f"📂 Loaded existing COCO: {path} "
                   f"({len(self.images)} imgs, {len(self.annotations)} anns)")
 
     def load_progress(self, total_frames: int) -> int:
