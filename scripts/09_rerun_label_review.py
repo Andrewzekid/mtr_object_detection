@@ -36,6 +36,9 @@ SAM3 segmentation
   While SAM3 runs, the side panel shows per-concept progress and a Cancel
   button (cooperative — the in-flight concept finishes first). The mask
   overlay opacity is adjustable via the slider next to the mask toggle.
+  "SAM3 ALL frames" runs SAM3 in the background over every box without a
+  mask on every frame; the progress bar above the frame slider shows how
+  many frames have at least one box.
 
 The .rrd must contain at least one ``EncodedImage`` entity (auto-detected).
 The script auto-detects:
@@ -79,6 +82,8 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
     Ctrl+Z   : undo last edit (add/delete/move/resize/mask/discard-all)
     Ctrl+Shift+Z / Ctrl+Y : redo
     U        : jump to the next unlabeled frame (no boxes, not yet reviewed)
+    C        : focus the "Cat of selected" field — type any category id
+               (e.g. 13) and press Enter to reassign the selected box
 
 Reviewed frames (marked on N forward-nav and X discard) are tracked in the
 .progress sidecar and shown in the status bar; X, S and quitting with
@@ -152,6 +157,7 @@ Qt.Key_Z = Qt.Key.Key_Z  # type: ignore[attr-defined]
 Qt.Key_Control = Qt.Key.Key_Control  # type: ignore[attr-defined]
 Qt.Key_Y = Qt.Key.Key_Y  # type: ignore[attr-defined]
 Qt.Key_U = Qt.Key.Key_U  # type: ignore[attr-defined]
+Qt.Key_C = Qt.Key.Key_C  # type: ignore[attr-defined]
 # Cursor shapes (PyQt6 scoped enums)
 Qt.SizeFDiagCursor = Qt.CursorShape.SizeFDiagCursor  # type: ignore[attr-defined]
 Qt.SizeBDiagCursor = Qt.CursorShape.SizeBDiagCursor  # type: ignore[attr-defined]
@@ -171,6 +177,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QSlider,
     QSplitter, QFrame, QSizePolicy, QMessageBox, QCheckBox,
+    QLineEdit, QProgressBar,
 )
 # QSizePolicy scoped enum alias
 QSizePolicy.Expanding = QSizePolicy.Policy.Expanding  # type: ignore[attr-defined]
@@ -296,126 +303,13 @@ class SAM3Worker(QThread):
                 "and place model weights under core/sam3/models/sam3-model/sam3.pt"
             )
             return
-        # Group bboxes by concept so SAM3 sees exemplars of the same class
-        # together. Each unique concept gets one run_sam3 call with all
-        # bboxes for that concept as exemplars.
-        per_concept: Dict[str, List[int]] = defaultdict(list)
-        for i, c in enumerate(self.concepts):
-            per_concept[c].append(i)
-
-        results: List[Dict[str, Any]] = []
-        total = len(per_concept)
-        done = 0
-        # Mutable per-run device: flips to "cpu" permanently after the
-        # first CUDA out-of-memory error.
-        device = self.device
-
-        def _progress(concept: str) -> None:
-            nonlocal done
-            done += 1
-            self.progress_signal.emit(done, total, concept)
-
-        for concept, idxs in per_concept.items():
-            if self._cancel_requested:
-                self.cancelled_signal.emit()
-                return
-            bxs = [self.bboxes_xyxy[i] for i in idxs]
-            try:
-                res = run_sam3(
-                    image_path=self.image_path,
-                    bboxes=bxs,
-                    concepts=[concept],
-                    model_path=self.model_path,
-                    device=device,
-                    conf=self.conf,
-                )
-            except Exception as e:
-                # CUDA OOM (e.g. another process hogging the GPU): fall back
-                # to CPU for this concept and everything after it.
-                if device != "cpu" and "out of memory" in str(e).lower():
-                    print(f"⚠️ SAM3 CUDA OOM — retrying on CPU "
-                          f"(and using CPU for the remaining concepts)")
-                    device = "cpu"
-                    try:
-                        res = run_sam3(
-                            image_path=self.image_path,
-                            bboxes=bxs,
-                            concepts=[concept],
-                            model_path=self.model_path,
-                            device=device,
-                            conf=self.conf,
-                        )
-                    except Exception as e2:
-                        for i in idxs:
-                            results.append({
-                                "ann_id": self.ann_ids[i],
-                                "bbox_xyxy": self.bboxes_xyxy[i],
-                                "mask": None,
-                                "label": concept,
-                                "area": 0.0,
-                                "success": False,
-                                "error": str(e2),
-                            })
-                        _progress(concept)
-                        continue
-                else:
-                    for i in idxs:
-                        results.append({
-                            "ann_id": self.ann_ids[i],
-                            "bbox_xyxy": self.bboxes_xyxy[i],
-                            "mask": None,
-                            "label": concept,
-                            "area": 0.0,
-                            "success": False,
-                            "error": str(e),
-                        })
-                    _progress(concept)
-                    continue
-
-            if not res.get("success"):
-                for i in idxs:
-                    results.append({
-                        "ann_id": self.ann_ids[i],
-                        "bbox_xyxy": self.bboxes_xyxy[i],
-                        "mask": None,
-                        "label": concept,
-                        "area": 0.0,
-                        "success": False,
-                        "error": res.get("error", "SAM3 failed"),
-                    })
-                _progress(concept)
-                continue
-
-            masks = res.get("masks", []) or []
-            dets = res.get("detections", []) or []
-            # Pair each input bbox with the closest detection's mask.
-            # dets[i].bbox is xyxy. We match by IoU.
-            for k, i in enumerate(idxs):
-                bx = self.bboxes_xyxy[i]
-                best_mask = None
-                best_iou = -1.0
-                for d_idx, d in enumerate(dets):
-                    db = d.get("bbox", [0, 0, 0, 0])
-                    iou = _iou_xyxy(bx, db)
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_mask = masks[d_idx] if d_idx < len(masks) else None
-                # If no detection matched by IoU, fall back to the k-th mask.
-                if best_mask is None and k < len(masks):
-                    best_mask = masks[k]
-                area = float(best_mask.sum()) if best_mask is not None else 0.0
-                results.append({
-                    "ann_id": self.ann_ids[i],
-                    "bbox_xyxy": bx,
-                    "mask": best_mask,
-                    "label": concept,
-                    "area": area,
-                    "success": best_mask is not None,
-                    "error": None if best_mask is not None else "no matching mask",
-                })
-            _progress(concept)
-
-        if self._cancel_requested:
+        results, _device, cancelled = _segment_concepts(
+            self.image_path, self.bboxes_xyxy, self.concepts, self.ann_ids,
+            self.model_path, self.device, self.conf,
+            cancel_check=lambda: self._cancel_requested,
+            progress_cb=lambda d, t, c: self.progress_signal.emit(d, t, c),
+        )
+        if cancelled:
             self.cancelled_signal.emit()
             return
         self.finished_signal.emit(results)
@@ -438,6 +332,195 @@ def _iou_xyxy(a: List[float], b: List[float]) -> float:
     if union <= 0:
         return 0.0
     return inter / union
+
+
+def _segment_concepts(image_path: str, bboxes_xyxy: list, concepts: list,
+                      ann_ids: list, model_path: Optional[str], device: str,
+                      conf: float, cancel_check=None, progress_cb=None
+                      ) -> Tuple[List[Dict[str, Any]], str, bool]:
+    """Run SAM3 on `bboxes_xyxy`, one run_sam3 call per unique concept.
+
+    Shared by SAM3Worker (single frame) and SAM3BatchWorker (all frames).
+
+    Returns (results, device, cancelled):
+      * results — per-box dicts {ann_id, bbox_xyxy, mask, label, area,
+        success, error}, one per input bbox.
+      * device — the device actually in use at the end. On a CUDA
+        out-of-memory error the call is retried on CPU and "cpu" is
+        returned, so the caller can stay on CPU for subsequent frames.
+      * cancelled — True when cancel_check() fired between concepts; the
+        partial results are returned and the caller decides what to do.
+    """
+    per_concept: Dict[str, List[int]] = defaultdict(list)
+    for i, c in enumerate(concepts):
+        per_concept[c].append(i)
+
+    results: List[Dict[str, Any]] = []
+    total = len(per_concept)
+    done = 0
+
+    def _progress(concept: str) -> None:
+        nonlocal done
+        done += 1
+        if progress_cb is not None:
+            progress_cb(done, total, concept)
+
+    def _fail_all(idxs: List[int], concept: str, error: str) -> None:
+        for i in idxs:
+            results.append({
+                "ann_id": ann_ids[i],
+                "bbox_xyxy": bboxes_xyxy[i],
+                "mask": None,
+                "label": concept,
+                "area": 0.0,
+                "success": False,
+                "error": error,
+            })
+
+    for concept, idxs in per_concept.items():
+        if cancel_check is not None and cancel_check():
+            return results, device, True
+        bxs = [bboxes_xyxy[i] for i in idxs]
+        try:
+            res = run_sam3(
+                image_path=image_path,
+                bboxes=bxs,
+                concepts=[concept],
+                model_path=model_path,
+                device=device,
+                conf=conf,
+            )
+        except Exception as e:
+            # CUDA OOM (e.g. another process hogging the GPU): fall back
+            # to CPU for this concept and everything after it.
+            if device != "cpu" and "out of memory" in str(e).lower():
+                print("⚠️ SAM3 CUDA OOM — retrying on CPU "
+                      "(and using CPU for the remaining concepts)")
+                device = "cpu"
+                try:
+                    res = run_sam3(
+                        image_path=image_path,
+                        bboxes=bxs,
+                        concepts=[concept],
+                        model_path=model_path,
+                        device=device,
+                        conf=conf,
+                    )
+                except Exception as e2:
+                    _fail_all(idxs, concept, str(e2))
+                    _progress(concept)
+                    continue
+            else:
+                _fail_all(idxs, concept, str(e))
+                _progress(concept)
+                continue
+
+        if not res.get("success"):
+            _fail_all(idxs, concept, res.get("error", "SAM3 failed"))
+            _progress(concept)
+            continue
+
+        masks = res.get("masks", []) or []
+        dets = res.get("detections", []) or []
+        # Pair each input bbox with the closest detection's mask.
+        # dets[i].bbox is xyxy. We match by IoU.
+        for k, i in enumerate(idxs):
+            bx = bboxes_xyxy[i]
+            best_mask = None
+            best_iou = -1.0
+            for d_idx, d in enumerate(dets):
+                db = d.get("bbox", [0, 0, 0, 0])
+                iou = _iou_xyxy(bx, db)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_mask = masks[d_idx] if d_idx < len(masks) else None
+            # If no detection matched by IoU, fall back to the k-th mask.
+            if best_mask is None and k < len(masks):
+                best_mask = masks[k]
+            area = float(best_mask.sum()) if best_mask is not None else 0.0
+            results.append({
+                "ann_id": ann_ids[i],
+                "bbox_xyxy": bx,
+                "mask": best_mask,
+                "label": concept,
+                "area": area,
+                "success": best_mask is not None,
+                "error": None if best_mask is not None else "no matching mask",
+            })
+        _progress(concept)
+
+    return results, device, False
+
+
+class SAM3BatchWorker(QThread):
+    """Background SAM3 over many frames ("SAM3 ALL frames" button).
+
+    jobs: list of dicts, one per frame:
+        {frame_idx: int, bboxes_xyxy: [...], concepts: [...], ann_ids: [...]}
+    Frames are decoded from the rrd index inside this thread (decode_image
+    is pure in-memory PIL decoding, so this is thread-safe) and written as
+    tmp PNGs under tmp_dir.
+
+    Emits frame_done_signal(frame_idx, results) after each frame so the UI
+    can apply masks incrementally, plus progress/finished/cancelled signals.
+    Cancel is cooperative: checked between frames and between concepts.
+    """
+
+    frame_done_signal = pyqtSignal(int, list)   # frame_idx, per-box results
+    progress_signal = pyqtSignal(int, int)      # frames done, total frames
+    finished_signal = pyqtSignal(int, int)      # masks assigned, failed
+    failed_signal = pyqtSignal(str)
+    cancelled_signal = pyqtSignal()
+
+    def __init__(self, rrd_index, jobs: List[Dict[str, Any]], tmp_dir: str,
+                 model_path: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.rrd_index = rrd_index
+        self.jobs = jobs
+        self.tmp_dir = tmp_dir
+        self.model_path = model_path
+        self.device = device
+        self.conf = conf
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Ask the worker to stop after the current frame."""
+        self._cancel_requested = True
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _SAM3_AVAILABLE:
+            self.failed_signal.emit(
+                "SAM3 is not installed. Install ultralytics + segment-anything "
+                "and place model weights under core/sam3/models/sam3-model/sam3.pt"
+            )
+            return
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        n_ok = 0
+        n_fail = 0
+        device = self.device
+        for n, job in enumerate(self.jobs):
+            if self._cancel_requested:
+                self.cancelled_signal.emit()
+                return
+            arr = self.rrd_index.decode_image(job["frame_idx"])
+            img_path = os.path.join(self.tmp_dir,
+                                    f"batch_{job['frame_idx']:06d}.png")
+            Image.fromarray(arr).save(img_path)
+            results, device, cancelled = _segment_concepts(
+                img_path, job["bboxes_xyxy"], job["concepts"], job["ann_ids"],
+                self.model_path, device, self.conf,
+                cancel_check=lambda: self._cancel_requested,
+            )
+            if cancelled:
+                # Discard the partial frame; frames already emitted stay.
+                self.cancelled_signal.emit()
+                return
+            self.frame_done_signal.emit(job["frame_idx"], results)
+            n_ok += sum(1 for r in results if r["success"])
+            n_fail += sum(1 for r in results if not r["success"])
+            self.progress_signal.emit(n + 1, len(self.jobs))
+        self.finished_signal.emit(n_ok, n_fail)
 
 
 # ---------------------------------------------------------------------------
@@ -1051,7 +1134,31 @@ class CocoState:
                 )
                 return
 
+    def set_cat(self, ann_id: int, cat_id: int) -> bool:
+        """Change an annotation's category. Returns False if not found."""
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                prev = ann["category_id"]
+                if prev == cat_id:
+                    return True
+                ann["category_id"] = cat_id
+                self.dirty = True
+                self.undo_stack.push(
+                    f"recat box #{ann_id} → {cat_id}",
+                    undo=lambda: self._undo_set_cat(ann_id, prev),
+                    redo=lambda: self._undo_set_cat(ann_id, cat_id),
+                )
+                return True
+        return False
+
     # ---- undo/redo primitives (called via lambdas on the stack) ---- #
+
+    def _undo_set_cat(self, ann_id: int, cat_id: int) -> None:
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                ann["category_id"] = cat_id
+                self.dirty = True
+                return
 
     def _undo_remove(self, ann_id: int) -> None:
         """Inverse of add_box / seed_box — remove the box."""
@@ -1709,6 +1816,8 @@ class SidePanel(QWidget):
     preselect_cat = pyqtSignal(int)      # category preselected for next draw
     mask_opacity_changed = pyqtSignal(int)  # 0-100 percent
     cancel_sam3_clicked = pyqtSignal()   # "Cancel SAM3" button
+    recat_selected = pyqtSignal(int)     # new cat_id for the selected box
+    sam3_all_frames_clicked = pyqtSignal()  # "SAM3 ALL frames" button
 
     def __init__(self, coco: CocoState, parent=None):
         super().__init__(parent)
@@ -1732,6 +1841,19 @@ class SidePanel(QWidget):
         self.box_list.setMaximumHeight(140)
         self.box_list.itemClicked.connect(self._on_box_list_clicked)
         layout.addWidget(self.box_list)
+
+        # Recategorize the selected box: type a category id, press Enter.
+        # Works for any id (not just 0-9 like the draw-time number keys).
+        recat_row = QHBoxLayout()
+        recat_row.addWidget(QLabel("Cat of selected:"))
+        self.recat_edit = QLineEdit()
+        self.recat_edit.setPlaceholderText("id, e.g. 13")
+        self.recat_edit.setToolTip(
+            "Select a box, type a category id, press Enter to reassign. "
+            "Press C to focus this field.")
+        self.recat_edit.returnPressed.connect(self._on_recat_entered)
+        recat_row.addWidget(self.recat_edit, 1)
+        layout.addLayout(recat_row)
 
         # Frame playback controls: play/pause + speed.
         play_row = QHBoxLayout()
@@ -1768,6 +1890,13 @@ class SidePanel(QWidget):
         sam_layout.addWidget(self.btn_cancel_sam3)
         layout.addLayout(sam_layout)
 
+        self.btn_sam3_all_frames = QPushButton("SAM3 ALL frames")
+        self.btn_sam3_all_frames.setToolTip(
+            "Background auto-annotate: run SAM3 on every box that has no "
+            "mask yet, across ALL frames. Cancel anytime.")
+        self.btn_sam3_all_frames.clicked.connect(self.sam3_all_frames_clicked.emit)
+        layout.addWidget(self.btn_sam3_all_frames)
+
         self.btn_masks = QPushButton("Masks: ON")
         self.btn_masks.setCheckable(True)
         self.btn_masks.setChecked(True)
@@ -1794,6 +1923,17 @@ class SidePanel(QWidget):
         self.sam3_status = QLabel("SAM3: idle")
         layout.addWidget(self.sam3_status)
 
+        # Annotation coverage: how many frames have at least one box.
+        self.annot_progress = QProgressBar()
+        self.annot_progress.setMinimum(0)
+        self.annot_progress.setMaximum(1)
+        self.annot_progress.setValue(0)
+        self.annot_progress.setFormat("Annotated: %v/%m (%p%)")
+        self.annot_progress.setToolTip(
+            "Frames with at least one box. Press U to jump to the next "
+            "frame that still needs labels.")
+        layout.addWidget(self.annot_progress)
+
         self.frame_slider = QSlider(_QT_HORZ)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(0)
@@ -1811,7 +1951,7 @@ class SidePanel(QWidget):
             "0-9 = pick cat (when drawing) &nbsp; + / - = zoom &nbsp; F = fit<br>"
             "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause<br>"
             "Z = zoom to sel &nbsp; Ctrl+Z = undo &nbsp; Ctrl+Shift+Z = redo<br>"
-            "U = jump to next unlabeled frame<br>"
+            "U = jump to next unlabeled frame &nbsp; C = focus cat-id field<br>"
             "<i>Click a category first to preselect it for the next draw.</i>"
         )
         self.help_label.setWordWrap(True)
@@ -1880,7 +2020,20 @@ class SidePanel(QWidget):
         """Enable Cancel and disable the run buttons while SAM3 is busy."""
         self.btn_run_sam3.setEnabled(not running)
         self.btn_reseg.setEnabled(not running)
+        self.btn_sam3_all_frames.setEnabled(not running)
         self.btn_cancel_sam3.setEnabled(running)
+
+    def set_annotated_progress(self, annotated: int, total: int) -> None:
+        self.annot_progress.setMaximum(max(total, 1))
+        self.annot_progress.setValue(min(annotated, max(total, 1)))
+
+    def _on_recat_entered(self) -> None:
+        txt = self.recat_edit.text().strip()
+        if txt.isdigit():
+            self.recat_selected.emit(int(txt))
+            self.recat_edit.clear()
+        else:
+            self.recat_edit.selectAll()
 
     def set_mask_opacity(self, pct: int) -> None:
         """Sync the opacity slider without re-emitting (e.g. on restore)."""
@@ -2048,6 +2201,8 @@ class ReviewWindow(QMainWindow):
         self._current_image_id: Optional[int] = None
         self._pending_cat_id: Optional[int] = None
         self._sam3_worker: Optional[SAM3Worker] = None
+        self._sam3_batch_worker: Optional[SAM3BatchWorker] = None
+        self._batch_frames_done: int = 0
         # Tmp file path for the current frame's image (run_sam3 needs a path).
         self._tmp_image_path: Optional[str] = None
 
@@ -2159,6 +2314,8 @@ class ReviewWindow(QMainWindow):
         self.side.preselect_cat.connect(self._on_preselect_cat)
         self.side.mask_opacity_changed.connect(self._on_mask_opacity_changed)
         self.side.cancel_sam3_clicked.connect(self._on_cancel_sam3)
+        self.side.recat_selected.connect(self._on_recat_selected)
+        self.side.sam3_all_frames_clicked.connect(self._on_sam3_all_frames)
 
         if self.bridge is not None:
             self.bridge.time_changed.connect(self._on_viewer_time_changed)
@@ -2186,6 +2343,8 @@ class ReviewWindow(QMainWindow):
             (Qt.Key_R, self._on_resegment_selected),
             (Qt.Key_Z, self._on_zoom_to_selected),
             (Qt.Key_U, self._on_next_unlabeled),
+            (Qt.Key_C, lambda: (self.side.recat_edit.setFocus(),
+                                self.side.recat_edit.selectAll())),
         ]:
             sc = QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(slot)
@@ -2431,6 +2590,7 @@ class ReviewWindow(QMainWindow):
         #   - on explicit N/B/X keystrokes (see _on_frame_nav / _on_discard_all)
         #   - on quit (closeEvent, _on_save_quit, _on_quit)
         self.coco.current_idx = idx
+        self._update_progress()
 
     # ----------------------- event handlers ---------------------------- #
 
@@ -2722,6 +2882,7 @@ class ReviewWindow(QMainWindow):
         self.side.set_info(self._current_idx, len(self.rrd_index),
                            self.rrd_index.frame_at(self._current_idx)["timestamp_ns"],
                            len(boxes))
+        self._update_progress()
 
     # ---- box list panel + preselected category ---- #
 
@@ -2741,6 +2902,30 @@ class ReviewWindow(QMainWindow):
         self.canvas._drawing = True
         self.canvas.update()
         self.statusBar().showMessage(f"Drawing: {name} — drag on the image", 4000)
+
+    def _on_recat_selected(self, cat_id: int) -> None:
+        """Reassign the selected box's category (typed id + Enter)."""
+        sel = self.canvas._selected_idx
+        if not (0 <= sel < len(self.canvas._boxes)):
+            self.statusBar().showMessage("Select a box first", 2500)
+            return
+        if cat_id not in self.coco.cat_map:
+            self.statusBar().showMessage(f"⚠️ Category {cat_id} not found", 3000)
+            return
+        ann_id = self.canvas._boxes[sel]["id"]
+        if self.coco.set_cat(ann_id, cat_id):
+            self._refresh_boxes()
+            self.canvas._selected_idx = sel
+            self.canvas.update()
+            name = self.coco.cat_map.get(cat_id, "?")
+            self.statusBar().showMessage(
+                f"Box #{ann_id} → category {cat_id} ({name})", 2500)
+
+    def _update_progress(self) -> None:
+        """Refresh the annotation-coverage progress bar in the side panel."""
+        annotated = len({a["image_id"] for a in self.coco.annotations
+                         if a["id"] not in self.coco.removed_ids})
+        self.side.set_annotated_progress(annotated, len(self.rrd_index))
 
     # ----------------------- SAM3 segmentation ------------------------- #
 
@@ -2801,6 +2986,108 @@ class ReviewWindow(QMainWindow):
             ann_ids.append(ann["id"])
         self._start_sam3_worker(img_path, bboxes_xyxy, concepts, ann_ids)
 
+    def _on_sam3_all_frames(self) -> None:
+        """Background SAM3 over every frame that has boxes without masks."""
+        if not _SAM3_AVAILABLE:
+            QMessageBox.warning(self, "SAM3 unavailable",
+                                 "core.models_inference.run_sam3 not importable.")
+            return
+        if (self._sam3_worker is not None and self._sam3_worker.isRunning()) or \
+           (self._sam3_batch_worker is not None
+                and self._sam3_batch_worker.isRunning()):
+            self.statusBar().showMessage("SAM3 already running", 2500)
+            return
+        jobs = []
+        total_boxes = 0
+        for idx in range(len(self.rrd_index)):
+            img_id = self.coco._img_id_by_idx.get(idx)
+            if img_id is None:
+                continue  # never visited → no annotations possible
+            anns = [a for a in self.coco.anns_for_image(img_id)
+                    if a.get("_mask") is None]
+            if not anns:
+                continue
+            bboxes, concepts, ann_ids = [], [], []
+            for ann in anns:
+                x, y, w, h = ann["bbox"]
+                bboxes.append([x, y, x + w, y + h])
+                concepts.append(
+                    self.coco.cat_map.get(ann["category_id"], "object"))
+                ann_ids.append(ann["id"])
+            jobs.append({"frame_idx": idx, "bboxes_xyxy": bboxes,
+                         "concepts": concepts, "ann_ids": ann_ids})
+            total_boxes += len(anns)
+        if not jobs:
+            self.statusBar().showMessage(
+                "Nothing to do — every annotated box already has a mask", 4000)
+            return
+        ret = QMessageBox.question(
+            self, "Auto-annotate all with SAM3?",
+            f"Run SAM3 on {total_boxes} box(es) without masks across "
+            f"{len(jobs)} frame(s)?\n"
+            f"Runs in the background (device: {self.sam3_device}, CPU "
+            f"fallback on CUDA OOM). You can cancel anytime.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        tmp_dir = str(Path(self.coco.output_json).parent / "_tmp_sam3_imgs")
+        self._batch_frames_done = 0
+        self.side.set_sam3_status(f"SAM3 all: 0/{len(jobs)} frames…")
+        self.side.set_sam3_running(True)
+        self.canvas.setEnabled(False)
+        self._sam3_batch_worker = SAM3BatchWorker(
+            self.rrd_index, jobs, tmp_dir,
+            model_path=self.sam3_model,
+            device=self.sam3_device,
+            conf=self.sam3_conf,
+            parent=self,
+        )
+        self._sam3_batch_worker.frame_done_signal.connect(
+            self._on_batch_frame_done)
+        self._sam3_batch_worker.progress_signal.connect(
+            self._on_batch_progress)
+        self._sam3_batch_worker.finished_signal.connect(
+            self._on_batch_finished)
+        self._sam3_batch_worker.failed_signal.connect(self._on_sam3_failed)
+        self._sam3_batch_worker.cancelled_signal.connect(
+            self._on_batch_cancelled)
+        self._sam3_batch_worker.start()
+
+    def _on_batch_frame_done(self, frame_idx: int, results: list) -> None:
+        """Apply one frame's masks (grouped as a single undo entry)."""
+        with self.coco.undo_stack.group(f"SAM3 masks on frame {frame_idx + 1}"):
+            for r in results:
+                if r.get("ann_id") is not None and r.get("mask") is not None:
+                    self.coco.set_mask(r["ann_id"], r["mask"])
+        if frame_idx == self._current_idx:
+            self._refresh_boxes()
+        self._batch_frames_done += 1
+        # Checkpoint every 10 frames so masks survive a crash.
+        if self._batch_frames_done % 10 == 0:
+            self.coco.save(is_final=False)
+
+    def _on_batch_progress(self, done: int, total: int) -> None:
+        self.side.set_sam3_status(f"SAM3 all: {done}/{total} frames…")
+
+    def _on_batch_finished(self, n_ok: int, n_fail: int) -> None:
+        self.canvas.setEnabled(True)
+        self.side.set_sam3_running(False)
+        self.side.set_sam3_status(
+            f"SAM3 all: done — {n_ok} mask(s), {n_fail} failed")
+        self.coco.save(is_final=False)
+        self._refresh_boxes()
+        self.statusBar().showMessage(
+            f"Auto-annotate finished: {n_ok} masks", 4000)
+
+    def _on_batch_cancelled(self) -> None:
+        self.canvas.setEnabled(True)
+        self.side.set_sam3_running(False)
+        self.side.set_sam3_status("SAM3 all: cancelled")
+        self.coco.save(is_final=False)
+        self._refresh_boxes()
+        self.statusBar().showMessage("Auto-annotate cancelled", 3000)
+
     def _on_resegment_selected(self) -> None:
         """Re-run SAM3 on just the selected bbox (R key / button)."""
         if not _SAM3_AVAILABLE:
@@ -2826,8 +3113,11 @@ class ReviewWindow(QMainWindow):
 
     def _start_sam3_worker(self, img_path: str, bboxes_xyxy: list,
                            concepts: list, ann_ids: list) -> None:
-        if self._sam3_worker is not None and self._sam3_worker.isRunning():
+        if (self._sam3_worker is not None and self._sam3_worker.isRunning()) or \
+           (self._sam3_batch_worker is not None
+                and self._sam3_batch_worker.isRunning()):
             print("⚠️ SAM3 already running, please wait…")
+            self.statusBar().showMessage("SAM3 already running", 2500)
             return
         self.side.set_sam3_status(
             f"SAM3: running on {len(bboxes_xyxy)} box(es)…"
@@ -2856,8 +3146,15 @@ class ReviewWindow(QMainWindow):
         )
 
     def _on_cancel_sam3(self) -> None:
+        cancelled_any = False
         if self._sam3_worker is not None and self._sam3_worker.isRunning():
             self._sam3_worker.cancel()
+            cancelled_any = True
+        if (self._sam3_batch_worker is not None
+                and self._sam3_batch_worker.isRunning()):
+            self._sam3_batch_worker.cancel()
+            cancelled_any = True
+        if cancelled_any:
             self.side.set_sam3_status("SAM3: cancelling…")
             self.side.btn_cancel_sam3.setEnabled(False)
 
@@ -2918,15 +3215,15 @@ class ReviewWindow(QMainWindow):
         super().closeEvent(ev)
 
     def _shutdown_sam3_worker(self) -> None:
-        """Cancel and reap the SAM3 thread so it isn't killed mid-run."""
-        w = self._sam3_worker
-        if w is None or not w.isRunning():
-            return
-        w.cancel()
-        if not w.wait(2000):
-            # run_sam3 call still in flight — last resort before exit.
-            w.terminate()
-            w.wait(1000)
+        """Cancel and reap the SAM3 threads so they aren't killed mid-run."""
+        for w in (self._sam3_worker, self._sam3_batch_worker):
+            if w is None or not w.isRunning():
+                continue
+            w.cancel()
+            if not w.wait(2000):
+                # run_sam3 call still in flight — last resort before exit.
+                w.terminate()
+                w.wait(1000)
 
 
 # ---------------------------------------------------------------------------
