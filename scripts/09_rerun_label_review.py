@@ -171,6 +171,11 @@ config override the corresponding CLI flags. Example:
         "mask_opacity": 47            // initial mask overlay opacity (0-100)
       }
     }
+
+The same settings can be edited at runtime from the ⚙ Config button in the
+menu bar (or File → Config settings…, Ctrl+G): a dialog with checkboxes for
+the UI groups plus interpolation / SAM3 / opacity fields, with buttons to
+Load from file…, Apply, Save… (writes the JSON above), and Close.
 """
 
 from __future__ import annotations
@@ -2815,6 +2820,229 @@ class TimeBridge(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Config dialog (runtime settings editor)
+# ---------------------------------------------------------------------------
+
+class ConfigDialog(QtWidgets.QDialog):
+    """Settings editor opened from the ⚙ Config button (File → Config…).
+
+    Contains checkboxes for hiding UI groups plus interpolation / SAM3 /
+    mask-opacity fields. Buttons:
+      - Load from file… — read a JSON config, fill the widgets, apply it.
+      - Apply — apply the current widget state without saving.
+      - Save… — apply, then write the widget state to a JSON file.
+      - Close — dismiss the dialog.
+    The dialog is pre-filled from the live window state when opened, and
+    collects the same config schema as scripts/config/label_review.example.json.
+    """
+
+    _HIDE_LABELS = {
+        "keyframe": "Keyframe controls",
+        "interpolate": "Interpolate controls",
+        "jump": "Jump buttons (+5/+10)",
+        "sam3_run": "SAM3 run buttons",
+        "sam3_all_frames": "SAM3 all-frames button",
+        "masks": "Mask toggle + opacity slider",
+        "play": "Play controls",
+        "rerun_toggle": "Rerun viewer toggle",
+    }
+
+    def __init__(self, win: "ReviewWindow"):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle("Config settings")
+        self.setModal(True)
+        root = QVBoxLayout(self)
+
+        # --- UI visibility -------------------------------------------------
+        ui_box = QtWidgets.QGroupBox("Hide UI elements")
+        ui_form = QVBoxLayout(ui_box)
+        ui_form.addWidget(QLabel("Checked = hidden"))
+        self.hide_checks: Dict[str, QCheckBox] = {}
+        for key, label in self._HIDE_LABELS.items():
+            cb = QCheckBox(label)
+            self.hide_checks[key] = cb
+            ui_form.addWidget(cb)
+        root.addWidget(ui_box)
+
+        # --- Interpolation -------------------------------------------------
+        interp_box = QtWidgets.QGroupBox("Interpolation")
+        interp_form = QtWidgets.QFormLayout(interp_box)
+        self.combo_flow = QtWidgets.QComboBox()
+        self.combo_flow.addItems(["dis", "klt", "farneback"])
+        interp_form.addRow("Flow method", self.combo_flow)
+        self.combo_cam = QtWidgets.QComboBox()
+        self.combo_cam.addItems(["none", "global"])
+        interp_form.addRow("Camera model", self.combo_cam)
+        self.spin_match_frac = QtWidgets.QDoubleSpinBox()
+        self.spin_match_frac.setRange(0.01, 1.0)
+        self.spin_match_frac.setSingleStep(0.05)
+        self.spin_match_frac.setDecimals(2)
+        interp_form.addRow("Match max dist frac", self.spin_match_frac)
+        self.check_confirm_mismatch = QCheckBox("Confirm on mismatch")
+        interp_form.addRow(self.check_confirm_mismatch)
+        root.addWidget(interp_box)
+
+        # --- SAM3 ----------------------------------------------------------
+        sam3_box = QtWidgets.QGroupBox("SAM3")
+        sam3_form = QtWidgets.QFormLayout(sam3_box)
+        self.combo_device = QtWidgets.QComboBox()
+        self.combo_device.addItems(["cuda", "cpu"])
+        sam3_form.addRow("Device", self.combo_device)
+        self.spin_sam3_conf = QtWidgets.QDoubleSpinBox()
+        self.spin_sam3_conf.setRange(0.0, 1.0)
+        self.spin_sam3_conf.setSingleStep(0.05)
+        self.spin_sam3_conf.setDecimals(2)
+        sam3_form.addRow("Confidence", self.spin_sam3_conf)
+        self.check_auto_segment = QCheckBox("Auto-segment on box add")
+        sam3_form.addRow(self.check_auto_segment)
+        root.addWidget(sam3_box)
+
+        # --- Mask opacity --------------------------------------------------
+        mask_box = QtWidgets.QGroupBox("Masks")
+        mask_form = QtWidgets.QFormLayout(mask_box)
+        self.spin_opacity = QtWidgets.QSpinBox()
+        self.spin_opacity.setRange(0, 100)
+        self.spin_opacity.setSuffix(" %")
+        mask_form.addRow("Mask opacity", self.spin_opacity)
+        root.addWidget(mask_box)
+
+        # --- Buttons -------------------------------------------------------
+        btn_row = QHBoxLayout()
+        self.btn_load = QPushButton("Load from file…")
+        self.btn_apply = QPushButton("Apply")
+        self.btn_save = QPushButton("Save…")
+        self.btn_close = QPushButton("Close")
+        btn_row.addWidget(self.btn_load)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_apply)
+        btn_row.addWidget(self.btn_save)
+        btn_row.addWidget(self.btn_close)
+        root.addLayout(btn_row)
+        self.btn_load.clicked.connect(self._on_load)
+        self.btn_apply.clicked.connect(self._on_apply)
+        self.btn_save.clicked.connect(self._on_save)
+        self.btn_close.clicked.connect(self.accept)
+
+        self._prefill_from_window()
+
+    # -- prefill / collect ---------------------------------------------------
+
+    def _is_group_hidden(self, key: str) -> bool:
+        if key == "rerun_toggle":
+            return self.win.btn_toggle_rerun.isHidden()
+        attrs = SidePanel._HIDEABLE.get(key, [])
+        if not attrs:
+            return False
+        w = getattr(self.win.side, attrs[0], None)
+        if isinstance(w, list):
+            w = w[0] if w else None
+        return bool(w is not None and w.isHidden())
+
+    def _prefill_from_window(self) -> None:
+        """Fill the widgets from the live window state."""
+        win = self.win
+        for key, cb in self.hide_checks.items():
+            cb.setChecked(self._is_group_hidden(key))
+        self.combo_flow.setCurrentText(win.interp_flow_method)
+        self.combo_cam.setCurrentText(win.interp_camera_model)
+        self.spin_match_frac.setValue(win.interp_match_frac)
+        self.check_confirm_mismatch.setChecked(win.interp_confirm_mismatch)
+        self.combo_device.setCurrentText(win.sam3_device)
+        self.spin_sam3_conf.setValue(win.sam3_conf)
+        self.check_auto_segment.setChecked(win.auto_segment)
+        self.spin_opacity.setValue(win.side.opacity_slider.value())
+
+    def _prefill_from_config(self, cfg: Dict[str, Any]) -> None:
+        """Fill the widgets from a config dict (same schema as _collect)."""
+        interp = cfg.get("interpolation", {})
+        if interp.get("flow_method") in ("dis", "klt", "farneback"):
+            self.combo_flow.setCurrentText(interp["flow_method"])
+        if interp.get("camera_model") in ("none", "global"):
+            self.combo_cam.setCurrentText(interp["camera_model"])
+        if "match_max_dist_frac" in interp:
+            self.spin_match_frac.setValue(float(interp["match_max_dist_frac"]))
+        if "confirm_mismatch" in interp:
+            self.check_confirm_mismatch.setChecked(
+                bool(interp["confirm_mismatch"]))
+        sam3 = cfg.get("sam3", {})
+        if sam3.get("device") in ("cuda", "cpu"):
+            self.combo_device.setCurrentText(sam3["device"])
+        if "conf" in sam3:
+            self.spin_sam3_conf.setValue(float(sam3["conf"]))
+        if "auto_segment" in sam3:
+            self.check_auto_segment.setChecked(bool(sam3["auto_segment"]))
+        ui = cfg.get("ui", {})
+        if "hide" in ui:
+            hidden = set(ui["hide"] or [])
+            for key, cb in self.hide_checks.items():
+                cb.setChecked(key in hidden)
+        if "mask_opacity" in ui:
+            self.spin_opacity.setValue(
+                max(0, min(100, int(ui["mask_opacity"]))))
+
+    def _collect(self) -> Dict[str, Any]:
+        """Widget state as a config dict (same schema as the example JSON)."""
+        return {
+            "interpolation": {
+                "flow_method": self.combo_flow.currentText(),
+                "camera_model": self.combo_cam.currentText(),
+                "match_max_dist_frac": self.spin_match_frac.value(),
+                "confirm_mismatch":
+                    self.check_confirm_mismatch.isChecked(),
+            },
+            "sam3": {
+                "device": self.combo_device.currentText(),
+                "conf": self.spin_sam3_conf.value(),
+                "auto_segment": self.check_auto_segment.isChecked(),
+            },
+            "ui": {
+                "hide": [k for k, cb in self.hide_checks.items()
+                         if cb.isChecked()],
+                "mask_opacity": self.spin_opacity.value(),
+            },
+        }
+
+    # -- button handlers -----------------------------------------------------
+
+    def _on_load(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load config", "scripts/config", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Load config", str(e))
+            return
+        self._prefill_from_config(cfg)
+        self.win._apply_runtime_config(self._collect())
+        self.win.statusBar().showMessage(f"Config loaded: {path}", 4000)
+
+    def _on_apply(self) -> None:
+        self.win._apply_runtime_config(self._collect())
+        self.win.statusBar().showMessage("Config applied", 3000)
+
+    def _on_save(self) -> None:
+        cfg = self._collect()
+        self.win._apply_runtime_config(cfg)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save config", "scripts/config/label_review.json",
+            "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+                f.write("\n")
+        except Exception as e:
+            QMessageBox.warning(self, "Save config", str(e))
+            return
+        self.win.statusBar().showMessage(f"Config saved: {path}", 4000)
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -3200,18 +3428,18 @@ class ReviewWindow(QMainWindow):
         act_rrd.triggered.connect(self._load_rrd_dialog)
         m.addAction(act_rrd)
         m.addSeparator()
-        act_cfg = QAction("Load config…", self)
+        act_cfg = QAction("Config settings…", self)
         act_cfg.setShortcut("Ctrl+G")
         act_cfg.setToolTip(
-            "Apply a JSON config at runtime (interpolation / SAM3 / "
-            "UI hide / mask opacity).")
+            "Open the settings dialog (hide UI elements / interpolation / "
+            "SAM3 / mask opacity; load/save a JSON config).")
         act_cfg.triggered.connect(self._load_config_dialog)
         m.addAction(act_cfg)
         # A visible Config button in the menu bar's top-right corner.
         cfg_btn = QPushButton("⚙ Config")
         cfg_btn.setToolTip(
-            "Load a JSON config at runtime (interpolation / SAM3 / "
-            "UI hide / mask opacity).")
+            "Open the settings dialog (hide UI elements / interpolation / "
+            "SAM3 / mask opacity; load/save a JSON config).")
         cfg_btn.clicked.connect(self._load_config_dialog)
         self.menuBar().setCornerWidget(cfg_btn)
 
@@ -3243,18 +3471,12 @@ class ReviewWindow(QMainWindow):
             5000)
 
     def _load_config_dialog(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load config", "scripts/config", "JSON (*.json)")
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception as e:
-            QMessageBox.warning(self, "Load config", str(e))
-            return
-        self._apply_runtime_config(cfg)
-        self.statusBar().showMessage(f"Config applied: {path}", 4000)
+        """Open the settings dialog (⚙ Config button / File → Config…).
+
+        The dialog edits live settings and can load/save a JSON config from
+        inside itself."""
+        dlg = ConfigDialog(self)
+        dlg.exec()
 
     def _apply_runtime_config(self, cfg: Dict[str, Any]) -> None:
         """Apply a config dict to the running window. Interpolation/SAM3
