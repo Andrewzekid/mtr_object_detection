@@ -306,6 +306,9 @@ class SAM3Worker(QThread):
         results: List[Dict[str, Any]] = []
         total = len(per_concept)
         done = 0
+        # Mutable per-run device: flips to "cpu" permanently after the
+        # first CUDA out-of-memory error.
+        device = self.device
 
         def _progress(concept: str) -> None:
             nonlocal done
@@ -323,22 +326,51 @@ class SAM3Worker(QThread):
                     bboxes=bxs,
                     concepts=[concept],
                     model_path=self.model_path,
-                    device=self.device,
+                    device=device,
                     conf=self.conf,
                 )
             except Exception as e:
-                for i in idxs:
-                    results.append({
-                        "ann_id": self.ann_ids[i],
-                        "bbox_xyxy": self.bboxes_xyxy[i],
-                        "mask": None,
-                        "label": concept,
-                        "area": 0.0,
-                        "success": False,
-                        "error": str(e),
-                    })
-                _progress(concept)
-                continue
+                # CUDA OOM (e.g. another process hogging the GPU): fall back
+                # to CPU for this concept and everything after it.
+                if device != "cpu" and "out of memory" in str(e).lower():
+                    print(f"⚠️ SAM3 CUDA OOM — retrying on CPU "
+                          f"(and using CPU for the remaining concepts)")
+                    device = "cpu"
+                    try:
+                        res = run_sam3(
+                            image_path=self.image_path,
+                            bboxes=bxs,
+                            concepts=[concept],
+                            model_path=self.model_path,
+                            device=device,
+                            conf=self.conf,
+                        )
+                    except Exception as e2:
+                        for i in idxs:
+                            results.append({
+                                "ann_id": self.ann_ids[i],
+                                "bbox_xyxy": self.bboxes_xyxy[i],
+                                "mask": None,
+                                "label": concept,
+                                "area": 0.0,
+                                "success": False,
+                                "error": str(e2),
+                            })
+                        _progress(concept)
+                        continue
+                else:
+                    for i in idxs:
+                        results.append({
+                            "ann_id": self.ann_ids[i],
+                            "bbox_xyxy": self.bboxes_xyxy[i],
+                            "mask": None,
+                            "label": concept,
+                            "area": 0.0,
+                            "success": False,
+                            "error": str(e),
+                        })
+                    _progress(concept)
+                    continue
 
             if not res.get("success"):
                 for i in idxs:
