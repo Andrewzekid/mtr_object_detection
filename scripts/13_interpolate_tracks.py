@@ -27,6 +27,26 @@ Method (Kalman, ``--interp-method kalman``):
     still starts at keyframe a and lands at keyframe b. Process/measurement
     noise are tunable via ``--kf-q`` / ``--kf-r``.
 
+Method (camera model, ``--camera-model global``):
+    Per-frame camera motion is estimated with a RANSAC similarity transform
+    (rotation + scale + translation; whole-frame features tracked outside
+    the object boxes, DIS-median translation fallback for texture-poor
+    pairs) and composed across the span. Object trajectories are then
+    tracked/anchored as a *residual* relative to the camera-predicted
+    position, so non-linear camera motion (handheld shake, walking) is
+    absorbed by the per-frame transform chain while the flow/KF only
+    denoises the small object-specific residual. Lost KLT tracks are
+    re-seeded at the camera-predicted position. Off by default: an accuracy
+    test against re-reviewed MTR 4k frames (644 ten-frame windows, median
+    center error vs ground truth) showed no net gain on this fisheye camera
+    (18.5px with 'global' vs 16.4px with 'none') — the similarity model is a
+    rough ego-motion approximation under fisheye distortion, and a full
+    homography fits the background parallax instead of the object's motion
+    (much worse). Use 'global' for pinhole cameras with strong non-linear
+    shake. Every output annotation also carries a ``source``
+    (keyframe/flow/kalman/linear/hold) and a ``confidence`` in [0, 1] so the
+    downstream review can prioritize uncertain frames.
+
 USAGE:
     python scripts/13_interpolate_tracks.py \
         --keyframes-coco output/MTR_keyframes/reviewed/coco_reviewed.json \
@@ -58,12 +78,15 @@ USAGE:
 
 OUTPUT:
     - <output-coco>        COCO with boxes for every frame (keyframes reviewed,
-                           in-between frames interpolated)
+                            in-between frames interpolated). Annotations carry
+                            "source" (keyframe/flow/kalman/linear/hold) and
+                            "confidence" (0-1) provenance fields.
     - <vis-output>/*.jpg   annotated frames (optional)
     - <vis-output>/tracking_result.mp4   summary video (optional)
 """
 
 import argparse
+import bisect
 import json
 import sys
 from pathlib import Path
@@ -230,10 +253,15 @@ def _seed_points(gray, xyxy, min_points=8):
 
 
 def _lk_step(prev_gray, curr_gray, points):
-    """One LK step; returns (next_points, valid_mask, fwd_disp_xy or None)."""
+    """One LK step with forward-backward check and displacement consensus.
+
+    Returns (next_points, valid_mask, med_disp or None). ``valid_mask`` marks
+    the inliers that survived the forward-backward test and the MAD
+    consensus, so the caller can refresh the tracked point set.
+    """
     next_pts, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, points,
-                                              None, winSize=(21, 21),
-                                              maxLevel=3)
+                                               None, winSize=(21, 21),
+                                               maxLevel=3)
     if next_pts is None or st is None:
         return None, None, None
     st = st.reshape(-1).astype(bool)
@@ -241,9 +269,37 @@ def _lk_step(prev_gray, curr_gray, points):
     ok = st & finite
     if ok.sum() < 1:
         return next_pts, ok, None
-    disp = (next_pts[ok].reshape(-1, 2) - points[ok].reshape(-1, 2))
+
+    idx = np.where(ok)[0]
+    p0 = points[idx].reshape(-1, 2)
+    p1 = next_pts[idx].reshape(-1, 2)
+
+    # Forward-backward check: the reverse flow from p1 must land near p0.
+    back, st2, _ = cv2.calcOpticalFlowPyrLK(curr_gray, prev_gray,
+                                            p1.reshape(-1, 1, 2), None,
+                                            winSize=(21, 21), maxLevel=3)
+    if back is not None and st2 is not None:
+        st2 = st2.reshape(-1).astype(bool)
+        fbe = np.full(len(p0), np.inf)
+        fbe[st2] = np.linalg.norm(back.reshape(-1, 2)[st2] - p0[st2], axis=1)
+        fbe_ok = fbe < 1.0
+        if fbe_ok.sum() < 1:
+            return next_pts, ok, None
+    else:
+        fbe_ok = np.ones(len(p0), dtype=bool)
+
+    disp = p1 - p0
+    # MAD consensus: reject displacements that deviate from the median.
     med = np.median(disp, axis=0)
-    return next_pts, ok, med
+    mad = np.median(np.abs(disp - med), axis=0)
+    tol = np.maximum(2.0, 3.0 * mad)
+    keep = fbe_ok & (np.abs(disp - med) <= tol).all(axis=1)
+    if keep.sum() < 1:
+        return next_pts, ok, None
+
+    valid = np.zeros(len(points), dtype=bool)
+    valid[idx[keep]] = True
+    return next_pts, valid, np.median(disp[keep], axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +355,183 @@ def _box_median_flow(flow, xyxy):
 
 
 # ---------------------------------------------------------------------------
+# Global camera-motion estimation (non-linear camera shake handling)
+# ---------------------------------------------------------------------------
+
+_cam_stats = {"attempts": 0, "ok": 0, "qualities": []}
+
+
+def _estimate_global_flow(prev_gray, curr_gray, exclude_boxes=(),
+                          gf_quality=0.02, ransac_px=2.0):
+    """Estimate the per-frame camera transform between two consecutive frames.
+
+    Features are tracked across the whole frame *outside* ``exclude_boxes``
+    (so object motion does not bias the estimate) and a similarity transform
+    (rotation + scale + translation, 4 DoF) is fitted with RANSAC. The
+    similarity approximates the camera ego-motion that a world-static object
+    rides on; a full homography (8 DoF) fits the *background parallax plane*
+    instead (higher inlier ratio ~0.55 vs ~0.32 on the MTR metacam data, but
+    4x worse at predicting the object's motion), so it is not used.
+    Composing the per-frame transforms across a span captures non-linear
+    motion.
+
+    Returns (H 3x3 homogeneous, inlier_ratio) or (None, 0.0) when the frame
+    pair has too few trackable features.
+    """
+    h, w = prev_gray.shape[:2]
+    mask = np.full((h, w), 255, dtype=np.uint8)
+    for xyxy in exclude_boxes:
+        x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
+        y1, x1 = max(0, y1), max(0, x1)
+        y2, x2 = min(h, y2), min(w, x2)
+        if y2 > y1 and x2 > x1:
+            mask[y1:y2, x1:x2] = 0
+    p0 = cv2.goodFeaturesToTrack(prev_gray, maxCorners=400,
+                                 qualityLevel=gf_quality, minDistance=8,
+                                 mask=mask)
+    if p0 is None or len(p0) < 30:
+        return None, 0.0
+    p1, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None,
+                                         winSize=(21, 21), maxLevel=4)
+    if p1 is None or st is None:
+        return None, 0.0
+    st = st.reshape(-1).astype(bool)
+    if st.sum() < 30:
+        return None, 0.0
+    M, inliers = cv2.estimateAffinePartial2D(
+        p0[st], p1.reshape(-1, 1, 2)[st], method=cv2.RANSAC,
+        ransacReprojThreshold=ransac_px, maxIters=3000, confidence=0.999)
+    if M is None:
+        return None, 0.0
+    ratio = float(inliers.reshape(-1).mean()) if inliers is not None else 0.0
+    H = np.eye(3, dtype=np.float64)
+    H[:2, :] = M
+    return H, ratio
+
+
+def _median_flow_outside(flow, exclude_boxes=()):
+    """Median (dx, dy) of a dense flow field outside the given box regions."""
+    h, w = flow.shape[:2]
+    keep = np.ones((h, w), dtype=bool)
+    for xyxy in exclude_boxes:
+        x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
+        y1, x1 = max(0, y1), max(0, x1)
+        y2, x2 = min(h, y2), min(w, x2)
+        if y2 > y1 and x2 > x1:
+            keep[y1:y2, x1:x2] = False
+    if keep.sum() < 64:
+        return None
+    dx = np.median(flow[:, :, 0][keep])
+    dy = np.median(flow[:, :, 1][keep])
+    if not (np.isfinite(dx) and np.isfinite(dy)):
+        return None
+    return np.array([dx, dy], dtype=np.float32)
+
+
+def _build_camera_model(image_folder, frames, a, b, exclude_boxes=(),
+                        gf_quality=0.02, ransac_px=2.0):
+    """Per-frame camera transforms for the span (a, b].
+
+    Returns (Hs, quality): ``Hs`` is a list of 3x3 matrices mapping frame
+    t-1 coordinates to frame t coordinates (t = a+1..b) and ``quality`` the
+    mean RANSAC inlier ratio in [0, 1]. Returns (None, 0.0) if the model
+    could not be built (missing frames / no features).
+    """
+    _cam_stats["attempts"] += 1
+    Hs, qs = [], []
+    prev_gray = _read_gray(image_folder, frames[a])
+    if prev_gray is None:
+        return None, 0.0
+    for t in range(a + 1, b + 1):
+        curr_gray = _read_gray(image_folder, frames[t])
+        if curr_gray is None:
+            return None, 0.0
+        H, ratio = _estimate_global_flow(prev_gray, curr_gray, exclude_boxes,
+                                         gf_quality=gf_quality,
+                                         ransac_px=ransac_px)
+        if H is None or ratio < 0.25:
+            # Texture-poor pair: fall back to the global translation given by
+            # the median dense flow outside the object boxes.
+            flow = _compute_dense_flow(prev_gray, curr_gray, frames[t - 1],
+                                       frames[t], method="dis")
+            med = _median_flow_outside(flow, exclude_boxes)
+            if med is None:
+                return None, 0.0
+            H = np.eye(3, dtype=np.float64)
+            H[0, 2], H[1, 2] = float(med[0]), float(med[1])
+            ratio = 0.25
+        Hs.append(H)
+        qs.append(ratio)
+        prev_gray = curr_gray
+    _cam_stats["ok"] += 1
+    _cam_stats["qualities"].append(float(np.mean(qs)))
+    return Hs, float(np.mean(qs))
+
+
+def _compose(Hs, a):
+    """Cumulative transforms: {t: H} mapping frame-a coords to frame-t coords."""
+    C = {a: np.eye(3)}
+    cur = np.eye(3)
+    for t, H in zip(range(a + 1, a + 1 + len(Hs)), Hs):
+        cur = H @ cur
+        C[t] = cur
+    return C
+
+
+def _apply_H(H, pt):
+    v = H @ np.array([float(pt[0]), float(pt[1]), 1.0])
+    return v[:2]
+
+
+def _predict_next(raw_centers, last_disp, cam_predict, p):
+    """Predict the center at frame p after a flow dropout.
+
+    Prefers the camera-model prediction (a world-static object rides the
+    camera transform), else extrapolates the last measured displacement,
+    else holds the last position.
+    """
+    if cam_predict is not None:
+        c = cam_predict(p)
+        if c is not None:
+            return c
+    last_p = max(raw_centers)
+    if last_disp is not None:
+        return raw_centers[last_p] + last_disp
+    return raw_centers[last_p].copy()
+
+
+def _step_residual(med, cam_pos, p):
+    """Per-step displacement relative to the camera motion, or None."""
+    if cam_pos is None:
+        return None
+    c0, c1 = cam_pos(p - 1), cam_pos(p)
+    if c0 is None or c1 is None:
+        return None
+    return med - (c1 - c0)
+
+
+def _clamp_step(med, cam_pos, p, max_step):
+    """Clamp a per-step displacement in the space where junk is bounded.
+
+    With a camera model the frame may legitimately move fast, so the *residual*
+    relative to the camera motion is clamped (the camera displacement itself
+    passes through untouched). Without one, the absolute displacement is
+    clamped, as before.
+    """
+    res = _step_residual(med, cam_pos, p)
+    if res is not None:
+        cam_d = cam_pos(p) - cam_pos(p - 1)
+        m = float(np.hypot(res[0], res[1]))
+        if m > max_step and m > 0:
+            res = res * (max_step / m)
+        return cam_d + res
+    m = float(np.hypot(med[0], med[1]))
+    if m > max_step and m > 0:
+        med = med * (max_step / m)
+    return med
+
+
+# ---------------------------------------------------------------------------
 # Kalman-filter smoothing (constant-velocity model)
 # ---------------------------------------------------------------------------
 
@@ -343,70 +576,27 @@ class _ConstantVelocityKF:
         return float(self.x[1])
 
 
-def _run_kf_span(raw_centers, a, b, center_a, center_b,
-                 q=1.0, r=4.0, anchor=True):
-    """Smooth a raw optical-flow trajectory with a constant-velocity KF.
-
-    Parameters
-    ----------
-    raw_centers : dict {p: np.array([cx, cy])}
-        Raw center positions from optical flow (may be missing for lost frames).
-    a, b : int
-        Span endpoint frame indices (keyframes).
-    center_a, center_b : np.array([cx, cy])
-        Reviewed endpoint centers (ground truth).
-    q : float
-        Process noise covariance scale.
-    r : float
-        Measurement noise covariance scale.
-    anchor : bool
-        If True, apply endpoint anchoring so the smoothed trajectory starts at
-        ``center_a`` and lands at ``center_b`` (same correction philosophy as the
-        optical-flow interpolator).
-
-    Returns
-    -------
-    dict {p: np.array([cx, cy])} for p in (a, b) — smoothed centers.
-    """
-    kfx = _ConstantVelocityKF(center_a[0], q=q, r=r)
-    kfy = _ConstantVelocityKF(center_a[1], q=q, r=r)
-
-    smoothed = {a: center_a.copy()}
-    for p in range(a + 1, b + 1):
-        kfx.predict()
-        kfy.predict()
-        if p in raw_centers:
-            kfx.update(float(raw_centers[p][0]))
-            kfy.update(float(raw_centers[p][1]))
-        smoothed[p] = np.array([kfx.pos, kfy.pos], dtype=np.float64)
-
-    if anchor:
-        # Endpoint correction identical to the optical-flow anchoring:
-        # blend raw smoothed with a linear correction so endpoints are exact.
-        raw_b = smoothed.get(b, center_a)
-        for p in range(a + 1, b):
-            t = (p - a) / (b - a) if b > a else 0.0
-            raw = smoothed.get(p, center_a + t * (raw_b - center_a))
-            smoothed[p] = raw + t * (center_b - raw_b)
-        smoothed[b] = center_b.copy()
-
-    # Strip endpoints (caller only wants interior frames).
-    return {p: smoothed[p] for p in smoothed if a < p < b}
-
-
 def interpolate_span_kalman(image_folder, frames, a, b, box_a, box_b,
                             min_valid=2, max_step_frac=0.3, flow_method="dis",
-                            kf_q=1.0, kf_r=4.0):
+                            kf_q=1.0, kf_r=4.0, camera_model="none",
+                            gf_quality=0.02, ransac_px=2.0):
     """Kalman-filtered optical flow for one matched pair between keyframe a and b.
 
-    Feeds the same per-frame optical-flow median displacement used by
-    :func:`interpolate_span` into a constant-velocity Kalman filter (one per
-    axis), then applies the same reviewed-endpoint anchoring. Compared to the
-    plain accumulator, the KF denoises jittery flow (acceleration model + gain
-    on the measurement) and extrapolates gracefully through short flow-dropout
-    gaps where the KLT/DIS track is temporarily lost, instead of bailing out.
+    Feeds the per-frame optical-flow median displacement into a
+    constant-velocity Kalman filter (one per axis), then applies the
+    reviewed-endpoint anchoring. Compared to the plain accumulator, the KF
+    denoises jittery flow (gain on the measurement) and extrapolates
+    gracefully through short flow-dropout gaps where the KLT/DIS track is
+    temporarily lost, instead of bailing out.
 
-    Returns {p: [x1,y1,x2,y2]} for interior frames p in (a, b).
+    With ``camera_model="global"`` the KF runs on the *residual* (measured
+    center minus camera-predicted position): the per-frame camera transform
+    absorbs non-linear camera motion, the CV model fits the small smooth
+    residual, and dropouts are extrapolated along the camera path. Lost KLT
+    tracks are re-seeded at the camera-predicted position.
+
+    Returns {p: {"xyxy": [x1,y1,x2,y2], "source": str, "conf": float}} for
+    interior frames p in (a, b).
     """
     gray_a = _read_gray(image_folder, frames[a])
     if gray_a is None:
@@ -418,15 +608,36 @@ def interpolate_span_kalman(image_folder, frames, a, b, box_a, box_b,
     wh_b = np.array([box_b["xywh"][2], box_b["xywh"][3]])
     max_step = max_step_frac * float(min(wh_a[0], wh_a[1]))
 
+    C = None
+    if camera_model == "global":
+        Hs, _cam_q = _build_camera_model(
+            image_folder, frames, a, b, [box_a["xyxy"], box_b["xyxy"]],
+            gf_quality=gf_quality, ransac_px=ransac_px)
+        if Hs is not None:
+            C = _compose(Hs, a)
+
+    def cam_pos(t):
+        if C is None or t not in C:
+            return None
+        return _apply_H(C[t], center_a)
+
+    def to_state(t, center):
+        c = cam_pos(t)
+        return center - c if c is not None else center
+
     cur_pts = None
     if flow_method == "klt":
         cur_pts = _seed_points(gray_a, box_a["xyxy"])
         if cur_pts is None:
             return _linear_span(a, b, box_a, box_b)
 
+    # Raw absolute measurements; missing frames stay as gaps the KF predicts
+    # through.
     raw_centers = {a: center_a.copy()}
     prev_gray = gray_a
     prev_name = frames[a]
+    last_disp = None
+    reseed_streak = 0
     for p in range(a + 1, b + 1):
         curr_gray = _read_gray(image_folder, frames[p])
         if curr_gray is None:
@@ -437,48 +648,88 @@ def interpolate_span_kalman(image_folder, frames, a, b, box_a, box_b,
         if flow_method == "klt":
             next_pts, ok, med = _lk_step(prev_gray, curr_gray, cur_pts)
             if med is not None and int(ok.sum()) >= min_valid:
-                cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
+                cur_pts = next_pts[ok].reshape(-1, 1, 2)
+                reseed_streak = 0
             else:
+                pred = _predict_next(raw_centers, last_disp, cam_pos, p)
+                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh_a))
+                if new_pts is not None and reseed_streak < 2:
+                    cur_pts = new_pts
+                    prev_center = raw_centers[max(raw_centers)]
+                    raw_centers[p] = pred.copy()
+                    last_disp = pred - prev_center
+                    reseed_streak += 1
+                    prev_gray = curr_gray
+                    prev_name = curr_name
+                    continue
                 med = None
         else:
             flow = _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name,
                                        method=flow_method)
             med = _box_median_flow(flow, box_a["xyxy"] if p == a + 1 else
                                    _center_wh_to_xyxy(
-                                       raw_centers[list(raw_centers)[-1]], wh_a))
-            if med is None:
-                continue
+                                        raw_centers[list(raw_centers)[-1]], wh_a))
 
         if med is not None:
-            mag = float(np.hypot(med[0], med[1]))
-            if mag > max_step and mag > 0:
-                med = med * (max_step / mag)
+            med = _clamp_step(med, cam_pos, p, max_step)
             prev_center = raw_centers[list(raw_centers)[-1]]
             raw_centers[p] = prev_center + med
+            last_disp = med
         prev_gray = curr_gray
         prev_name = curr_name
 
-    # Smooth + anchor with the Kalman filter.
-    kf_centers = _run_kf_span(raw_centers, a, b, center_a, center_b,
-                              q=kf_q, r=kf_r, anchor=True)
+    # Constant-velocity KF on the state (residual when a camera model is set,
+    # absolute center otherwise; both start at the reviewed keyframe-a box).
+    init = to_state(a, center_a)
+    kfx = _ConstantVelocityKF(float(init[0]), q=kf_q, r=kf_r)
+    kfy = _ConstantVelocityKF(float(init[1]), q=kf_q, r=kf_r)
+    state = {a: init.copy()}
+    for p in range(a + 1, b + 1):
+        kfx.predict()
+        kfy.predict()
+        if p in raw_centers:
+            z = to_state(p, raw_centers[p])
+            kfx.update(float(z[0]))
+            kfy.update(float(z[1]))
+        state[p] = np.array([kfx.pos, kfy.pos], dtype=np.float64)
+
+    # Endpoint anchoring in state space (exact at both reviewed keyframes).
+    s_b_raw = state[b]
+    s_b_tgt = to_state(b, center_b)
+    for p in range(a + 1, b):
+        t = (p - a) / (b - a) if b > a else 0.0
+        state[p] = state[p] + t * (s_b_tgt - s_b_raw)
+    state[b] = s_b_tgt.copy()
+
+    n_interior = max(1, b - a - 1)
+    n_meas = sum(1 for p in range(a + 1, b) if p in raw_centers)
+    q_meas = n_meas / n_interior
 
     result = {}
     for p in range(a + 1, b):
-        center = kf_centers.get(p, center_a)
+        c = cam_pos(p)
+        center = state[p] + c if c is not None else state[p]
         wh = wh_a + (wh_b - wh_a) * ((p - a) / (b - a) if b > a else 0.0)
-        result[p] = _center_wh_to_xyxy(center, wh)
+        conf = (0.9 if p in raw_centers else 0.6) * q_meas
+        result[p] = {"xyxy": _center_wh_to_xyxy(center, wh),
+                     "source": "kalman", "conf": round(float(conf), 3)}
     return result
 
 
 def track_forward_kalman(image_folder, frames, a, b, box_a,
                          min_valid=2, max_step_frac=0.3, flow_method="dis",
-                         kf_q=1.0, kf_r=4.0):
+                         kf_q=1.0, kf_r=4.0, camera_model="none",
+                         gf_quality=0.02, ransac_px=2.0):
     """Forward Kalman-filtered tracking for an unmatched-at-a box.
 
-    Same measurement pipeline as :func:`track_forward`, but the center is
-    smoothed by a constant-velocity KF which keeps predicting (extrapolating
-    with the learned velocity) through short flow-dropout gaps instead of
-    stopping immediately. Emits boxes for p in (a, b). Size stays at box_a's.
+    The measured centers are smoothed by a constant-velocity KF which keeps
+    predicting (extrapolating with the learned velocity) through short
+    flow-dropout gaps instead of stopping immediately. With
+    ``camera_model="global"`` the KF runs on the residual relative to the
+    camera-predicted position, so dropouts ride the camera path. Emits boxes
+    for p in (a, b). Size stays at box_a's.
+
+    Returns {p: {"xyxy": [x1,y1,x2,y2], "source": str, "conf": float}}.
     """
     gray_a = _read_gray(image_folder, frames[a])
     if gray_a is None:
@@ -487,10 +738,34 @@ def track_forward_kalman(image_folder, frames, a, b, box_a,
     center = box_a["center"].copy()
     wh = np.array([box_a["xywh"][2], box_a["xywh"][3]])
     max_step = max_step_frac * float(min(wh[0], wh[1]))
-    kfx = _ConstantVelocityKF(center[0], q=kf_q, r=kf_r)
-    kfy = _ConstantVelocityKF(center[1], q=kf_q, r=kf_r)
+
+    C = None
+    if camera_model == "global":
+        Hs, _q = _build_camera_model(image_folder, frames, a, b,
+                                     [box_a["xyxy"]],
+                                     gf_quality=gf_quality, ransac_px=ransac_px)
+        if Hs is not None:
+            C = _compose(Hs, a)
+
+    def cam_pos(t):
+        if C is None or t not in C:
+            return None
+        return _apply_H(C[t], center)
+
+    def to_state(t, c):
+        cp = cam_pos(t)
+        return c - cp if cp is not None else c
+
+    def from_state(t, s):
+        cp = cam_pos(t)
+        return s + cp if cp is not None else s
+
+    init = to_state(a, center)
+    kfx = _ConstantVelocityKF(float(init[0]), q=kf_q, r=kf_r)
+    kfy = _ConstantVelocityKF(float(init[1]), q=kf_q, r=kf_r)
 
     result = {}
+    raw = {a: center.copy()}
     prev_gray = gray_a
     prev_name = frames[a]
     cur_pts = None
@@ -499,50 +774,76 @@ def track_forward_kalman(image_folder, frames, a, b, box_a,
         if cur_pts is None:
             return {}
 
+    last_disp = None
+    reseed_streak = 0
     for p in range(a + 1, b):
         curr_gray = _read_gray(image_folder, frames[p])
         if curr_gray is None:
             kfx.predict(); kfy.predict()
-            result[p] = _center_wh_to_xyxy(np.array([kfx.pos, kfy.pos]), wh)
+            st = np.array([kfx.pos, kfy.pos])
+            result[p] = {"xyxy": _center_wh_to_xyxy(from_state(p, st), wh),
+                         "source": "kalman", "conf": 0.45}
             continue
         curr_name = frames[p]
 
         med = None
+        measured_pred = None
         if flow_method == "klt":
             next_pts, ok, m = _lk_step(prev_gray, curr_gray, cur_pts)
             if m is not None and int(ok.sum()) >= min_valid:
                 med = m
-                cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
+                cur_pts = next_pts[ok].reshape(-1, 1, 2)
+                reseed_streak = 0
+            else:
+                pred = _predict_next(raw, last_disp, cam_pos, p)
+                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh))
+                if new_pts is not None and reseed_streak < 2:
+                    cur_pts = new_pts
+                    prev_center = raw[max(raw)]
+                    raw[p] = pred.copy()
+                    last_disp = pred - prev_center
+                    reseed_streak += 1
+                    measured_pred = pred
         else:
             flow = _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name,
                                        method=flow_method)
-            med = _box_median_flow(flow, _center_wh_to_xyxy(center, wh))
+            med = _box_median_flow(flow, _center_wh_to_xyxy(raw[max(raw)], wh))
 
         kfx.predict(); kfy.predict()
         if med is not None:
-            mag = float(np.hypot(med[0], med[1]))
-            if mag > float(max(wh)):
+            res = _step_residual(med, cam_pos, p)
+            junk = res if res is not None else med
+            if float(np.hypot(junk[0], junk[1])) > float(max(wh)):
                 break  # jumped to junk
-            if mag > max_step and mag > 0:
-                med = med * (max_step / mag)
-            new_center = np.array([kfx.pos, kfy.pos]) + med
-            kfx.update(float(new_center[0]))
-            kfy.update(float(new_center[1]))
-            center = np.array([kfx.pos, kfy.pos])
+            med = _clamp_step(med, cam_pos, p, max_step)
+            raw[p] = raw[max(raw)] + med
+            last_disp = med
+            z = to_state(p, raw[p])
+            kfx.update(float(z[0]))
+            kfy.update(float(z[1]))
+            conf = 0.6
+        elif measured_pred is not None:
+            z = to_state(p, measured_pred)
+            kfx.update(float(z[0]))
+            kfy.update(float(z[1]))
+            conf = 0.5
         else:
-            center = np.array([kfx.pos, kfy.pos])
-
-        result[p] = _center_wh_to_xyxy(center, wh)
+            conf = 0.45
+        st = np.array([kfx.pos, kfy.pos])
+        result[p] = {"xyxy": _center_wh_to_xyxy(from_state(p, st), wh),
+                     "source": "kalman", "conf": conf}
         prev_gray = curr_gray
         prev_name = curr_name
     return result
 
 
 def interpolate_span(image_folder, frames, a, b, box_a, box_b,
-                     min_valid=2, max_step_frac=0.3, flow_method="klt"):
+                     min_valid=2, max_step_frac=0.3, flow_method="klt",
+                     camera_model="none", gf_quality=0.02, ransac_px=2.0):
     """Anchored optical flow for one matched pair between keyframe a and b.
 
-    Returns {p: [x1,y1,x2,y2]} for interior frames p in (a, b).
+    Returns {p: {"xyxy": [x1,y1,x2,y2], "source": str, "conf": float}} for
+    interior frames p in (a, b).
 
     Per-step displacement is clamped to ``max_step_frac * min(box_a w,h)`` so
     unreliable features cannot run away; the endpoint anchor then guarantees
@@ -550,20 +851,45 @@ def interpolate_span(image_folder, frames, a, b, box_a, box_b,
     flow has nothing real to follow, the clamped raw trajectory stays near
     box_a and the anchor term reduces the result to ~linear interpolation.
 
+    With ``camera_model="global"`` a per-frame camera transform is estimated
+    for the span and the anchor correction is applied to the *residual*
+    (center minus camera-predicted position) instead of the absolute
+    trajectory, so non-linear camera motion is absorbed by the transform chain
+    and lost KLT tracks are re-seeded at the camera-predicted position.
+
     Args:
-        flow_method: "klt" (sparse Lucas-Kanade, default), "dis" (dense
-            inverse search — handles large displacements from handheld camera
-            shake), or "farneback" (dense, more accurate but slower).
+        flow_method: "klt" (sparse Lucas-Kanade), "dis" (dense inverse
+            search — handles large displacements from handheld camera shake)
+            or "farneback" (dense, more accurate but slower).
+        camera_model: "none" (classic absolute flow) or "global" (per-frame
+            RANSAC similarity transform).
     """
     gray_a = _read_gray(image_folder, frames[a])
     if gray_a is None:
-        return {}
+        return _linear_span(a, b, box_a, box_b)
 
     center_a = box_a["center"].copy()
     center_b = box_b["center"].copy()
     wh_a = np.array([box_a["xywh"][2], box_a["xywh"][3]])
     wh_b = np.array([box_b["xywh"][2], box_b["xywh"][3]])
     max_step = max_step_frac * float(min(wh_a[0], wh_a[1]))
+
+    C = None
+    if camera_model == "global":
+        Hs, _cam_q = _build_camera_model(
+            image_folder, frames, a, b, [box_a["xyxy"], box_b["xyxy"]],
+            gf_quality=gf_quality, ransac_px=ransac_px)
+        if Hs is not None:
+            C = _compose(Hs, a)
+
+    def cam_pos(t):
+        if C is None or t not in C:
+            return None
+        return _apply_H(C[t], center_a)
+
+    def to_res(t, center):
+        c = cam_pos(t)
+        return center - c if c is not None else center
 
     # KLT needs seed points; dense flow doesn't.
     cur_pts = None
@@ -576,6 +902,8 @@ def interpolate_span(image_folder, frames, a, b, box_a, box_b,
     prev_gray = gray_a
     prev_name = frames[a]
     lost = False
+    last_disp = None
+    reseed_streak = 0
     for p in range(a + 1, b + 1):
         curr_gray = _read_gray(image_folder, frames[p])
         if curr_gray is None:
@@ -585,63 +913,97 @@ def interpolate_span(image_folder, frames, a, b, box_a, box_b,
 
         if flow_method == "klt":
             next_pts, ok, med = _lk_step(prev_gray, curr_gray, cur_pts)
-            if med is None or int(ok.sum()) < min_valid:
+            if med is not None and int(ok.sum()) >= min_valid:
+                cur_pts = next_pts[ok].reshape(-1, 1, 2)
+                reseed_streak = 0
+            else:
+                # Track failed: re-seed at the predicted position (camera
+                # model preferred) so a single bad frame does not kill the span.
+                pred = _predict_next(raw_centers, last_disp, cam_pos, p)
+                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh_a))
+                if new_pts is not None and reseed_streak < 2:
+                    cur_pts = new_pts
+                    prev_center = raw_centers[max(raw_centers)]
+                    raw_centers[p] = pred.copy()
+                    last_disp = pred - prev_center
+                    reseed_streak += 1
+                    prev_gray = curr_gray
+                    prev_name = curr_name
+                    continue
                 lost = True
                 break
-            cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
         else:
             flow = _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name,
                                        method=flow_method)
             med = _box_median_flow(flow, box_a["xyxy"] if p == a + 1 else
                                    _center_wh_to_xyxy(
-                                       raw_centers[list(raw_centers)[-1]], wh_a))
+                                        raw_centers[list(raw_centers)[-1]], wh_a))
             if med is None:
                 lost = True
                 break
 
-        # Clamp per-step displacement to keep unreliable features bounded.
-        mag = float(np.hypot(med[0], med[1]))
-        if mag > max_step and mag > 0:
-            med = med * (max_step / mag)
+        # Clamp the step (residual vs camera when a camera model is set).
+        med = _clamp_step(med, cam_pos, p, max_step)
         # Accumulate the per-step median displacement into the raw trajectory.
         prev_center = raw_centers[list(raw_centers)[-1]]
         raw_centers[p] = prev_center + med
+        last_disp = med
         prev_gray = curr_gray
         prev_name = curr_name
+
+    n_interior = max(1, b - a - 1)
+    n_meas = sum(1 for p in range(a + 1, b) if p in raw_centers)
+    q_meas = n_meas / n_interior
+
+    def emit_frame(p, center, source, conf):
+        t = (p - a) / (b - a) if b > a else 0.0
+        wh = wh_a + (wh_b - wh_a) * t
+        return {"xyxy": _center_wh_to_xyxy(center, wh), "source": source,
+                "conf": round(float(conf), 3)}
 
     result = {}
     if lost:
         # Use the raw flow up to where the track was lost, then linearly
-        # bridge from the last raw center to the reviewed center_b.
+        # bridge (in residual space) from the last raw center to center_b.
         last_p = max(raw_centers)
-        last_raw = raw_centers[last_p]
+        r_last = to_res(last_p, raw_centers[last_p])
+        r_b = to_res(b, center_b)
         for p in range(a + 1, b):
             if p <= last_p:
-                center = raw_centers[p]
+                r = to_res(p, raw_centers[p])
+                conf = 0.9 * q_meas
             else:
                 t = (p - last_p) / (b - last_p) if b > last_p else 1.0
-                center = last_raw + t * (center_b - last_raw)
-            wh = wh_a + (wh_b - wh_a) * ((p - a) / (b - a) if b > a else 0.0)
-            result[p] = _center_wh_to_xyxy(center, wh)
+                r = r_last + t * (r_b - r_last)
+                conf = 0.35 * q_meas
+            center = r if C is None else cam_pos(p) + r
+            result[p] = emit_frame(p, center, "flow", conf)
         return result
 
-    # Not lost: anchored correction using raw endpoint at b.
-    raw_b = raw_centers.get(b, center_a)
+    # Not lost: anchored correction using raw endpoint at b (residual space).
+    r_b_raw = to_res(b, raw_centers[b])
+    r_b_tgt = to_res(b, center_b)
     for p in range(a + 1, b):
         t = (p - a) / (b - a) if b > a else 0.0
-        raw = raw_centers.get(p, center_a + t * (raw_b - center_a))
-        center = raw + t * (center_b - raw_b)
-        wh = wh_a + (wh_b - wh_a) * t
-        result[p] = _center_wh_to_xyxy(center, wh)
+        r = to_res(p, raw_centers[p])
+        r = r + t * (r_b_tgt - r_b_raw)
+        center = r if C is None else cam_pos(p) + r
+        result[p] = emit_frame(p, center, "flow", 0.9 * q_meas)
     return result
 
 
 def track_forward(image_folder, frames, a, b, box_a,
-                   min_valid=2, max_step_frac=0.3, flow_method="klt"):
-    """Forward optical flow for an unmatched-at-a box. Returns {p: [x1,y1,x2,y2]}.
+                    min_valid=2, max_step_frac=0.3, flow_method="klt",
+                    camera_model="none", gf_quality=0.02, ransac_px=2.0):
+    """Forward optical flow for an unmatched-at-a box.
 
     Emits boxes until the track is lost or the next keyframe is reached. Size
-    stays at box_a's; per-step displacement is clamped to bound drift.
+    stays at box_a's; per-step displacement is clamped to bound drift. With
+    ``camera_model="global"`` lost KLT tracks are re-seeded at the
+    camera-predicted position instead of stopping.
+
+    Returns {p: {"xyxy": [x1,y1,x2,y2], "source": str, "conf": float}} for
+    p in (a, b).
     """
     gray_a = _read_gray(image_folder, frames[a])
     if gray_a is None:
@@ -650,7 +1012,22 @@ def track_forward(image_folder, frames, a, b, box_a,
     center = box_a["center"].copy()
     wh = np.array([box_a["xywh"][2], box_a["xywh"][3]])
     max_step = max_step_frac * float(min(wh[0], wh[1]))
+
+    C = None
+    if camera_model == "global":
+        Hs, _q = _build_camera_model(image_folder, frames, a, b,
+                                     [box_a["xyxy"]],
+                                     gf_quality=gf_quality, ransac_px=ransac_px)
+        if Hs is not None:
+            C = _compose(Hs, a)
+
+    def cam_pos(t):
+        if C is None or t not in C:
+            return None
+        return _apply_H(C[t], center)
+
     result = {}
+    raw = {a: center.copy()}
     prev_gray = gray_a
     prev_name = frames[a]
 
@@ -660,6 +1037,8 @@ def track_forward(image_folder, frames, a, b, box_a,
         if cur_pts is None:
             return {}
 
+    last_disp = None
+    reseed_streak = 0
     for p in range(a + 1, b):  # stop before the next keyframe (it's reviewed)
         curr_gray = _read_gray(image_folder, frames[p])
         if curr_gray is None:
@@ -668,27 +1047,76 @@ def track_forward(image_folder, frames, a, b, box_a,
 
         if flow_method == "klt":
             next_pts, ok, med = _lk_step(prev_gray, curr_gray, cur_pts)
-            if med is None or int(ok.sum()) < min_valid:
+            if med is not None and int(ok.sum()) >= min_valid:
+                cur_pts = next_pts[ok].reshape(-1, 1, 2)
+                reseed_streak = 0
+            else:
+                pred = _predict_next(raw, last_disp, cam_pos, p)
+                new_pts = _seed_points(curr_gray, _center_wh_to_xyxy(pred, wh))
+                if new_pts is not None and reseed_streak < 2:
+                    cur_pts = new_pts
+                    prev_center = raw[max(raw)]
+                    raw[p] = pred.copy()
+                    last_disp = pred - prev_center
+                    reseed_streak += 1
+                    result[p] = {"xyxy": _center_wh_to_xyxy(pred, wh),
+                                 "source": "flow", "conf": 0.5}
+                    prev_gray = curr_gray
+                    prev_name = curr_name
+                    continue
                 break
-            cur_pts = next_pts[ok].reshape(-1, 1, 2) if int(ok.sum()) >= 1 else cur_pts
         else:
             flow = _compute_dense_flow(prev_gray, curr_gray, prev_name, curr_name,
                                        method=flow_method)
-            med = _box_median_flow(flow, _center_wh_to_xyxy(center, wh))
+            med = _box_median_flow(flow, _center_wh_to_xyxy(raw[max(raw)], wh))
             if med is None:
                 break
 
-        mag = float(np.hypot(med[0], med[1]))
+        res = _step_residual(med, cam_pos, p)
+        junk = res if res is not None else med
         # A step larger than the whole box means the track jumped to junk: stop.
-        if mag > float(max(wh)):
+        if float(np.hypot(junk[0], junk[1])) > float(max(wh)):
             break
-        if mag > max_step and mag > 0:
-            med = med * (max_step / mag)
-        center = center + med
+        med = _clamp_step(med, cam_pos, p, max_step)
+        center_p = raw[max(raw)] + med
+        raw[p] = center_p
+        last_disp = med
         prev_gray = curr_gray
         prev_name = curr_name
-        result[p] = _center_wh_to_xyxy(center, wh)
+        result[p] = {"xyxy": _center_wh_to_xyxy(center_p, wh),
+                     "source": "flow", "conf": 0.7}
     return result
+
+
+def track_backward(image_folder, frames, a, b, box_b,
+                   min_valid=2, max_step_frac=0.3, flow_method="klt",
+                   camera_model="none", gf_quality=0.02, ransac_px=2.0):
+    """Backward optical flow for a box that first appears at keyframe b.
+
+    Runs :func:`track_forward` on the reversed frame sequence so a new object
+    is tracked backwards from keyframe b toward keyframe a (emits boxes for
+    p in (a, b)).
+    """
+    rev = frames[:b + 1][::-1]
+    res = track_forward(image_folder, rev, 0, b - a, box_b,
+                        min_valid=min_valid, max_step_frac=max_step_frac,
+                        flow_method=flow_method, camera_model=camera_model,
+                        gf_quality=gf_quality, ransac_px=ransac_px)
+    return {b - p: v for p, v in res.items()}
+
+
+def track_backward_kalman(image_folder, frames, a, b, box_b,
+                          min_valid=2, max_step_frac=0.3, flow_method="dis",
+                          kf_q=1.0, kf_r=4.0, camera_model="none",
+                          gf_quality=0.02, ransac_px=2.0):
+    """Kalman-filtered :func:`track_backward` (see its docstring)."""
+    rev = frames[:b + 1][::-1]
+    res = track_forward_kalman(image_folder, rev, 0, b - a, box_b,
+                               min_valid=min_valid, max_step_frac=max_step_frac,
+                               flow_method=flow_method, kf_q=kf_q, kf_r=kf_r,
+                               camera_model=camera_model,
+                               gf_quality=gf_quality, ransac_px=ransac_px)
+    return {b - p: v for p, v in res.items()}
 
 
 def _linear_span(a, b, box_a, box_b):
@@ -701,7 +1129,8 @@ def _linear_span(a, b, box_a, box_b):
         t = (p - a) / (b - a) if b > a else 0.0
         center = ca + t * (cb - ca)
         wh = wa + t * (wb - wa)
-        result[p] = _center_wh_to_xyxy(center, wh)
+        result[p] = {"xyxy": _center_wh_to_xyxy(center, wh),
+                     "source": "linear", "conf": 0.15}
     return result
 
 
@@ -782,10 +1211,27 @@ def main():
     parser.add_argument("--kf-r", type=float, default=4.0,
                         help="Kalman measurement-noise scale (default: 4.0). "
                              "Only used with --interp-method kalman.")
-    parser.add_argument("--device", default="cuda",
-                        help="Unused placeholder (KLT runs on CPU). Kept for "
-                             "pipeline consistency with other scripts.")
+    parser.add_argument("--camera-model", choices=["none", "global"],
+                        default=None,
+                        help="Camera-motion handling: 'none' (classic absolute "
+                             "flow + linear anchor, default) or 'global' "
+                             "(per-frame RANSAC similarity transform; "
+                             "tracking/anchoring runs on the residual relative "
+                             "to the camera-predicted position, absorbing "
+                             "non-linear camera shake). Accuracy test on the "
+                             "re-reviewed MTR 4k frames: no net gain on this "
+                             "fisheye camera (18.5px vs 16.4px median center "
+                             "error), so it stays off by default; use 'global' "
+                             "for pinhole cameras with strong shake.")
+    parser.add_argument("--gf-quality", type=float, default=0.02,
+                        help="goodFeaturesToTrack quality level for the global "
+                             "camera-transform estimate (default: 0.02).")
+    parser.add_argument("--ransac-reproj-px", type=float, default=2.0,
+                        help="RANSAC reprojection threshold (px) for the global "
+                             "camera-transform estimate (default: 2.0).")
     args = parser.parse_args()
+
+    camera_model = args.camera_model if args.camera_model is not None else "none"
 
     image_folder = Path(args.image_folder)
     with open(args.manifest, "r", encoding="utf-8") as f:
@@ -819,8 +1265,12 @@ def main():
     spans = list(zip(keyframe_idxs[:-1], keyframe_idxs[1:]))
     # For each span, compute matches and union the ann_ids.
     span_matches = {}  # (a,b) -> list of (idx_a, idx_b, dist)
-    span_interp = {}   # (a,b) -> {(box_a_idx): {p: xyxy}} for matched pairs
-    span_forward = {}  # (a,b) -> {(box_a_idx): {p: xyxy}} for unmatched-at-a
+    span_interp = {}   # (a,b) -> {(box_a_idx): {p: entry}} for matched pairs
+    span_forward = {}  # (a,b) -> {(box_a_idx): {p: entry}} for unmatched-at-a
+    span_backward = {} # (a,b) -> {(box_b_idx): {p: entry}} for unmatched-at-b
+
+    cam_kwargs = dict(camera_model=camera_model, gf_quality=args.gf_quality,
+                      ransac_px=args.ransac_reproj_px)
 
     for (a, b) in spans:
         ba = boxes_by_frame.get(a, [])
@@ -837,11 +1287,12 @@ def main():
                     image_folder, frames, a, b, ba[i], bb[j],
                     max_step_frac=args.max_step_frac,
                     flow_method=args.flow_method,
-                    kf_q=args.kf_q, kf_r=args.kf_r)
+                    kf_q=args.kf_q, kf_r=args.kf_r, **cam_kwargs)
             else:
                 interp[i] = interpolate_span(image_folder, frames, a, b, ba[i], bb[j],
                                              max_step_frac=args.max_step_frac,
-                                             flow_method=args.flow_method)
+                                             flow_method=args.flow_method,
+                                             **cam_kwargs)
         span_interp[(a, b)] = interp
         # Forward-track unmatched-at-a boxes.
         fwd = {}
@@ -851,12 +1302,28 @@ def main():
                     image_folder, frames, a, b, ba[i],
                     max_step_frac=args.max_step_frac,
                     flow_method=args.flow_method,
-                    kf_q=args.kf_q, kf_r=args.kf_r)
+                    kf_q=args.kf_q, kf_r=args.kf_r, **cam_kwargs)
             else:
                 fwd[i] = track_forward(image_folder, frames, a, b, ba[i],
                                        max_step_frac=args.max_step_frac,
-                                       flow_method=args.flow_method)
+                                       flow_method=args.flow_method,
+                                       **cam_kwargs)
         span_forward[(a, b)] = fwd
+        # Back-track unmatched-at-b boxes (objects appearing at keyframe b).
+        back = {}
+        for j in un_b:
+            if args.interp_method == "kalman":
+                back[j] = track_backward_kalman(
+                    image_folder, frames, a, b, bb[j],
+                    max_step_frac=args.max_step_frac,
+                    flow_method=args.flow_method,
+                    kf_q=args.kf_q, kf_r=args.kf_r, **cam_kwargs)
+            else:
+                back[j] = track_backward(image_folder, frames, a, b, bb[j],
+                                         max_step_frac=args.max_step_frac,
+                                         flow_method=args.flow_method,
+                                         **cam_kwargs)
+        span_backward[(a, b)] = back
 
     # Assign track ids (0..N-1) in first-seen order across all reviewed boxes.
     all_ann_ids = [b["ann_id"] for fidx in sorted(boxes_by_frame)
@@ -875,7 +1342,7 @@ def main():
             "height": H,
         })
 
-    def emit(p, xyxy, category_id, tid):
+    def emit(p, xyxy, category_id, tid, source, confidence):
         nonlocal ann_id
         x1, y1, x2, y2 = [float(v) for v in xyxy]
         x1 = max(0.0, min(x1, W)); x2 = max(0.0, min(x2, W))
@@ -891,39 +1358,52 @@ def main():
             "area": w * h,
             "iscrowd": 0,
             "track_id": int(tid),
+            "source": str(source),
+            "confidence": round(float(confidence), 3),
         })
         ann_id += 1
 
     # Emit boxes per frame.
-    keyframe_set = set(keyframe_idxs)
+    keyframe_list = sorted(keyframe_idxs)
+    keyframe_set = set(keyframe_list)
     for p in range(total):
         if p in keyframe_set:
             # Reviewed boxes verbatim.
-            for b in boxes_by_frame.get(p, []):
-                tid = track_ids[b["ann_id"]]
-                emit(p, b["xyxy"], b["category_id"], tid)
+            for box in boxes_by_frame.get(p, []):
+                tid = track_ids[box["ann_id"]]
+                emit(p, box["xyxy"], box["category_id"], tid, "keyframe", 1.0)
             continue
-        # Find surrounding keyframes.
-        prev_kf = max((k for k in keyframe_idxs if k <= p), default=None)
-        next_kf = min((k for k in keyframe_idxs if k > p), default=None)
+        # Find surrounding keyframes (bisect: keyframe_list is sorted).
+        i = bisect.bisect_left(keyframe_list, p)
+        next_kf = keyframe_list[i] if i < len(keyframe_list) else None
+        prev_kf = keyframe_list[i - 1] if i > 0 else None
         if prev_kf is not None and next_kf is not None:
             ba = boxes_by_frame.get(prev_kf, [])
+            bb = boxes_by_frame.get(next_kf, [])
             interp = span_interp.get((prev_kf, next_kf), {})
             fwd = span_forward.get((prev_kf, next_kf), {})
-            for i, boxes_p in interp.items():
+            back = span_backward.get((prev_kf, next_kf), {})
+            for i2, boxes_p in interp.items():
                 if p in boxes_p:
-                    tid = track_ids[ba[i]["ann_id"]]
-                    emit(p, boxes_p[p], ba[i]["category_id"], tid)
-            for i, boxes_p in fwd.items():
+                    e = boxes_p[p]
+                    emit(p, e["xyxy"], ba[i2]["category_id"],
+                         track_ids[ba[i2]["ann_id"]], e["source"], e["conf"])
+            for i2, boxes_p in fwd.items():
                 if p in boxes_p:
-                    tid = track_ids[ba[i]["ann_id"]]
-                    emit(p, boxes_p[p], ba[i]["category_id"], tid)
+                    e = boxes_p[p]
+                    emit(p, e["xyxy"], ba[i2]["category_id"],
+                         track_ids[ba[i2]["ann_id"]], e["source"], e["conf"])
+            for j2, boxes_p in back.items():
+                if p in boxes_p:
+                    e = boxes_p[p]
+                    emit(p, e["xyxy"], bb[j2]["category_id"],
+                         track_ids[bb[j2]["ann_id"]], e["source"], e["conf"])
         elif prev_kf is not None and next_kf is None:
             # Tail after the last keyframe.
             if args.tail_fill == "hold":
-                for b in boxes_by_frame.get(prev_kf, []):
-                    tid = track_ids[b["ann_id"]]
-                    emit(p, b["xyxy"], b["category_id"], tid)
+                for box in boxes_by_frame.get(prev_kf, []):
+                    tid = track_ids[box["ann_id"]]
+                    emit(p, box["xyxy"], box["category_id"], tid, "hold", 0.4)
         # Frames before the first keyframe (prev_kf is None) stay empty.
 
     out = {
@@ -938,6 +1418,11 @@ def main():
 
     print(f"Wrote COCO for {total} frames, {len(annotations_out)} boxes -> {out_path}")
     print(f"  Keyframes: {len(keyframe_idxs)}, spans: {len(spans)}")
+    if camera_model == "global" and _cam_stats["attempts"]:
+        q = (float(np.mean(_cam_stats["qualities"]))
+             if _cam_stats["qualities"] else 0.0)
+        print(f"  Camera model: {_cam_stats['ok']}/{_cam_stats['attempts']} spans "
+              f"estimated, mean inlier ratio {q:.2f}")
 
     if args.vis_output:
         vis_dir = Path(args.vis_output)
@@ -958,7 +1443,8 @@ def main():
                 color = cat_colors.get(a["category_id"], (0, 255, 255))
                 cv2.rectangle(img, (int(x), int(y)), (int(x + w), int(y + h)),
                               color, 2)
-                cv2.putText(img, f"id{a['track_id']}", (int(x), max(0, int(y) - 5)),
+                cv2.putText(img, f"id{a['track_id']} c{a.get('confidence', 1.0):.2f}",
+                            (int(x), max(0, int(y) - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             vp = vis_dir / frames[p]
             cv2.imwrite(str(vp), img)

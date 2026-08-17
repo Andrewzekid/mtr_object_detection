@@ -358,7 +358,7 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | Script | Purpose | Key inputs | Outputs |
 |-------|---------|------------|---------|
 | `12_extract_keyframes.py` | Select every Nth frame as a keyframe + write a manifest for the interpolator. | `--image-folder`/`--video`, `--output-dir`, `--every`, `--mode` | Keyframe images + `keyframe_manifest.json` |
-| `13_interpolate_tracks.py` | Propagate reviewed keyframe boxes to every frame via anchored KLT optical flow. | `--keyframes-coco`, `--manifest`, `--image-folder`, `--output-coco`, `--match-max-dist` | COCO annotations for every frame (+ optional vis) |
+| `13_interpolate_tracks.py` | Propagate reviewed keyframe boxes to every frame via anchored optical flow. An optional per-frame RANSAC camera model (`--camera-model global`) can absorb non-linear camera shake (tracking/anchoring on the residual, KLT dropouts re-seeded); off by default — accuracy testing on the re-reviewed MTR 4k frames showed no net gain on this fisheye camera. New objects at a keyframe are back-tracked. Each output box carries a `source`/`confidence` provenance field. | `--keyframes-coco`, `--manifest`, `--image-folder`, `--output-coco`, `--match-max-dist`, `--flow-method`, `--interp-method`, `--camera-model` | COCO annotations for every frame (+ optional vis) |
 
 ### Data prep & conversion
 
