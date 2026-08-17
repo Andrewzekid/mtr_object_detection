@@ -3207,6 +3207,13 @@ class ReviewWindow(QMainWindow):
             "UI hide / mask opacity).")
         act_cfg.triggered.connect(self._load_config_dialog)
         m.addAction(act_cfg)
+        # A visible Config button in the menu bar's top-right corner.
+        cfg_btn = QPushButton("⚙ Config")
+        cfg_btn.setToolTip(
+            "Load a JSON config at runtime (interpolation / SAM3 / "
+            "UI hide / mask opacity).")
+        cfg_btn.clicked.connect(self._load_config_dialog)
+        self.menuBar().setCornerWidget(cfg_btn)
 
     def _switch_source(self, new_index, out_json: str, label: str) -> None:
         """Shared source-switch: save the current session, swap the frame
