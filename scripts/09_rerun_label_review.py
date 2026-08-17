@@ -135,6 +135,12 @@ Qt.Key_0 = Qt.Key.Key_0  # type: ignore[attr-defined]
 Qt.Key_M = Qt.Key.Key_M  # type: ignore[attr-defined]
 Qt.Key_R = Qt.Key.Key_R  # type: ignore[attr-defined]
 Qt.Key_Shift = Qt.Key.Key_Shift  # type: ignore[attr-defined]
+Qt.Key_Space = Qt.Key.Key_Space  # type: ignore[attr-defined]
+Qt.Key_F = Qt.Key.Key_F  # type: ignore[attr-defined]
+Qt.Key_Z = Qt.Key.Key_Z  # type: ignore[attr-defined]
+Qt.Key_Control = Qt.Key.Key_Control  # type: ignore[attr-defined]
+Qt.Key_Y = Qt.Key.Key_Y  # type: ignore[attr-defined]
+Qt.Key_U = Qt.Key.Key_U  # type: ignore[attr-defined]
 from PyQt6.QtGui import QPen, QColor, QPainter, QPixmap, QFont, QTransform
 # PyQt6 scoped-enum shims for QtGui
 QPainter.Antialiasing = QPainter.RenderHint.Antialiasing  # type: ignore[attr-defined]
@@ -820,6 +826,8 @@ class CanvasWidget(QWidget):
     cat_pick_requested = pyqtSignal(float, float, float, float)  # pending rect
     resegment_selected = pyqtSignal()  # R key on selected box
     toggle_masks = pyqtSignal()       # M key
+    play_pause = pyqtSignal()          # Space key
+    fit_view = pyqtSignal()            # F key
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1147,6 +1155,10 @@ class CanvasWidget(QWidget):
             self.toggle_masks.emit()
         elif k == Qt.Key_R:
             self.resegment_selected.emit()
+        elif k == Qt.Key_Space:
+            self.play_pause.emit()
+        elif k == Qt.Key_F:
+            self._fit_to_view()
         elif k in (Qt.Key_Plus, Qt.Key_Equal):
             self._scale = min(40.0, self._scale * 1.2); self.update()
         elif k == Qt.Key_Minus:
@@ -1168,6 +1180,8 @@ class SidePanel(QWidget):
     run_sam3_clicked = pyqtSignal()      # "Run SAM3 (all)" button
     toggle_masks_clicked = pyqtSignal()  # "Masks: on/off" button
     resegment_clicked = pyqtSignal()     # "Re-segment selected" button
+    play_pause_clicked = pyqtSignal()     # "▶ / ⏸" button
+    play_speed_changed = pyqtSignal(int)  # ms-per-frame
 
     def __init__(self, coco: CocoState, parent=None):
         super().__init__(parent)
@@ -1182,6 +1196,23 @@ class SidePanel(QWidget):
         layout.addWidget(self.cat_list, 1)
         self.cat_list.itemClicked.connect(self._on_cat_clicked)
         self._rebuild_cat_list()
+
+        # Frame playback controls: play/pause + speed.
+        play_row = QHBoxLayout()
+        self.btn_play = QPushButton("▶ Play")
+        self.btn_play.setCheckable(True)
+        self.btn_play.setToolTip("Play / pause the frame timeline (Space).")
+        self.btn_play.clicked.connect(self._on_play_clicked)
+        play_row.addWidget(self.btn_play)
+        play_row.addWidget(QLabel("speed:"))
+        self.combo_speed = QtWidgets.QComboBox()
+        for label, ms in [("1x", 1000), ("2x", 500), ("5x", 200),
+                          ("10x", 100), ("0.5x", 2000)]:
+            self.combo_speed.addItem(label, ms)
+        self.combo_speed.setCurrentIndex(0)  # 1x default
+        self.combo_speed.currentIndexChanged.connect(self._on_speed_changed)
+        play_row.addWidget(self.combo_speed, 1)
+        layout.addLayout(play_row)
 
         # SAM3 controls
         sam_layout = QHBoxLayout()
@@ -1220,10 +1251,27 @@ class SidePanel(QWidget):
             "D = delete sel &nbsp; A = draw &nbsp; N = next &nbsp; B = back<br>"
             "X = discard all &nbsp; S = save+quit &nbsp; Q = quit<br>"
             "0-9 = pick cat &nbsp; + / - = zoom &nbsp; 0 = fit<br>"
-            "M = toggle masks &nbsp; R = re-seg selected"
+            "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause"
         )
         self.help_label.setWordWrap(True)
         layout.addWidget(self.help_label)
+
+    def _on_play_clicked(self) -> None:
+        on = self.btn_play.isChecked()
+        self.btn_play.setText("⏸ Pause" if on else "▶ Play")
+        self.play_pause_clicked.emit()
+
+    def _on_speed_changed(self) -> None:
+        ms = self.combo_speed.currentData()
+        if ms is not None:
+            self.play_speed_changed.emit(int(ms))
+
+    def set_playing(self, playing: bool) -> None:
+        """Sync the play/pause button from external triggers (e.g. Space key)."""
+        self.btn_play.blockSignals(True)
+        self.btn_play.setChecked(playing)
+        self.btn_play.setText("⏸ Pause" if playing else "▶ Play")
+        self.btn_play.blockSignals(False)
 
     def _on_masks_toggled(self) -> None:
         on = self.btn_masks.isChecked()
@@ -1378,6 +1426,13 @@ class ReviewWindow(QMainWindow):
         # Persisted UI state (collapsed Rerun panel etc.).
         self._ui_state_path = Path.home() / ".config" / "rerun_label_review" / "state.json"
 
+        # Frame playback timer.
+        self._play_timer = QTimer(self)
+        self._play_timer.setTimerType(Qt.PreciseTimer)
+        self._play_timer.timeout.connect(self._on_play_tick)
+        self._play_interval_ms: int = 1000  # 1x default
+        self._playing: bool = False
+
         # ---------- layout ----------
         splitter = QSplitter(_QT_HORZ)
         self.canvas = CanvasWidget()
@@ -1451,11 +1506,15 @@ class ReviewWindow(QMainWindow):
         self.canvas.cat_pick_requested.connect(self._on_cat_pick_requested)
         self.canvas.toggle_masks.connect(self._on_toggle_masks)
         self.canvas.resegment_selected.connect(self._on_resegment_selected)
+        self.canvas.play_pause.connect(self._on_play_pause)
+        self.canvas.fit_view.connect(lambda: self.canvas._fit_to_view())
         self.side.cat_clicked.connect(self._on_side_cat_clicked)
         self.side.slider_moved.connect(self._on_slider_moved)
         self.side.run_sam3_clicked.connect(self._on_run_sam3_all)
         self.side.toggle_masks_clicked.connect(self._on_toggle_masks)
         self.side.resegment_clicked.connect(self._on_resegment_selected)
+        self.side.play_pause_clicked.connect(self._on_play_pause)
+        self.side.play_speed_changed.connect(self._on_play_speed_changed)
 
         if self.bridge is not None:
             self.bridge.time_changed.connect(self._on_viewer_time_changed)
@@ -1469,6 +1528,8 @@ class ReviewWindow(QMainWindow):
             (Qt.Key_B, lambda: self._on_frame_nav(-1)),
             (Qt.Key_S, self._on_save_quit),
             (Qt.Key_Q, self._on_quit),
+            (Qt.Key_Space, self._on_play_pause),
+            (Qt.Key_F, lambda: self.canvas._fit_to_view()),
         ]:
             sc = QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(slot)
@@ -1504,6 +1565,22 @@ class ReviewWindow(QMainWindow):
             QTimer.singleShot(500 * (attempt + 1),
                               lambda: self.web_view and
                               self.web_view.page().runJavaScript(js))
+        # After the widget is hooked, pause its timeline so it doesn't
+        # autoplay through every frame on load (which would flood the
+        # canvas with time_update events). We retry a few times because
+        # `rerunWidget` is exposed asynchronously by the wasm viewer.
+        pause_js = (
+            "(function pause(){"
+            "  var w = window.rerunWidget;"
+            "  if (w && w.set_time_ctrl){"
+            "    try { w.set_time_ctrl(null, null, false); } catch(e){}"
+            "  } else { setTimeout(pause, 250); }"
+            "})();"
+        )
+        for attempt in range(20):
+            QTimer.singleShot(750 + 250 * attempt,
+                              lambda: self.web_view and
+                              self.web_view.page().runJavaScript(pause_js))
 
     # ----------------------- status bar + save indicator ----------------- #
 
@@ -1559,6 +1636,68 @@ class ReviewWindow(QMainWindow):
             if state.get("web_collapsed") and self.btn_toggle_rerun.isEnabled():
                 self.btn_toggle_rerun.setChecked(True)
                 self._on_toggle_rerun()
+        except Exception:
+            pass
+
+    # ----------------------- frame playback ----------------------------- #
+
+    def _on_play_pause(self) -> None:
+        if self._playing:
+            self._stop_playback()
+        else:
+            self._start_playback()
+        self.side.set_playing(self._playing)
+
+    def _on_play_speed_changed(self, ms: int) -> None:
+        self._play_interval_ms = ms
+        if self._playing:
+            # Restart the timer with the new interval.
+            self._play_timer.stop()
+            self._play_timer.start(self._play_interval_ms)
+
+    def _start_playback(self) -> None:
+        if self._playing:
+            return
+        self._playing = True
+        self._play_timer.start(self._play_interval_ms)
+        # Pause the embedded Rerun viewer so its timeline doesn't fight
+        # with our playback timer (both would emit time_update events
+        # and double-advance the canvas).
+        self._pause_rerun_viewer()
+        self.statusBar().showMessage(
+            f"Playing at {self._play_interval_ms} ms/frame", 2000
+        )
+
+    def _stop_playback(self) -> None:
+        if not self._playing:
+            return
+        self._playing = False
+        self._play_timer.stop()
+        self.statusBar().showMessage("Paused", 1500)
+
+    def _on_play_tick(self) -> None:
+        """Advance one frame per timer tick; stop at the end."""
+        if self._current_idx + 1 >= len(self.rrd_index):
+            self._stop_playback()
+            self.side.set_playing(False)
+            self.statusBar().showMessage("Reached last frame", 3000)
+            return
+        self._on_frame_nav(+1)
+
+    def _pause_rerun_viewer(self) -> None:
+        """Send a JS command to pause the embedded Rerun viewer."""
+        if self.web_view is None:
+            return
+        js = (
+            "(function(){"
+            "  var w = window.rerunWidget;"
+            "  if (w && w.set_time_ctrl){"
+            "    try { w.set_time_ctrl(null, null, false); } catch(e){}"
+            "  }"
+            "})();"
+        )
+        try:
+            self.web_view.page().runJavaScript(js)
         except Exception:
             pass
 
@@ -1623,6 +1762,11 @@ class ReviewWindow(QMainWindow):
             self.coco.save(is_final=False)
 
     def _on_viewer_time_changed(self, ts_ns: int) -> None:
+        # If the user manually scrubs the Rerun viewer while our play timer
+        # is running, stop our playback so the two timelines don't fight.
+        if self._playing:
+            self._stop_playback()
+            self.side.set_playing(False)
         idx = self.rrd_index.find_idx_by_timestamp(ts_ns)
         if idx != self._current_idx and 0 <= idx < len(self.rrd_index):
             self._current_idx = idx
