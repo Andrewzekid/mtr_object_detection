@@ -21,6 +21,10 @@ What this does
   of plain image files (one or more files/folders; folders are scanned for
   jpg/jpeg/png/bmp/webp/tif, sorted by name). In image mode there is no
   Rerun viewer; navigation is via the N/B keys, the slider, or Space.
+* The File menu (``Ctrl+O`` open image files, ``Ctrl+Shift+O`` open folder)
+  switches to image mode at runtime: the current session is saved, and a
+  fresh session starts writing ``labels_coco.json`` next to the chosen
+  images, keeping the category list.
 * Embeds the official Rerun *web* viewer inside a PyQt6 window using
   ``QWebEngineView`` pointed at a locally hosted ``rerun.serve_web_viewer()``
   instance. The viewer shows the full 3D world + camera images, and you can
@@ -200,13 +204,13 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QSlider,
     QSplitter, QFrame, QSizePolicy, QMessageBox, QCheckBox,
-    QLineEdit, QProgressBar,
+    QLineEdit, QProgressBar, QFileDialog,
 )
 # QSizePolicy scoped enum alias
 QSizePolicy.Expanding = QSizePolicy.Policy.Expanding  # type: ignore[attr-defined]
 QSizePolicy.Fixed = QSizePolicy.Policy.Fixed  # type: ignore[attr-defined]
 QSizePolicy.Preferred = QSizePolicy.Policy.Preferred  # type: ignore[attr-defined]
-from PyQt6.QtGui import QShortcut
+from PyQt6.QtGui import QShortcut, QAction
 from PyQt6.QtCore import QThread
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -2411,6 +2415,7 @@ class ReviewWindow(QMainWindow):
             self.btn_toggle_rerun.setEnabled(False)
 
         self.setCentralWidget(right_split)
+        self._build_menu()
 
         # ---------- status bar (save indicator + transient messages) ----------
         self._save_indicator = QLabel("✓ Saved")
@@ -2623,6 +2628,69 @@ class ReviewWindow(QMainWindow):
         self.canvas.set_mask_alpha(round(pct * 255 / 100))
         self._write_ui_state(mask_opacity=int(pct))
 
+    # ----------------------- open images / folder ----------------------- #
+
+    def _build_menu(self) -> None:
+        m = self.menuBar().addMenu("&File")
+        act_imgs = QAction("Open image file(s)…", self)
+        act_imgs.setShortcut("Ctrl+O")
+        act_imgs.triggered.connect(self._open_image_files)
+        m.addAction(act_imgs)
+        act_dir = QAction("Open folder…", self)
+        act_dir.setShortcut("Ctrl+Shift+O")
+        act_dir.triggered.connect(self._open_image_folder)
+        m.addAction(act_dir)
+
+    def _open_image_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Open image file(s)", "",
+            "Images (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff)")
+        if files:
+            self._switch_to_images(files)
+
+    def _open_image_folder(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Open image folder", "")
+        if d:
+            self._switch_to_images([d])
+
+    def _switch_to_images(self, paths: List[str]) -> None:
+        """Replace the frame source with plain image files/folders.
+
+        Saves the current session first, then starts a fresh COCO session
+        next to the source (``labels_coco.json`` in the folder, or beside
+        the first file), keeping the current category list.
+        """
+        try:
+            new_index = ImageFolderIndex(paths)
+        except (FileNotFoundError, RuntimeError) as e:
+            QMessageBox.warning(self, "Open images", str(e))
+            return
+        # Save the current session before switching away from it.
+        try:
+            self.coco.save(is_final=False)
+        except Exception:
+            pass
+        self._stop_playback()
+        self.side.set_playing(False)
+        self.rrd_index = new_index
+        out_dir = (paths[0] if os.path.isdir(paths[0])
+                   else os.path.dirname(os.path.abspath(paths[0])))
+        out_json = os.path.join(out_dir, "labels_coco.json")
+        self.coco = CocoState(out_json, self.coco.categories)
+        self.coco.load_existing()
+        self.side.coco = self.coco  # side panel keeps its own reference
+        self._current_idx = self.coco.load_progress(len(self.rrd_index))
+        self._current_image_id = None
+        self._last_cat_id = None
+        self._pending_cat_id = None
+        self.canvas.reset_state()
+        self.side.set_slider_max(len(self.rrd_index))
+        self.setWindowTitle(f"Computer Vision Label Review Tool — {out_dir}")
+        self._load_current()
+        self.statusBar().showMessage(
+            f"Loaded {len(self.rrd_index)} image(s) — saving to {out_json}",
+            5000)
+
     # ----------------------- frame playback ----------------------------- #
 
     def _on_play_pause(self) -> None:
@@ -2753,6 +2821,11 @@ class ReviewWindow(QMainWindow):
             self.coco.save(is_final=False)
 
     def _on_viewer_time_changed(self, ts_ns: int) -> None:
+        # Ignore the embedded viewer after switching to --images mode — it
+        # still shows the old recording, whose timestamps are meaningless
+        # for the image index.
+        if isinstance(self.rrd_index, ImageFolderIndex):
+            return
         # If the user manually scrubs the Rerun viewer while our play timer
         # is running, stop our playback so the two timelines don't fight.
         if self._playing:
