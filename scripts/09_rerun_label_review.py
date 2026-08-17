@@ -828,6 +828,7 @@ class CanvasWidget(QWidget):
     toggle_masks = pyqtSignal()       # M key
     play_pause = pyqtSignal()          # Space key
     fit_view = pyqtSignal()            # F key
+    selection_changed = pyqtSignal(int)  # selected box index (or -1)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1059,6 +1060,7 @@ class CanvasWidget(QWidget):
                         hit = i
                         break
                 self._selected_idx = hit
+                self.selection_changed.emit(hit)
                 self.update()
         elif ev.button() == Qt.MiddleButton:
             self._panning = True
@@ -1086,10 +1088,25 @@ class CanvasWidget(QWidget):
                 self._draw_start = None
                 self._draw_current = None
                 if w > 2 and h > 2:
-                    self._pending_rect = (x, y, w, h)
-                    self._waiting_cat = True
-                    self.update()
-                    self.cat_pick_requested.emit(x, y, w, h)
+                    # If the user preselected a category (clicked a cat in
+                    # the side panel before drawing), assign it now without
+                    # waiting for a number key.
+                    pre = getattr(self.parent_window, "_pending_cat_id", None)
+                    if pre is not None:
+                        # Reset pending cat so the next draw asks again.
+                        self.parent_window._pending_cat_id = None
+                        # Don't clear the preselection visual in the side panel;
+                        # the user can click again to re-preselect.
+                        self.parent_window().box_added.emit(
+                            self.parent_window()._current_image_id or 0,
+                            x, y, w, h, pre,
+                        )
+                        self.update()
+                    else:
+                        self._pending_rect = (x, y, w, h)
+                        self._waiting_cat = True
+                        self.update()
+                        self.cat_pick_requested.emit(x, y, w, h)
                 else:
                     self.update()
         elif ev.button() == Qt.MiddleButton:
@@ -1182,6 +1199,8 @@ class SidePanel(QWidget):
     resegment_clicked = pyqtSignal()     # "Re-segment selected" button
     play_pause_clicked = pyqtSignal()     # "▶ / ⏸" button
     play_speed_changed = pyqtSignal(int)  # ms-per-frame
+    box_selected = pyqtSignal(int)       # box list row clicked → canvas selection
+    preselect_cat = pyqtSignal(int)      # category preselected for next draw
 
     def __init__(self, coco: CocoState, parent=None):
         super().__init__(parent)
@@ -1189,13 +1208,22 @@ class SidePanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
 
-        self.cat_label = QLabel("Categories (click or press 0-9 when drawing):")
+        self.cat_label = QLabel("Categories (click to preselect for next draw, or press 0-9 when drawing):")
         layout.addWidget(self.cat_label)
 
         self.cat_list = QListWidget()
         layout.addWidget(self.cat_list, 1)
         self.cat_list.itemClicked.connect(self._on_cat_clicked)
         self._rebuild_cat_list()
+        self._preselected_cat_id: Optional[int] = None
+
+        # Boxes on current frame list.
+        self.boxes_label = QLabel("Boxes on this frame:")
+        layout.addWidget(self.boxes_label)
+        self.box_list = QListWidget()
+        self.box_list.setMaximumHeight(140)
+        self.box_list.itemClicked.connect(self._on_box_list_clicked)
+        layout.addWidget(self.box_list)
 
         # Frame playback controls: play/pause + speed.
         play_row = QHBoxLayout()
@@ -1247,14 +1275,47 @@ class SidePanel(QWidget):
         layout.addWidget(self.info_label)
 
         self.help_label = QLabel(
-            "<b>Keys (click canvas first):</b><br>"
+            "<b>Keys (work anywhere):</b><br>"
             "D = delete sel &nbsp; A = draw &nbsp; N = next &nbsp; B = back<br>"
             "X = discard all &nbsp; S = save+quit &nbsp; Q = quit<br>"
-            "0-9 = pick cat &nbsp; + / - = zoom &nbsp; 0 = fit<br>"
-            "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause"
+            "0-9 = pick cat (when drawing) &nbsp; + / - = zoom &nbsp; F = fit<br>"
+            "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause<br>"
+            "<i>Click a category first to preselect it for the next draw.</i>"
         )
         self.help_label.setWordWrap(True)
         layout.addWidget(self.help_label)
+
+    # ---- box list ---- #
+
+    def set_boxes(self, boxes: List[Dict[str, Any]]) -> None:
+        """Rebuild the box list display. boxes: list of dicts (see CanvasWidget.set_boxes)."""
+        self.box_list.blockSignals(True)
+        self.box_list.clear()
+        for i, b in enumerate(boxes):
+            x, y, w, h = b["bbox"]
+            txt = (f"#{b['id']}  {b.get('cat_name','?')}  "
+                   f"[{int(x)},{int(y)},{int(w)},{int(h)}]")
+            it = QListWidgetItem(txt)
+            it.setData(Qt.UserRole, i)  # store the box index, not ann_id
+            self.box_list.addItem(it)
+        self.box_list.blockSignals(False)
+        self.boxes_label.setText(f"Boxes on this frame ({len(boxes)}):")
+
+    def highlight_box_row(self, box_idx: int) -> None:
+        """Sync the list's current row with the canvas selection. -1 = none."""
+        self.box_list.blockSignals(True)
+        if 0 <= box_idx < self.box_list.count():
+            self.box_list.setCurrentRow(box_idx)
+        else:
+            self.box_list.setCurrentRow(-1)
+        self.box_list.blockSignals(False)
+
+    def _on_box_list_clicked(self, item: QListWidgetItem) -> None:
+        idx = item.data(Qt.UserRole)
+        if idx is not None:
+            self.box_selected.emit(int(idx))
+
+    # ---- play/pause ---- #
 
     def _on_play_clicked(self) -> None:
         on = self.btn_play.isChecked()
@@ -1273,6 +1334,8 @@ class SidePanel(QWidget):
         self.btn_play.setText("⏸ Pause" if playing else "▶ Play")
         self.btn_play.blockSignals(False)
 
+    # ---- masks + sam3 ---- #
+
     def _on_masks_toggled(self) -> None:
         on = self.btn_masks.isChecked()
         self.btn_masks.setText("Masks: ON" if on else "Masks: OFF")
@@ -1281,10 +1344,30 @@ class SidePanel(QWidget):
     def set_sam3_status(self, text: str) -> None:
         self.sam3_status.setText(text)
 
+    # ---- categories ---- #
+
     def _on_cat_clicked(self, item: QListWidgetItem) -> None:
         cat_id = item.data(Qt.UserRole)
         if cat_id is not None:
-            self.cat_clicked.emit(int(cat_id))
+            cat_id = int(cat_id)
+            self._preselected_cat_id = cat_id
+            # Visual hint: bold the clicked row.
+            f = item.font()
+            f.setBold(True)
+            item.setFont(f)
+            # Un-bold other rows.
+            for i in range(self.cat_list.count()):
+                if i is not self.cat_list.row(item):
+                    other = self.cat_list.item(i)
+                    of = other.font()
+                    if of.bold():
+                        of.setBold(False)
+                        other.setFont(of)
+            self.preselect_cat.emit(cat_id)
+            self.cat_clicked.emit(cat_id)
+
+    def get_preselected_cat_id(self) -> Optional[int]:
+        return self._preselected_cat_id
 
     def _rebuild_cat_list(self) -> None:
         self.cat_list.clear()
@@ -1508,6 +1591,7 @@ class ReviewWindow(QMainWindow):
         self.canvas.resegment_selected.connect(self._on_resegment_selected)
         self.canvas.play_pause.connect(self._on_play_pause)
         self.canvas.fit_view.connect(lambda: self.canvas._fit_to_view())
+        self.canvas.selection_changed.connect(self.side.highlight_box_row)
         self.side.cat_clicked.connect(self._on_side_cat_clicked)
         self.side.slider_moved.connect(self._on_slider_moved)
         self.side.run_sam3_clicked.connect(self._on_run_sam3_all)
@@ -1515,6 +1599,8 @@ class ReviewWindow(QMainWindow):
         self.side.resegment_clicked.connect(self._on_resegment_selected)
         self.side.play_pause_clicked.connect(self._on_play_pause)
         self.side.play_speed_changed.connect(self._on_play_speed_changed)
+        self.side.box_selected.connect(self._on_box_list_selected)
+        self.side.preselect_cat.connect(self._on_preselect_cat)
 
         if self.bridge is not None:
             self.bridge.time_changed.connect(self._on_viewer_time_changed)
@@ -1522,7 +1608,9 @@ class ReviewWindow(QMainWindow):
         # Frame slider config
         self.side.set_slider_max(len(self.rrd_index))
 
-        # Shortcuts that work even when canvas doesn't have focus
+        # Shortcuts that work even when canvas doesn't have focus.
+        # These mirror the canvas keyPressEvent so the user doesn't need
+        # to click the canvas first to give it focus.
         for key, slot in [
             (Qt.Key_N, lambda: self._on_frame_nav(+1)),
             (Qt.Key_B, lambda: self._on_frame_nav(-1)),
@@ -1530,6 +1618,14 @@ class ReviewWindow(QMainWindow):
             (Qt.Key_Q, self._on_quit),
             (Qt.Key_Space, self._on_play_pause),
             (Qt.Key_F, lambda: self.canvas._fit_to_view()),
+            (Qt.Key_D, lambda: self.canvas.keyPressEvent(
+                QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, Qt.Key_D, Qt.NoModifier))),
+            (Qt.Key_A, lambda: self.canvas.keyPressEvent(
+                QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, Qt.Key_A, Qt.NoModifier))),
+            (Qt.Key_X, lambda: self.canvas.keyPressEvent(
+                QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, Qt.Key_X, Qt.NoModifier))),
+            (Qt.Key_M, self._on_toggle_masks),
+            (Qt.Key_R, self._on_resegment_selected),
         ]:
             sc = QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(slot)
@@ -1720,7 +1816,7 @@ class ReviewWindow(QMainWindow):
             for (cx, cy, hw, hh, label) in existing:
                 self.coco.seed_box(image_id, cx, cy, hw, hh, label)
 
-        # Build box list for canvas.
+        # Build box list for canvas + side panel.
         boxes = []
         for ann in self.coco.anns_for_image(image_id):
             x, y, bw, bh = ann["bbox"]
@@ -1729,9 +1825,12 @@ class ReviewWindow(QMainWindow):
                 "bbox": [x, y, bw, bh],
                 "cat_id": ann["category_id"],
                 "cat_name": self.coco.cat_map.get(ann["category_id"], "?"),
+                "mask": ann.get("_mask"),
             })
         self.canvas.set_image(arr)
         self.canvas.set_boxes(boxes)
+        self.side.set_boxes(boxes)
+        self.side.highlight_box_row(-1)
         self.canvas.set_info(
             f"Frame {idx + 1}/{len(self.rrd_index)}  |  ts={frame['timestamp_ns']}"
         )
@@ -1774,26 +1873,40 @@ class ReviewWindow(QMainWindow):
 
     def _on_box_deleted(self, ann_id: int) -> None:
         self.coco.remove_box(ann_id)
-        # Refresh boxes on canvas.
-        if self._current_image_id is not None:
-            boxes = []
-            for ann in self.coco.anns_for_image(self._current_image_id):
-                x, y, bw, bh = ann["bbox"]
-                boxes.append({
-                    "id": ann["id"],
-                    "bbox": [x, y, bw, bh],
-                    "cat_id": ann["category_id"],
-                    "cat_name": self.coco.cat_map.get(ann["category_id"], "?"),
-                })
-            self.canvas.set_boxes(boxes)
-            self.side.set_info(self._current_idx, len(self.rrd_index),
-                               self.rrd_index.frame_at(self._current_idx)["timestamp_ns"],
-                               len(boxes))
+        self._refresh_boxes()
+        self.statusBar().showMessage(f"Deleted box #{ann_id}", 2500)
 
     def _on_box_added(self, image_id: int, x: float, y: float,
                       w: float, h: float, cat_id: int) -> None:
-        self.coco.add_box(image_id, x, y, w, h, cat_id)
+        new_ann_id = self.coco.add_box(image_id, x, y, w, h, cat_id)
         self._refresh_boxes()
+        self.statusBar().showMessage(
+            f"Added box cat={self.coco.cat_map.get(cat_id, '?')} "
+            f"(ann_id={new_ann_id})", 3000
+        )
+        if self.auto_segment and _SAM3_AVAILABLE:
+            # Auto-run SAM3 on the freshly added box.
+            img_path = self._write_tmp_image()
+            if img_path is not None:
+                self._start_sam3_worker(
+                    img_path,
+                    bboxes_xyxy=[[x, y, x + w, y + h]],
+                    concepts=[self.coco.cat_map[cat_id]],
+                    ann_ids=[new_ann_id],
+                )
+
+    def _assign_pending_cat(self, cat_id: int) -> None:
+        """Number-key category pick for the pending rectangle."""
+        if cat_id not in self.coco.cat_map:
+            self.statusBar().showMessage(f"⚠️ Category {cat_id} not found", 3000)
+            return
+        rect = self.canvas.get_pending_rect()
+        if rect is None or self._current_image_id is None:
+            return
+        x, y, w, h = rect
+        self.canvas.reset_state()
+        # Reuse the shared add-box path.
+        self._on_box_added(self._current_image_id, x, y, w, h, cat_id)
 
     def _on_discard_all(self) -> None:
         if self._current_image_id is None:
@@ -1819,40 +1932,12 @@ class ReviewWindow(QMainWindow):
         for cid, name in sorted(self.coco.cat_map.items()):
             print(f"    {cid} -> {name}")
 
-    def _assign_pending_cat(self, cat_id: int) -> None:
-        if cat_id not in self.coco.cat_map:
-            print(f"⚠️ Category {cat_id} not found")
-            return
-        rect = self.canvas.get_pending_rect()
-        if rect is None or self._current_image_id is None:
-            return
-        x, y, w, h = rect
-        new_ann_id = self.coco.add_box(self._current_image_id, x, y, w, h, cat_id)
-        self.canvas.reset_state()
-        self._refresh_boxes()
-        print(f"✅ Added box cat={self.coco.cat_map[cat_id]} (ann_id={new_ann_id})")
-        if self.auto_segment and _SAM3_AVAILABLE:
-            # Auto-run SAM3 on the freshly added box.
-            img_path = self._write_tmp_image()
-            if img_path is not None:
-                self._start_sam3_worker(
-                    img_path,
-                    bboxes_xyxy=[[x, y, x + w, y + h]],
-                    concepts=[self.coco.cat_map[cat_id]],
-                    ann_ids=[new_ann_id],
-                )
-
     def _on_side_cat_clicked(self, cat_id: int) -> None:
-        # If we have a pending rect, assign; else start a draw mode.
+        # If we have a pending rect, assign; else preselect for the next draw.
         if self.canvas.get_pending_rect() is not None:
             self._assign_pending_cat(cat_id)
         else:
-            self.canvas._drawing = True
-            self.canvas.update()
-            print(f"✏️ Draw mode for cat_id={cat_id} "
-                  f"({self.coco.cat_map.get(cat_id, '?')}) — drag on the image")
-            # Remember which cat to use after the next draw.
-            self._pending_cat_id = cat_id
+            self._on_preselect_cat(cat_id)
 
     def _refresh_boxes(self) -> None:
         if self._current_image_id is None:
@@ -1868,9 +1953,30 @@ class ReviewWindow(QMainWindow):
                 "mask": ann.get("_mask"),
             })
         self.canvas.set_boxes(boxes)
+        self.side.set_boxes(boxes)
+        self.side.highlight_box_row(self.canvas._selected_idx)
         self.side.set_info(self._current_idx, len(self.rrd_index),
                            self.rrd_index.frame_at(self._current_idx)["timestamp_ns"],
                            len(boxes))
+
+    # ---- box list panel + preselected category ---- #
+
+    def _on_box_list_selected(self, box_idx: int) -> None:
+        """Clicking a box-list row selects that box on the canvas."""
+        if 0 <= box_idx < len(self.canvas._boxes):
+            self.canvas._selected_idx = box_idx
+            self.canvas.update()
+            self.side.highlight_box_row(box_idx)
+
+    def _on_preselect_cat(self, cat_id: int) -> None:
+        """A category was clicked in the side panel — remember it for the
+        next draw so the user doesn't need to press a number key."""
+        self._pending_cat_id = cat_id
+        name = self.coco.cat_map.get(cat_id, "?")
+        # Put the canvas in draw mode immediately so the next click-drag draws.
+        self.canvas._drawing = True
+        self.canvas.update()
+        self.statusBar().showMessage(f"Drawing: {name} — drag on the image", 4000)
 
     # ----------------------- SAM3 segmentation ------------------------- #
 
