@@ -74,7 +74,9 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
     S        : save final result and quit
     Q / ESC  : quit (progress saved in tmp file)
     0..9     : when drawing, assign category id to the pending rectangle
-               (use the buttons in the side panel for ids > 9)
+               (use the buttons in the side panel for ids > 9). After the
+               first box, new draws auto-reuse the previous box's category
+               (preselect another cat in the side panel to change it)
     M        : toggle mask overlay visibility
     R        : re-segment the selected bbox with SAM3 (replaces its mask)
     + / =    : zoom in   |  -  : zoom out  |  0 : reset zoom
@@ -1660,8 +1662,15 @@ class CanvasWidget(QWidget):
                 if w > 2 and h > 2:
                     # If the user preselected a category (clicked a cat in
                     # the side panel before drawing), assign it now without
-                    # waiting for a number key.
+                    # waiting for a number key. Otherwise reuse the last
+                    # assigned category (sticky), so consecutive boxes of the
+                    # same class need no keypress at all.
                     pre = getattr(self.parent_window, "_pending_cat_id", None)
+                    if pre is None:
+                        pre = getattr(self.parent_window, "_last_cat_id", None)
+                    if pre not in self.parent_window.coco.cat_map:
+                        # Stale (e.g. category deleted since last use).
+                        pre = None
                     if pre is not None:
                         # Reset pending cat so the next draw asks again.
                         self.parent_window._pending_cat_id = None
@@ -1964,7 +1973,8 @@ class SidePanel(QWidget):
             "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause<br>"
             "Z = zoom to sel &nbsp; Ctrl+Z = undo &nbsp; Ctrl+Shift+Z = redo<br>"
             "U = jump to next unlabeled frame &nbsp; C = focus cat-id field<br>"
-            "<i>Click a category first to preselect it for the next draw.</i>"
+            "<i>Click a category first to preselect it for the next draw.<br>"
+            "New draws reuse the previous box's category automatically.</i>"
         )
         self.help_label.setWordWrap(True)
         layout.addWidget(self.help_label)
@@ -2214,6 +2224,9 @@ class ReviewWindow(QMainWindow):
         self._current_idx = coco.current_idx
         self._current_image_id: Optional[int] = None
         self._pending_cat_id: Optional[int] = None
+        # Sticky category: the last category assigned to a drawn box. New
+        # draws auto-assign it (unless the user preselected another cat).
+        self._last_cat_id: Optional[int] = None
         self._sam3_worker: Optional[SAM3Worker] = None
         self._sam3_batch_worker: Optional[SAM3BatchWorker] = None
         self._batch_frames_done: int = 0
@@ -2721,6 +2734,7 @@ class ReviewWindow(QMainWindow):
     def _on_box_added(self, image_id: int, x: float, y: float,
                       w: float, h: float, cat_id: int) -> None:
         new_ann_id = self.coco.add_box(image_id, x, y, w, h, cat_id)
+        self._last_cat_id = cat_id
         self._refresh_boxes()
         self.statusBar().showMessage(
             f"Added box cat={self.coco.cat_map.get(cat_id, '?')} "
