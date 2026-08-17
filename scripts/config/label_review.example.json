@@ -1,0 +1,17 @@
+{
+  "interpolation": {
+    "flow_method": "dis",
+    "camera_model": "none",
+    "match_max_dist_frac": 0.2,
+    "confirm_mismatch": true
+  },
+  "sam3": {
+    "device": "cpu",
+    "conf": 0.25,
+    "auto_segment": false
+  },
+  "ui": {
+    "hide": [],
+    "mask_opacity": 47
+  }
+}

@@ -124,6 +124,35 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
 Reviewed frames (marked on N forward-nav and X discard) are tracked in the
 .progress sidecar and shown in the status bar; X, S and quitting with
 unsaved changes ask for confirmation first.
+
+Config file (--config)
+----------------------
+A JSON file can adjust interpolation, SAM3, and UI settings. Values in the
+config override the corresponding CLI flags. Example:
+``scripts/config/label_review.example.json``.
+
+    {
+      "interpolation": {
+        "flow_method": "dis",         // dis | klt | farneback
+        "camera_model": "none",       // none | global
+        "match_max_dist_frac": 0.2,   // anchor box pairing distance,
+                                      // fraction of min(frame w, h)
+        "confirm_mismatch": true      // false = skip the track-id mismatch
+                                      // dialog (mismatches are logged)
+      },
+      "sam3": {
+        "device": "cpu",              // cpu | cuda
+        "conf": 0.25,
+        "auto_segment": false
+      },
+      "ui": {
+        "hide": ["sam3_all_frames"],  // button groups to hide; known groups:
+                                      // keyframe, interpolate, jump,
+                                      // sam3_run, sam3_all_frames, masks,
+                                      // play, rerun_toggle
+        "mask_opacity": 47            // initial mask overlay opacity (0-100)
+      }
+    }
 """
 
 from __future__ import annotations
@@ -2290,11 +2319,13 @@ class SidePanel(QWidget):
         # Big forward jumps.
         jump_row = QHBoxLayout()
         jump_row.addWidget(QLabel("Jump:"))
+        self.jump_buttons = []  # kept for config-driven hiding
         for delta in (5, 10):
             btn = QPushButton(f"+{delta} frames")
             btn.setToolTip(f"Jump forward {delta} frames.")
             btn.clicked.connect(lambda _c=False, d=delta: self.nav_delta.emit(d))
             jump_row.addWidget(btn)
+            self.jump_buttons.append(btn)
         jump_row.addStretch(1)
         layout.addLayout(jump_row)
 
@@ -2560,6 +2591,35 @@ class SidePanel(QWidget):
             it.setData(Qt.UserRole, cat["id"])
             self.cat_list.addItem(it)
 
+    # Widget groups that can be hidden via the config's "ui": {"hide": [...]}.
+    # Values are attribute names on this panel; an attribute may be a single
+    # widget or a list of widgets.
+    _HIDEABLE = {
+        "keyframe": ["btn_keyframe"],
+        "interpolate": ["btn_interpolate", "btn_cancel_interp",
+                        "interp_status"],
+        "jump": ["jump_buttons"],
+        "sam3_run": ["btn_run_sam3", "btn_reseg", "btn_cancel_sam3"],
+        "sam3_all_frames": ["btn_sam3_all_frames"],
+        "masks": ["btn_masks", "opacity_slider", "opacity_value_label"],
+        "play": ["btn_play", "combo_speed"],
+    }
+
+    def set_hidden_groups(self, groups: List[str]) -> None:
+        """Hide widget groups named in `groups` (see _HIDEABLE)."""
+        for g in groups:
+            attrs = self._HIDEABLE.get(g)
+            if attrs is None:
+                print(f"⚠️ Unknown ui.hide group: {g!r} "
+                      f"(known: {sorted(self._HIDEABLE)})")
+                continue
+            for attr in attrs:
+                w = getattr(self, attr, None)
+                if w is None:
+                    continue
+                for widget in (w if isinstance(w, list) else [w]):
+                    widget.hide()
+
     def set_slider_max(self, n: int) -> None:
         self.frame_slider.setMaximum(max(0, n - 1))
 
@@ -2672,7 +2732,11 @@ class ReviewWindow(QMainWindow):
                   seed_from_rrd: bool = True,
                   interp_flow_method: str = "dis",
                   interp_camera_model: str = "none",
+                  interp_match_frac: float = 0.2,
+                  interp_confirm_mismatch: bool = True,
                   has_viewer: bool = True,
+                  ui_hide: Optional[List[str]] = None,
+                  mask_opacity: Optional[int] = None,
                   parent=None):
         super().__init__(parent)
         self.rrd_index = rrd_index
@@ -2686,6 +2750,12 @@ class ReviewWindow(QMainWindow):
         self.auto_segment = auto_segment
         self.interp_flow_method = interp_flow_method
         self.interp_camera_model = interp_camera_model
+        # Fraction of min(frame w, h) used as the max pairing distance when
+        # matching anchor boxes for interpolation.
+        self.interp_match_frac = interp_match_frac
+        # Whether to show the track-id mismatch confirmation dialog before
+        # interpolating.
+        self.interp_confirm_mismatch = interp_confirm_mismatch
 
         self.setWindowTitle("Computer Vision Label Review Tool")
         self.resize(1600, 900)
@@ -2776,6 +2846,19 @@ class ReviewWindow(QMainWindow):
 
         self.setCentralWidget(right_split)
         self._build_menu()
+
+        # Config-driven UI tweaks: hide button groups, preset mask opacity.
+        if ui_hide:
+            side_groups = [g for g in ui_hide if g != "rerun_toggle"]
+            self.side.set_hidden_groups(side_groups)
+            if "rerun_toggle" in ui_hide:
+                self.btn_toggle_rerun.hide()
+        if mask_opacity is not None:
+            pct = max(0, min(100, int(mask_opacity)))
+            self.side.opacity_slider.setValue(pct)
+            # Signals aren't connected yet at this point, so set the canvas
+            # overlay alpha directly as well.
+            self.canvas.set_mask_alpha(round(pct * 255 / 100))
 
         # ---------- status bar (save indicator + transient messages) ----------
         self._save_indicator = QLabel("✓ Saved")
@@ -3421,22 +3504,23 @@ class ReviewWindow(QMainWindow):
             return
         boxes_a = [self._ann_to_interp_dict(ann) for ann in anns_a]
         boxes_b = [self._ann_to_interp_dict(ann) for ann in anns_b]
-        # Match threshold: fraction of the smaller frame dimension (same
-        # default as 13's --match-max-dist), from the anchor image records.
+        # Match threshold: fraction of the smaller frame dimension (config:
+        # interpolation.match_max_dist_frac), from the anchor image records.
         max_dist = 0.0
         for img_id in (img_a, img_b):
             for img in self.coco.images:
                 if img["id"] == img_id and img.get("width") \
                         and img.get("height"):
-                    max_dist = max(max_dist, 0.2 * min(img["width"],
-                                                       img["height"]))
+                    max_dist = max(max_dist,
+                                   self.interp_match_frac
+                                   * min(img["width"], img["height"]))
                     break
         pairs, warnings = self._pair_boxes(boxes_a, boxes_b, max_dist)
         if not pairs:
             self.statusBar().showMessage(
                 "Interpolate: no box pairs to interpolate", 3000)
             return
-        if warnings:
+        if warnings and self.interp_confirm_mismatch:
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Icon.Warning)
             msg.setWindowTitle("Track id mismatch")
@@ -3450,6 +3534,10 @@ class ReviewWindow(QMainWindow):
             msg.setDefaultButton(QMessageBox.StandardButton.Ok)
             if msg.exec() != QMessageBox.StandardButton.Ok:
                 return
+        elif warnings:
+            # Confirmation disabled via config — log the mismatches instead.
+            for w_ in warnings:
+                print(f"⚠️ Interpolate pairing: {w_}")
         jobs = [{"a": a, "b": b, "box_a": ba, "box_b": bb}
                 for ba, bb in pairs]
         tmp_base = str(Path(self.coco.output_json).parent
@@ -4287,12 +4375,47 @@ def main():
                         help="Camera motion model for gap interpolation "
                              "(default: none; 'global' fits a per-frame "
                              "RANSAC similarity transform).")
+    parser.add_argument("--config",
+                        help="JSON config file (interpolation/sam3/ui "
+                             "settings; values override the corresponding "
+                             "CLI flags). See scripts/config/"
+                             "label_review.example.json.")
     args = parser.parse_args()
 
     if not args.rrd and not args.images:
         parser.error("one of --rrd or --images is required")
     if args.rrd and args.images:
         parser.error("--rrd and --images are mutually exclusive")
+
+    # Optional JSON config; its values override the corresponding CLI flags.
+    cfg: Dict[str, Any] = {}
+    if args.config:
+        try:
+            with open(args.config, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            print(f"⚙️  Loaded config: {args.config}")
+        except Exception as e:
+            print(f"❌ Could not read config {args.config}: {e}")
+            sys.exit(1)
+    interp_cfg = cfg.get("interpolation", {})
+    sam3_cfg = cfg.get("sam3", {})
+    ui_cfg = cfg.get("ui", {})
+
+    flow_method = interp_cfg.get("flow_method", args.interp_flow_method)
+    if flow_method not in ("dis", "klt", "farneback"):
+        print(f"⚠️ config interpolation.flow_method {flow_method!r} "
+              "invalid; using 'dis'")
+        flow_method = "dis"
+    camera_model = interp_cfg.get("camera_model", args.interp_camera_model)
+    if camera_model not in ("none", "global"):
+        print(f"⚠️ config interpolation.camera_model {camera_model!r} "
+              "invalid; using 'none'")
+        camera_model = "none"
+    sam3_device = sam3_cfg.get("device", args.sam3_device)
+    if sam3_device not in ("cuda", "cpu"):
+        print(f"⚠️ config sam3.device {sam3_device!r} invalid; "
+              f"using '{args.sam3_device}'")
+        sam3_device = args.sam3_device
 
     # ---------- 1. Index the frame source ----------
     if args.images:
@@ -4353,13 +4476,20 @@ def main():
                                  if args.rrd else ""),
                        web_port=args.web_port,
                        sam3_model=args.sam3_model,
-                       sam3_device=args.sam3_device,
-                       sam3_conf=args.sam3_conf,
-                        auto_segment=args.auto_segment,
+                       sam3_device=sam3_device,
+                       sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),
+                       auto_segment=bool(sam3_cfg.get("auto_segment",
+                                                      args.auto_segment)),
                         seed_from_rrd=not args.no_seed and bool(args.rrd),
                         has_viewer=bool(args.rrd),
-                        interp_flow_method=args.interp_flow_method,
-                        interp_camera_model=args.interp_camera_model)
+                        interp_flow_method=flow_method,
+                        interp_camera_model=camera_model,
+                        interp_match_frac=float(interp_cfg.get(
+                            "match_max_dist_frac", 0.2)),
+                        interp_confirm_mismatch=bool(interp_cfg.get(
+                            "confirm_mismatch", True)),
+                        ui_hide=ui_cfg.get("hide") or None,
+                        mask_opacity=ui_cfg.get("mask_opacity"))
     win.show()
     exit_code = app.exec()
 
