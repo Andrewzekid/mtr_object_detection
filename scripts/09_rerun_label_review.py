@@ -21,6 +21,19 @@ What this does
   new time, the script looks up the matching frame, and the 2D canvas updates
   automatically. You can also navigate with N/B keys or a slider.
 
+SAM3 segmentation
+-----------------
+* ``M`` toggles mask overlay visibility.
+* ``Run SAM3 (all)`` button (or ``Shift+M``) runs Ultralytics SAM3 on every
+  bbox on the current frame and overlays the resulting masks. Masks are
+  stored per-annotation in the COCO output (PNG-encoded in the ``mask`` field)
+  so they round-trip with the json file.
+* ``R`` re-segments the *selected* bbox only — useful after you've redrawn a
+  bbox to fix a bad SAM3 mask: delete the old box, draw a new one, then press
+  R while it's selected to regenerate the mask.
+* ``--auto-segment`` runs SAM3 automatically right after each new bbox is
+  drawn, so you don't need to press anything.
+
 The .rrd must contain at least one ``EncodedImage`` entity (auto-detected).
 The script auto-detects:
   * the image entity path (first entity with archetype EncodedImage),
@@ -56,6 +69,8 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
     Q / ESC  : quit (progress saved in tmp file)
     0..9     : when drawing, assign category id to the pending rectangle
                (use the buttons in the side panel for ids > 9)
+    M        : toggle mask overlay visibility
+    R        : re-segment the selected bbox with SAM3 (replaces its mask)
     + / =    : zoom in   |  -  : zoom out  |  0 : reset zoom
     arrows   : pan (when zoomed)
 """
@@ -90,13 +105,54 @@ import PyQt6.QtCore as QtCore
 import PyQt6.QtGui as QtGui
 import PyQt6.QtWidgets as QtWidgets
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QEvent, pyqtSlot
+# PyQt6 uses scoped enums. Provide short aliases for PyQt5-style names used below.
+_QT_HORZ = Qt.Orientation.Horizontal
+_QT_VERT = Qt.Orientation.Vertical
+Qt.StrongFocus = Qt.FocusPolicy.StrongFocus  # type: ignore[attr-defined]
+Qt.NoFocus = Qt.FocusPolicy.NoFocus  # type: ignore[attr-defined]
+Qt.AlignCenter = Qt.AlignmentFlag.AlignCenter  # type: ignore[attr-defined]
+Qt.AlignLeft = Qt.AlignmentFlag.AlignLeft  # type: ignore[attr-defined]
+Qt.DashLine = Qt.PenStyle.DashLine  # type: ignore[attr-defined]
+Qt.LeftButton = Qt.MouseButton.LeftButton  # type: ignore[attr-defined]
+Qt.MiddleButton = Qt.MouseButton.MiddleButton  # type: ignore[attr-defined]
+Qt.RightButton = Qt.MouseButton.RightButton  # type: ignore[attr-defined]
+Qt.UserRole = Qt.ItemDataRole.UserRole  # type: ignore[attr-defined]
+Qt.Key_Escape = Qt.Key.Key_Escape  # type: ignore[attr-defined]
+Qt.Key_D = Qt.Key.Key_D  # type: ignore[attr-defined]
+Qt.Key_Delete = Qt.Key.Key_Delete  # type: ignore[attr-defined]
+Qt.Key_A = Qt.Key.Key_A  # type: ignore[attr-defined]
+Qt.Key_N = Qt.Key.Key_N  # type: ignore[attr-defined]
+Qt.Key_Right = Qt.Key.Key_Right  # type: ignore[attr-defined]
+Qt.Key_B = Qt.Key.Key_B  # type: ignore[attr-defined]
+Qt.Key_Left = Qt.Key.Key_Left  # type: ignore[attr-defined]
+Qt.Key_X = Qt.Key.Key_X  # type: ignore[attr-defined]
+Qt.Key_S = Qt.Key.Key_S  # type: ignore[attr-defined]
+Qt.Key_Q = Qt.Key.Key_Q  # type: ignore[attr-defined]
+Qt.Key_Plus = Qt.Key.Key_Plus  # type: ignore[attr-defined]
+Qt.Key_Equal = Qt.Key.Key_Equal  # type: ignore[attr-defined]
+Qt.Key_Minus = Qt.Key.Key_Minus  # type: ignore[attr-defined]
+Qt.Key_0 = Qt.Key.Key_0  # type: ignore[attr-defined]
+Qt.Key_M = Qt.Key.Key_M  # type: ignore[attr-defined]
+Qt.Key_R = Qt.Key.Key_R  # type: ignore[attr-defined]
+Qt.Key_Shift = Qt.Key.Key_Shift  # type: ignore[attr-defined]
 from PyQt6.QtGui import QPen, QColor, QPainter, QPixmap, QFont, QTransform
+# PyQt6 scoped-enum shims for QtGui
+QPainter.Antialiasing = QPainter.RenderHint.Antialiasing  # type: ignore[attr-defined]
+QPainter.SmoothPixmapTransform = QPainter.RenderHint.SmoothPixmapTransform  # type: ignore[attr-defined]
+QtGui.QImage.Format_RGB888 = QtGui.QImage.Format.Format_RGB888  # type: ignore[attr-defined]
+QtGui.QImage.Format_ARGB32 = QtGui.QImage.Format.Format_ARGB32  # type: ignore[attr-defined]
+# QFont doesn't accept "Sans" string in PyQt6; we use QFont() with family name below.
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QSlider,
     QSplitter, QFrame, QSizePolicy, QMessageBox,
 )
+# QSizePolicy scoped enum alias
+QSizePolicy.Expanding = QSizePolicy.Policy.Expanding  # type: ignore[attr-defined]
+QSizePolicy.Fixed = QSizePolicy.Policy.Fixed  # type: ignore[attr-defined]
+QSizePolicy.Preferred = QSizePolicy.Policy.Preferred  # type: ignore[attr-defined]
 from PyQt6.QtGui import QShortcut
+from PyQt6.QtCore import QThread
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
     from PyQt6.QtWebChannel import QWebChannel
@@ -114,6 +170,185 @@ except Exception:
     _HAS_EXP = False
 
 import pyarrow as pa
+
+# SAM3 (optional — core.models_inference.run_sam3)
+_SAM3_AVAILABLE = False
+try:
+    import sys as _sys
+    _PROJ_ROOT = str(Path(__file__).resolve().parent.parent)
+    if _PROJ_ROOT not in _sys.path:
+        _sys.path.insert(0, _PROJ_ROOT)
+    from core.models_inference import run_sam3  # type: ignore[import-not-found]
+    _SAM3_AVAILABLE = True
+except Exception as _sam3_import_err:
+    run_sam3 = None  # type: ignore[assignment]
+    print(f"⚠️ SAM3 not available ({_sam3_import_err}). "
+          f"Segmentation features will be disabled.")
+
+
+# ---------------------------------------------------------------------------
+# Mask encoding / decoding helpers (PNG in-memory)
+# ---------------------------------------------------------------------------
+
+def _encode_mask_png(mask: np.ndarray) -> Optional[bytes]:
+    """Encode a boolean HxW mask as PNG bytes (single-channel, 0/255)."""
+    if mask is None or mask.size == 0:
+        return None
+    arr = (mask.astype(np.uint8) * 255)
+    img = Image.fromarray(arr, mode="L")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _decode_mask_png(blob: bytes) -> Optional[np.ndarray]:
+    """Decode PNG bytes back to a boolean HxW mask. Returns None on failure."""
+    if not blob:
+        return None
+    try:
+        with Image.open(io.BytesIO(blob)) as im:
+            arr = np.array(im.convert("L"))
+        return arr > 0
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# SAM3Worker: runs run_sam3 on a worker thread so the UI doesn't freeze.
+# ---------------------------------------------------------------------------
+
+class SAM3Worker(QThread):
+    """Asynchronous SAM3 inference thread.
+
+    Inputs:
+      image_path : str — path to a temp image file on disk (run_sam3 needs a
+                   path; we dump the .rrd blob there).
+      bboxes_xyxy: list of [x1,y1,x2,y2] pixel coords (one per region).
+      concepts   : list of class names (one per bbox, used for labelling).
+      model_path, device, conf : forwarded to run_sam3.
+
+    Emits:
+      finished_signal(list_of_dicts) where each dict is
+        {ann_id: int|None, bbox_xyxy: [...], mask: HxW bool array|None,
+         label: str, area: float, success: bool, error: str|None}
+    """
+
+    finished_signal = pyqtSignal(list)
+    failed_signal = pyqtSignal(str)
+
+    def __init__(self, image_path: str, bboxes_xyxy: list,
+                 concepts: list, ann_ids: list,
+                 model_path: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.bboxes_xyxy = bboxes_xyxy
+        self.concepts = concepts
+        self.ann_ids = ann_ids
+        self.model_path = model_path
+        self.device = device
+        self.conf = conf
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _SAM3_AVAILABLE:
+            self.failed_signal.emit(
+                "SAM3 is not installed. Install ultralytics + segment-anything "
+                "and place model weights under core/sam3/models/sam3-model/sam3.pt"
+            )
+            return
+        # Group bboxes by concept so SAM3 sees exemplars of the same class
+        # together. Each unique concept gets one run_sam3 call with all
+        # bboxes for that concept as exemplars.
+        per_concept: Dict[str, List[int]] = defaultdict(list)
+        for i, c in enumerate(self.concepts):
+            per_concept[c].append(i)
+
+        results: List[Dict[str, Any]] = []
+        for concept, idxs in per_concept.items():
+            bxs = [self.bboxes_xyxy[i] for i in idxs]
+            try:
+                res = run_sam3(
+                    image_path=self.image_path,
+                    bboxes=bxs,
+                    concepts=[concept],
+                    model_path=self.model_path,
+                    device=self.device,
+                    conf=self.conf,
+                )
+            except Exception as e:
+                for i in idxs:
+                    results.append({
+                        "ann_id": self.ann_ids[i],
+                        "bbox_xyxy": self.bboxes_xyxy[i],
+                        "mask": None,
+                        "label": concept,
+                        "area": 0.0,
+                        "success": False,
+                        "error": str(e),
+                    })
+                continue
+
+            if not res.get("success"):
+                for i in idxs:
+                    results.append({
+                        "ann_id": self.ann_ids[i],
+                        "bbox_xyxy": self.bboxes_xyxy[i],
+                        "mask": None,
+                        "label": concept,
+                        "area": 0.0,
+                        "success": False,
+                        "error": res.get("error", "SAM3 failed"),
+                    })
+                continue
+
+            masks = res.get("masks", []) or []
+            dets = res.get("detections", []) or []
+            # Pair each input bbox with the closest detection's mask.
+            # dets[i].bbox is xyxy. We match by IoU.
+            for k, i in enumerate(idxs):
+                bx = self.bboxes_xyxy[i]
+                best_mask = None
+                best_iou = -1.0
+                for d_idx, d in enumerate(dets):
+                    db = d.get("bbox", [0, 0, 0, 0])
+                    iou = _iou_xyxy(bx, db)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_mask = masks[d_idx] if d_idx < len(masks) else None
+                # If no detection matched by IoU, fall back to the k-th mask.
+                if best_mask is None and k < len(masks):
+                    best_mask = masks[k]
+                area = float(best_mask.sum()) if best_mask is not None else 0.0
+                results.append({
+                    "ann_id": self.ann_ids[i],
+                    "bbox_xyxy": bx,
+                    "mask": best_mask,
+                    "label": concept,
+                    "area": area,
+                    "success": best_mask is not None,
+                    "error": None if best_mask is not None else "no matching mask",
+                })
+
+        self.finished_signal.emit(results)
+
+
+def _iou_xyxy(a: List[float], b: List[float]) -> float:
+    """IoU between two xyxy boxes. Returns 0 if either has zero area."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1); inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2); inter_y2 = min(ay2, by2)
+    iw = max(0.0, inter_x2 - inter_x1)
+    ih = max(0.0, inter_y2 - inter_y1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +631,18 @@ class CocoState:
             self.cat_name_to_id = {c["name"]: c["id"] for c in self.categories}
             for ann in self.annotations:
                 self._ann_id_next = max(self._ann_id_next, ann["id"] + 1)
+                # Decode any persisted mask (base64-encoded PNG).
+                mask_b64 = ann.get("mask")
+                if isinstance(mask_b64, str) and mask_b64:
+                    try:
+                        import base64
+                        ann["_mask"] = _decode_mask_png(
+                            base64.b64decode(mask_b64)
+                        ) or None
+                    except Exception:
+                        ann["_mask"] = None
+                else:
+                    ann["_mask"] = ann.get("_mask")  # may be None or ndarray
             for img in self.images:
                 ts = img.get("timestamp_ns")
                 if ts is not None:
@@ -418,10 +665,19 @@ class CocoState:
         return 0
 
     def save(self, is_final: bool) -> None:
-        final_anns = [
-            ann for ann in self.annotations
-            if ann["id"] not in self.removed_ids
-        ]
+        import base64
+        final_anns = []
+        for ann in self.annotations:
+            if ann["id"] in self.removed_ids:
+                continue
+            out = {k: v for k, v in ann.items() if not k.startswith("_")}
+            # Persist mask as base64-encoded PNG so it survives json round-trip.
+            mask = ann.get("_mask")
+            if mask is not None and isinstance(mask, np.ndarray) and mask.size:
+                png = _encode_mask_png(mask)
+                if png:
+                    out["mask"] = base64.b64encode(png).decode("ascii")
+            final_anns.append(out)
         data = {
             "images": self.images,
             "annotations": final_anns,
@@ -499,6 +755,22 @@ class CocoState:
     def remove_box(self, ann_id: int) -> None:
         self.removed_ids.add(ann_id)
 
+    def set_mask(self, ann_id: int, mask: Optional[np.ndarray]) -> None:
+        """Attach (or clear) a SAM3 mask to an annotation, in-memory only."""
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                if mask is None:
+                    ann.pop("_mask", None)
+                else:
+                    ann["_mask"] = mask
+                return
+
+    def get_mask(self, ann_id: int) -> Optional[np.ndarray]:
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                return ann.get("_mask")
+        return None
+
     def anns_for_image(self, image_id: int) -> List[Dict[str, Any]]:
         return [
             ann for ann in self.annotations
@@ -529,7 +801,7 @@ class CocoState:
 # ---------------------------------------------------------------------------
 
 class CanvasWidget(QWidget):
-    """2D image canvas with bbox overlay. Emits signals on edits."""
+    """2D image canvas with bbox + mask overlay. Emits signals on edits."""
 
     box_added = pyqtSignal(int, float, float, float, float, int)  # img_id,x,y,w,h,cat_id
     box_deleted = pyqtSignal(int)  # ann_id
@@ -538,6 +810,8 @@ class CanvasWidget(QWidget):
     quit_request = pyqtSignal()
     discard_all = pyqtSignal()
     cat_pick_requested = pyqtSignal(float, float, float, float)  # pending rect
+    resegment_selected = pyqtSignal()  # R key on selected box
+    toggle_masks = pyqtSignal()       # M key
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -549,6 +823,7 @@ class CanvasWidget(QWidget):
         self._pixmap: Optional[QPixmap] = None
         self._image_size: Tuple[int, int] = (0, 0)  # (w, h)
         self._boxes: List[Dict[str, Any]] = []  # see set_boxes
+        self._masks_visible: bool = True
         self._selected_idx: int = -1
         self._drawing: bool = False
         self._draw_start: Optional[Tuple[float, float]] = None
@@ -577,12 +852,20 @@ class CanvasWidget(QWidget):
         self.update()
 
     def set_boxes(self, boxes: List[Dict[str, Any]]) -> None:
-        """boxes: list of dicts with keys id, bbox=[x,y,w,h], cat_name, cat_id, seed."""
+        """boxes: list of dicts with keys id, bbox=[x,y,w,h], cat_name, cat_id,
+        optional mask (HxW bool array)."""
         self._boxes = list(boxes)
         self._selected_idx = -1
         self._waiting_cat = False
         self._pending_rect = None
         self.update()
+
+    def set_masks_visible(self, visible: bool) -> None:
+        self._masks_visible = visible
+        self.update()
+
+    def masks_visible(self) -> bool:
+        return self._masks_visible
 
     def set_info(self, text: str) -> None:
         self._info_text = text
@@ -631,6 +914,48 @@ class CanvasWidget(QWidget):
 
     # ----------------------- painting ---------------------------------- #
 
+    # Per-class color palette (RGB) for mask overlays.
+    _MASK_COLORS = [
+        (255, 0, 128), (0, 200, 255), (120, 220, 60), (255, 160, 0),
+        (160, 0, 255), (0, 255, 200), (220, 40, 40), (40, 220, 220),
+        (255, 220, 40), (180, 220, 255),
+    ]
+
+    def _color_for_cat(self, cat_id: int) -> Tuple[int, int, int]:
+        return self._MASK_COLORS[cat_id % len(self._MASK_COLORS)]
+
+    def _paint_masks(self, p: QPainter) -> None:
+        """Paint semi-transparent masks for every box that has one."""
+        iw, ih = self._image_size
+        if iw <= 0 or ih <= 0:
+            return
+        for i, box in enumerate(self._boxes):
+            mask = box.get("mask")
+            if mask is None or not isinstance(mask, np.ndarray) or mask.size == 0:
+                continue
+            # Build an RGBA8888 QImage from the mask tinted with the class color.
+            h, w = mask.shape[:2]
+            if (w, h) != (iw, ih):
+                # Resize the mask to the current image size (nearest neighbor).
+                from PIL import Image as _PILImage
+                m_pil = _PILImage.fromarray((mask.astype(np.uint8) * 255), mode="L")
+                m_pil = m_pil.resize((iw, ih), _PILImage.NEAREST)
+                mask = np.array(m_pil) > 0
+            cat_id = box.get("cat_id", 0)
+            r, g, b = self._color_for_cat(cat_id)
+            rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba[..., 0] = r
+            rgba[..., 1] = g
+            rgba[..., 2] = b
+            rgba[..., 3] = (mask.astype(np.uint8) * 120)  # 47% alpha
+            qimg = QtGui.QImage(rgba.data, w, h, 4 * w,
+                               QtGui.QImage.Format.Format_RGBA8888)
+            mask_pixmap = QPixmap.fromImage(qimg.copy())
+            tl = self._img_to_widget(0, 0)
+            br = self._img_to_widget(iw, ih)
+            p.drawPixmap(QtCore.QRectF(tl, br), mask_pixmap,
+                         QtCore.QRectF(0, 0, iw, ih))
+
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -649,6 +974,10 @@ class CanvasWidget(QWidget):
         p.drawPixmap(target, self._pixmap,
                      QtCore.QRectF(0, 0, self._pixmap.width(),
                                    self._pixmap.height()))
+
+        # Draw masks (semi-transparent overlay, per-class color).
+        if self._masks_visible and self._boxes:
+            self._paint_masks(p)
 
         # Draw boxes.
         font = QFont("Sans", max(8, int(10 * self._scale + 4)))
@@ -806,6 +1135,10 @@ class CanvasWidget(QWidget):
             self.save_quit.emit()
         elif k in (Qt.Key_Q, Qt.Key_Escape):
             self.quit_request.emit()
+        elif k == Qt.Key_M:
+            self.toggle_masks.emit()
+        elif k == Qt.Key_R:
+            self.resegment_selected.emit()
         elif k in (Qt.Key_Plus, Qt.Key_Equal):
             self._scale = min(40.0, self._scale * 1.2); self.update()
         elif k == Qt.Key_Minus:
@@ -824,6 +1157,9 @@ class SidePanel(QWidget):
 
     cat_clicked = pyqtSignal(int)  # cat_id
     slider_moved = pyqtSignal(int)  # frame_idx
+    run_sam3_clicked = pyqtSignal()      # "Run SAM3 (all)" button
+    toggle_masks_clicked = pyqtSignal()  # "Masks: on/off" button
+    resegment_clicked = pyqtSignal()     # "Re-segment selected" button
 
     def __init__(self, coco: CocoState, parent=None):
         super().__init__(parent)
@@ -839,7 +1175,29 @@ class SidePanel(QWidget):
         self.cat_list.itemClicked.connect(self._on_cat_clicked)
         self._rebuild_cat_list()
 
-        self.frame_slider = QSlider(Qt.Horizontal)
+        # SAM3 controls
+        sam_layout = QHBoxLayout()
+        self.btn_run_sam3 = QPushButton("Run SAM3 (all)")
+        self.btn_run_sam3.setToolTip("Run SAM3 segmentation on every bbox on the current frame.")
+        self.btn_run_sam3.clicked.connect(self.run_sam3_clicked.emit)
+        sam_layout.addWidget(self.btn_run_sam3)
+        self.btn_reseg = QPushButton("Re-seg sel (R)")
+        self.btn_reseg.setToolTip("Re-run SAM3 on the selected bbox only.")
+        self.btn_reseg.clicked.connect(self.resegment_clicked.emit)
+        sam_layout.addWidget(self.btn_reseg)
+        layout.addLayout(sam_layout)
+
+        self.btn_masks = QPushButton("Masks: ON")
+        self.btn_masks.setCheckable(True)
+        self.btn_masks.setChecked(True)
+        self.btn_masks.setToolTip("Toggle mask overlay visibility (M).")
+        self.btn_masks.clicked.connect(self._on_masks_toggled)
+        layout.addWidget(self.btn_masks)
+
+        self.sam3_status = QLabel("SAM3: idle")
+        layout.addWidget(self.sam3_status)
+
+        self.frame_slider = QSlider(_QT_HORZ)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(0)
         self.frame_slider.valueChanged.connect(self.slider_moved.emit)
@@ -853,10 +1211,19 @@ class SidePanel(QWidget):
             "<b>Keys (click canvas first):</b><br>"
             "D = delete sel &nbsp; A = draw &nbsp; N = next &nbsp; B = back<br>"
             "X = discard all &nbsp; S = save+quit &nbsp; Q = quit<br>"
-            "0-9 = pick cat &nbsp; + / - = zoom &nbsp; 0 = fit"
+            "0-9 = pick cat &nbsp; + / - = zoom &nbsp; 0 = fit<br>"
+            "M = toggle masks &nbsp; R = re-seg selected"
         )
         self.help_label.setWordWrap(True)
         layout.addWidget(self.help_label)
+
+    def _on_masks_toggled(self) -> None:
+        on = self.btn_masks.isChecked()
+        self.btn_masks.setText("Masks: ON" if on else "Masks: OFF")
+        self.toggle_masks_clicked.emit()
+
+    def set_sam3_status(self, text: str) -> None:
+        self.sam3_status.setText(text)
 
     def _on_cat_clicked(self, item: QListWidgetItem) -> None:
         cat_id = item.data(Qt.UserRole)
@@ -974,21 +1341,34 @@ class TimeBridge(QObject):
 class ReviewWindow(QMainWindow):
 
     def __init__(self, rrd_index: RrdFrameIndex, coco: CocoState,
-                 grpc_uri: str, web_port: int, parent=None):
+                 grpc_uri: str, web_port: int,
+                 sam3_model: Optional[str] = None,
+                 sam3_device: str = "cuda",
+                 sam3_conf: float = 0.25,
+                 auto_segment: bool = False,
+                 parent=None):
         super().__init__(parent)
         self.rrd_index = rrd_index
         self.coco = coco
         self.grpc_uri = grpc_uri
         self.web_port = web_port
+        self.sam3_model = sam3_model
+        self.sam3_device = sam3_device
+        self.sam3_conf = sam3_conf
+        self.auto_segment = auto_segment
 
         self.setWindowTitle("Rerun Label Review")
         self.resize(1600, 900)
 
         self._current_idx = coco.current_idx
         self._current_image_id: Optional[int] = None
+        self._pending_cat_id: Optional[int] = None
+        self._sam3_worker: Optional[SAM3Worker] = None
+        # Tmp file path for the current frame's image (run_sam3 needs a path).
+        self._tmp_image_path: Optional[str] = None
 
         # ---------- layout ----------
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(_QT_HORZ)
         self.canvas = CanvasWidget()
         self.canvas.parent_window = self  # type: ignore[attr-defined]
         splitter.addWidget(self.canvas)
@@ -998,7 +1378,7 @@ class ReviewWindow(QMainWindow):
         splitter.setSizes([1200, 360])
 
         # Right column: web viewer below the canvas
-        right_split = QSplitter(Qt.Vertical)
+        right_split = QSplitter(_QT_VERT)
         right_split.addWidget(splitter)
 
         self.web_view: Optional[QWebEngineView] = None
@@ -1028,8 +1408,13 @@ class ReviewWindow(QMainWindow):
         self.canvas.quit_request.connect(self._on_quit)
         self.canvas.discard_all.connect(self._on_discard_all)
         self.canvas.cat_pick_requested.connect(self._on_cat_pick_requested)
+        self.canvas.toggle_masks.connect(self._on_toggle_masks)
+        self.canvas.resegment_selected.connect(self._on_resegment_selected)
         self.side.cat_clicked.connect(self._on_side_cat_clicked)
         self.side.slider_moved.connect(self._on_slider_moved)
+        self.side.run_sam3_clicked.connect(self._on_run_sam3_all)
+        self.side.toggle_masks_clicked.connect(self._on_toggle_masks)
+        self.side.resegment_clicked.connect(self._on_resegment_selected)
 
         if self.bridge is not None:
             self.bridge.time_changed.connect(self._on_viewer_time_changed)
@@ -1115,9 +1500,12 @@ class ReviewWindow(QMainWindow):
         self.side.set_slider(idx)
         self.side.set_info(idx, len(self.rrd_index),
                            frame["timestamp_ns"], len(boxes))
-        # Autosave progress (tmp).
+        # Update current index for save paths. We do NOT autosave on every
+        # frame navigation (it would write the JSON every tick when the
+        # embedded Rerun viewer autoplays the timeline). Progress is saved:
+        #   - on explicit N/B/X keystrokes (see _on_frame_nav / _on_discard_all)
+        #   - on quit (closeEvent, _on_save_quit, _on_quit)
         self.coco.current_idx = idx
-        self.coco.save(is_final=False)
 
     # ----------------------- event handlers ---------------------------- #
 
@@ -1126,11 +1514,14 @@ class ReviewWindow(QMainWindow):
         if 0 <= new_idx < len(self.rrd_index):
             self._current_idx = new_idx
             self._load_current()
+            # Save progress (tmp) on explicit nav — not on autoplay ticks.
+            self.coco.save(is_final=False)
 
     def _on_slider_moved(self, idx: int) -> None:
         if 0 <= idx < len(self.rrd_index) and idx != self._current_idx:
             self._current_idx = idx
             self._load_current()
+            self.coco.save(is_final=False)
 
     def _on_viewer_time_changed(self, ts_ns: int) -> None:
         idx = self.rrd_index.find_idx_by_timestamp(ts_ns)
@@ -1193,10 +1584,20 @@ class ReviewWindow(QMainWindow):
         if rect is None or self._current_image_id is None:
             return
         x, y, w, h = rect
-        self.coco.add_box(self._current_image_id, x, y, w, h, cat_id)
+        new_ann_id = self.coco.add_box(self._current_image_id, x, y, w, h, cat_id)
         self.canvas.reset_state()
         self._refresh_boxes()
-        print(f"✅ Added box cat={self.coco.cat_map[cat_id]}")
+        print(f"✅ Added box cat={self.coco.cat_map[cat_id]} (ann_id={new_ann_id})")
+        if self.auto_segment and _SAM3_AVAILABLE:
+            # Auto-run SAM3 on the freshly added box.
+            img_path = self._write_tmp_image()
+            if img_path is not None:
+                self._start_sam3_worker(
+                    img_path,
+                    bboxes_xyxy=[[x, y, x + w, y + h]],
+                    concepts=[self.coco.cat_map[cat_id]],
+                    ann_ids=[new_ann_id],
+                )
 
     def _on_side_cat_clicked(self, cat_id: int) -> None:
         # If we have a pending rect, assign; else start a draw mode.
@@ -1221,11 +1622,151 @@ class ReviewWindow(QMainWindow):
                 "bbox": [x, y, bw, bh],
                 "cat_id": ann["category_id"],
                 "cat_name": self.coco.cat_map.get(ann["category_id"], "?"),
+                "mask": ann.get("_mask"),
             })
         self.canvas.set_boxes(boxes)
         self.side.set_info(self._current_idx, len(self.rrd_index),
                            self.rrd_index.frame_at(self._current_idx)["timestamp_ns"],
                            len(boxes))
+
+    # ----------------------- SAM3 segmentation ------------------------- #
+
+    def _write_tmp_image(self) -> Optional[str]:
+        """Write the current frame's image blob to a tmp file (for run_sam3)."""
+        if self._current_idx < 0 or self._current_idx >= len(self.rrd_index):
+            return None
+        frame = self.rrd_index.frame_at(self._current_idx)
+        blob = frame.get("image_blob")
+        if not blob:
+            return None
+        # Pick suffix from media_type if available, else .jpg
+        mt = frame.get("media_type") or "image/jpeg"
+        ext = ".jpg"
+        if "png" in mt:
+            ext = ".png"
+        elif "webp" in mt:
+            ext = ".webp"
+        elif "bmp" in mt:
+            ext = ".bmp"
+        tmp_dir = Path(self.coco.output_json).parent / "_tmp_sam3_imgs"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        path = tmp_dir / f"frame_{self._current_idx}{ext}"
+        try:
+            with open(path, "wb") as f:
+                f.write(blob)
+            self._tmp_image_path = str(path)
+            return self._tmp_image_path
+        except Exception as e:
+            print(f"⚠️ Failed to write tmp image for SAM3: {e}")
+            return None
+
+    def _on_run_sam3_all(self) -> None:
+        """Run SAM3 on every bbox on the current frame."""
+        if not _SAM3_AVAILABLE:
+            QMessageBox.warning(self, "SAM3 unavailable",
+                                 "core.models_inference.run_sam3 not importable. "
+                                 "Install ultralytics + segment-anything and "
+                                 "place weights at "
+                                 "core/sam3/models/sam3-model/sam3.pt")
+            return
+        if self._current_image_id is None:
+            return
+        anns = self.coco.anns_for_image(self._current_image_id)
+        if not anns:
+            print("ℹ️ No bboxes on this frame — nothing to segment.")
+            return
+        img_path = self._write_tmp_image()
+        if img_path is None:
+            return
+        bboxes_xyxy = []
+        concepts = []
+        ann_ids = []
+        for ann in anns:
+            x, y, w, h = ann["bbox"]
+            bboxes_xyxy.append([x, y, x + w, y + h])
+            concepts.append(self.coco.cat_map.get(ann["category_id"], "object"))
+            ann_ids.append(ann["id"])
+        self._start_sam3_worker(img_path, bboxes_xyxy, concepts, ann_ids)
+
+    def _on_resegment_selected(self) -> None:
+        """Re-run SAM3 on just the selected bbox (R key / button)."""
+        if not _SAM3_AVAILABLE:
+            QMessageBox.warning(self, "SAM3 unavailable",
+                                 "core.models_inference.run_sam3 not importable.")
+            return
+        sel = self.canvas._selected_idx
+        if sel < 0 or sel >= len(self.canvas._boxes):
+            print("ℹ️ No box selected — press R after clicking a box.")
+            return
+        box = self.canvas._boxes[sel]
+        ann_id = box["id"]
+        x, y, w, h = box["bbox"]
+        img_path = self._write_tmp_image()
+        if img_path is None:
+            return
+        bboxes_xyxy = [[x, y, x + w, y + h]]
+        concepts = [self.coco.cat_map.get(box.get("cat_id", 0), "object")]
+        ann_ids = [ann_id]
+        print(f"🔬 Re-segmenting ann_id={ann_id} "
+              f"bbox={bboxes_xyxy[0]} cat={concepts[0]}")
+        self._start_sam3_worker(img_path, bboxes_xyxy, concepts, ann_ids)
+
+    def _start_sam3_worker(self, img_path: str, bboxes_xyxy: list,
+                           concepts: list, ann_ids: list) -> None:
+        if self._sam3_worker is not None and self._sam3_worker.isRunning():
+            print("⚠️ SAM3 already running, please wait…")
+            return
+        self.side.set_sam3_status(
+            f"SAM3: running on {len(bboxes_xyxy)} box(es)…"
+        )
+        self.canvas.setEnabled(False)
+        self._sam3_worker = SAM3Worker(
+            image_path=img_path,
+            bboxes_xyxy=bboxes_xyxy,
+            concepts=concepts,
+            ann_ids=ann_ids,
+            model_path=self.sam3_model,
+            device=self.sam3_device,
+            conf=self.sam3_conf,
+            parent=self,
+        )
+        self._sam3_worker.finished_signal.connect(self._on_sam3_finished)
+        self._sam3_worker.failed_signal.connect(self._on_sam3_failed)
+        self._sam3_worker.start()
+
+    def _on_sam3_finished(self, results: list) -> None:
+        self.canvas.setEnabled(True)
+        n_ok = sum(1 for r in results if r.get("success"))
+        n_fail = len(results) - n_ok
+        self.side.set_sam3_status(
+            f"SAM3: done — {n_ok} mask(s), {n_fail} failed"
+        )
+        for r in results:
+            ann_id = r.get("ann_id")
+            mask = r.get("mask")
+            if ann_id is None:
+                continue
+            self.coco.set_mask(ann_id, mask)
+            if not r.get("success"):
+                print(f"  ⚠️ ann_id={ann_id}: {r.get('error', 'no mask')}")
+        self._refresh_boxes()
+        # Save progress so masks survive a crash.
+        self.coco.save(is_final=False)
+        print(f"✅ SAM3 finished — {n_ok}/{len(results)} masks assigned")
+
+    def _on_sam3_failed(self, msg: str) -> None:
+        self.canvas.setEnabled(True)
+        self.side.set_sam3_status(f"SAM3: failed — {msg}")
+        QMessageBox.warning(self, "SAM3 failed", msg)
+
+    def _on_toggle_masks(self) -> None:
+        new_vis = not self.canvas.masks_visible()
+        self.canvas.set_masks_visible(new_vis)
+        # Keep the side-panel button in sync.
+        self.side.btn_masks.blockSignals(True)
+        self.side.btn_masks.setChecked(new_vis)
+        self.side.btn_masks.setText("Masks: ON" if new_vis else "Masks: OFF")
+        self.side.btn_masks.blockSignals(False)
 
     # ----------------------- shutdown ---------------------------------- #
 
@@ -1368,6 +1909,16 @@ def main():
     parser.add_argument("--data-yaml", help="Reference data.yaml for YOLO class order.")
     parser.add_argument("--grpc-port", type=int, default=9876)
     parser.add_argument("--web-port", type=int, default=9090)
+    # SAM3 options
+    parser.add_argument("--sam3-model", default=None,
+                        help="Path to SAM3 weights (default: "
+                             "core/sam3/models/sam3-model/sam3.pt).")
+    parser.add_argument("--sam3-device", default="cuda", choices=["cuda", "cpu"],
+                        help="Device for SAM3 inference (default: cuda).")
+    parser.add_argument("--sam3-conf", type=float, default=0.25,
+                        help="SAM3 confidence threshold (default: 0.25).")
+    parser.add_argument("--auto-segment", action="store_true",
+                        help="Automatically run SAM3 after each new bbox is drawn.")
     args = parser.parse_args()
 
     rrd_path = os.path.abspath(args.rrd)
@@ -1420,7 +1971,11 @@ def main():
 
     win = ReviewWindow(rrd_index, coco,
                        grpc_uri=f"rerun+http://127.0.0.1:{args.grpc_port}/proxy",
-                       web_port=args.web_port)
+                       web_port=args.web_port,
+                       sam3_model=args.sam3_model,
+                       sam3_device=args.sam3_device,
+                       sam3_conf=args.sam3_conf,
+                       auto_segment=args.auto_segment)
     win.show()
     exit_code = app.exec()
 
