@@ -133,8 +133,11 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
                (e.g. 13) and press Enter to reassign the selected box
     T        : focus the "Track of selected" field — type a track id and
                press Enter to set it (clear the field to unset). Track ids
-               are auto-assigned globally in creation order (1, 2, 3, ...)
-               across categories and frames
+               are auto-assigned by inheritance: the k-th box drawn on a
+               frame gets the k-th track id from the nearest earlier
+               annotated frame (box 1 on frame 2 → track 1, etc.), falling
+               back to a global counter (1, 2, 3, ...) when there is no
+               earlier frame or it has fewer boxes
     K        : toggle keyframe on the current frame (anchors for
                interpolation; keyframes with boxes take priority over
                other labeled frames)
@@ -1228,9 +1231,11 @@ class CocoState:
         # Frames the user marked as interpolation keyframes (K key / button).
         # Persisted in the .progress sidecar like `reviewed`.
         self.keyframes: set = set()
-        # Global auto-increment for track ids, in creation order: box 1 gets
-        # id 1, box 2 gets id 2, the first box on frame 2 gets id 3, and so
-        # on across categories and frames. Deleted ids are never recycled.
+        # Global auto-increment fallback for track ids. Normally a drawn box
+        # inherits the track id of the same-order box on the nearest earlier
+        # annotated frame (see _next_track_id); this counter covers the
+        # first frame, extra boxes, and seeds. Deleted ids are never
+        # recycled.
         self._track_next: int = 1
         self._img_id_by_ts: Dict[int, int] = {}
         self._img_id_by_idx: Dict[int, int] = {}
@@ -1393,7 +1398,7 @@ class CocoState:
             "area": float(hw * 2 * hh * 2),
             "iscrowd": 0,
             "seed": True,
-            "track_id": self._next_track_id(cat_id),
+            "track_id": self._fresh_track_id(),
         }
         self.annotations.append(ann)
         self._ann_id_next += 1
@@ -1412,7 +1417,7 @@ class CocoState:
             "bbox": [float(x), float(y), float(w), float(h)],
             "area": float(w * h),
             "iscrowd": 0,
-            "track_id": self._next_track_id(cat_id),
+            "track_id": self._next_track_id(image_id, cat_id),
         }
         self.annotations.append(ann)
         self._ann_id_next += 1
@@ -1520,17 +1525,61 @@ class CocoState:
                 return True
         return False
 
-    def _next_track_id(self, cat_id: int) -> int:
-        """Assign the next track id in global creation order (1-based).
+    def _fresh_track_id(self) -> int:
+        """Next id from the global creation-order counter (1-based).
 
-        Box 1 drawn gets id 1, box 2 gets id 2, the first box on frame 2
-        gets id 3, etc. — across categories and frames. Deleted boxes do
-        not recycle their ids (the counter only moves forward). ``cat_id``
-        is accepted for call-site compatibility and ignored.
-        """
+        Deleted boxes do not recycle their ids (the counter only moves
+        forward)."""
         n = self._track_next
         self._track_next += 1
         return n
+
+    def _reference_track_ids(self, image_id: int) -> List[Optional[int]]:
+        """Track ids of the nearest earlier annotated frame, in that
+        frame's creation order — the frame new boxes should inherit
+        track ids from (this is what interpolation pairing expects)."""
+        idx = None
+        for img in self.images:
+            if img["id"] == image_id:
+                idx = img.get("frame_idx")
+                break
+        if not idx:  # None or frame 0 → no earlier frame possible
+            return []
+        for fi in range(idx - 1, -1, -1):
+            ref_img_id = self._img_id_by_idx.get(fi)
+            if ref_img_id is None:
+                continue
+            tids = [a.get("track_id")
+                    for a in sorted(self.annotations,
+                                    key=lambda a: a["id"])
+                    if a["image_id"] == ref_img_id
+                    and a["id"] not in self.removed_ids]
+            if any(t is not None for t in tids):
+                return tids
+        return []
+
+    def _next_track_id(self, image_id: int, cat_id: int) -> int:
+        """Track id for a newly drawn box.
+
+        The k-th box drawn on this frame (in creation order) inherits the
+        k-th track id from the nearest earlier annotated frame — so the
+        first box drawn on frame 2 continues track 1 from frame 1, the
+        second continues track 2, etc. When there is no such reference, or
+        this frame already has more boxes than the reference, or the id is
+        already taken on this frame, a fresh global id is used. ``cat_id``
+        is accepted for call-site compatibility and ignored."""
+        ref = self._reference_track_ids(image_id)
+        if ref:
+            live = [a for a in self.annotations
+                    if a["image_id"] == image_id
+                    and a["id"] not in self.removed_ids]
+            k = len(live)
+            used = {a.get("track_id") for a in live}
+            if k < len(ref):
+                tid = ref[k]
+                if tid is not None and tid not in used:
+                    return tid
+        return self._fresh_track_id()
 
     def set_track_id(self, ann_id: int, value: Optional[int]) -> bool:
         """Undoable set of the annotation's track id (None clears it)."""
@@ -2398,8 +2447,9 @@ class SidePanel(QWidget):
         layout.addLayout(recat_row)
 
         # Track id of the selected box: type a number + Enter to set it,
-        # clear the field + Enter to unset. Auto-assigned globally in
-        # creation order (1, 2, 3, ...); edit it when a track continues.
+        # clear the field + Enter to unset. Auto-assigned by inheritance
+        # from the nearest earlier annotated frame (global counter as
+        # fallback); edit it when a track continues.
         track_row = QHBoxLayout()
         track_row.addWidget(QLabel("Track of selected:"))
         self.track_edit = QLineEdit()
