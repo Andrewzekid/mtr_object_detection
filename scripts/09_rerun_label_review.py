@@ -111,6 +111,15 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
     U        : jump to the next unlabeled frame (no boxes, not yet reviewed)
     C        : focus the "Cat of selected" field — type any category id
                (e.g. 13) and press Enter to reassign the selected box
+    T        : focus the "Track of selected" field — type a track id and
+               press Enter to set it (clear the field to unset). Track ids
+               are auto-assigned per category in draw order (T1, T2, ...)
+    K        : toggle keyframe on the current frame (anchors for
+               interpolation; keyframes with boxes take priority over
+               other labeled frames)
+    I        : interpolate — fill the gap between the nearest labeled
+               frames with optical-flow boxes (frames that already have
+               boxes are skipped; Ctrl+Z undoes the whole fill)
 
 Reviewed frames (marked on N forward-nav and X discard) are tracked in the
 .progress sidecar and shown in the status bar; X, S and quitting with
@@ -123,6 +132,7 @@ import argparse
 import io
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import sys
@@ -548,6 +558,135 @@ class SAM3BatchWorker(QThread):
             n_fail += sum(1 for r in results if not r["success"])
             self.progress_signal.emit(n + 1, len(self.jobs))
         self.finished_signal.emit(n_ok, n_fail)
+
+
+# ---------------------------------------------------------------------------
+# 13_interpolate_tracks.py engine loader + interpolation worker
+# ---------------------------------------------------------------------------
+
+_interp13_mod: Optional[Any] = None
+
+
+def _get_interp13():
+    """Lazily import scripts/13_interpolate_tracks.py (cached).
+
+    The file name starts with a digit, so a normal `import` is impossible;
+    load it by path via importlib. Safe at import time: 13's top-level code
+    only imports stdlib + cv2/numpy (+ scripts.tracking_utils, which is also
+    dependency-light) and its main() is __main__-guarded.
+    """
+    global _interp13_mod
+    if _interp13_mod is None:
+        from importlib import util
+        path = Path(__file__).resolve().parent / "13_interpolate_tracks.py"
+        spec = util.spec_from_file_location("interpolate_tracks", path)
+        mod = util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _interp13_mod = mod
+    return _interp13_mod
+
+
+class InterpBatchWorker(QThread):
+    """Background optical-flow interpolation between labeled frames.
+
+    jobs: list of dicts, one per matched (box_a, box_b) anchor pair:
+        {a: int, b: int, box_a: boxdict, box_b: boxdict}
+    where a < b are frame_idxs and box_a/box_b are 13-style box dicts
+    (ann_id, category_id, track_id, xywh, xyxy, center).
+
+    For each job the span's rrd image blobs are materialized into a fresh
+    per-run tmp dir and 13's interpolate_span is called as-is (flow_method /
+    camera_model passed through). Results for all jobs are collected and
+    emitted together via finished_signal(list of (job, {p: result})) so the
+    UI can apply them in a single undo group. Cancel is cooperative
+    (checked between jobs).
+    """
+
+    progress_signal = pyqtSignal(int, int)   # jobs done, total jobs
+    finished_signal = pyqtSignal(list)       # list of (job, pairs)
+    failed_signal = pyqtSignal(str)
+    cancelled_signal = pyqtSignal()
+
+    def __init__(self, rrd_index, jobs: List[Dict[str, Any]],
+                 base_tmp_dir: str, flow_method: str, camera_model: str,
+                 parent=None):
+        super().__init__(parent)
+        self.rrd_index = rrd_index
+        self.jobs = jobs
+        self.base_tmp_dir = base_tmp_dir
+        self.flow_method = flow_method
+        self.camera_model = camera_model
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Ask the worker to stop after the current job."""
+        self._cancel_requested = True
+
+    @staticmethod
+    def _frame_ext(frame: Dict[str, Any]) -> str:
+        mt = frame.get("media_type") or "image/jpeg"
+        if "png" in mt:
+            return ".png"
+        if "webp" in mt:
+            return ".webp"
+        if "bmp" in mt:
+            return ".bmp"
+        return ".jpg"
+
+    def _write_span(self, run_dir: str, a: int, b: int) -> List[Optional[str]]:
+        """Write the span's image blobs; return per-frame file names
+        (length b+1, None before a). Raises RuntimeError on a missing blob."""
+        frames: List[Optional[str]] = [None] * (b + 1)
+        for p in range(a, b + 1):
+            frame = self.rrd_index.frame_at(p)
+            name = f"frame_{p:06d}{self._frame_ext(frame)}"
+            frames[p] = name
+            dst = os.path.join(run_dir, name)
+            blob = frame.get("image_blob")
+            if blob:
+                with open(dst, "wb") as f:
+                    f.write(blob)
+            elif frame.get("file_path"):
+                # --images mode: no blob, copy the source file (cv2.imread
+                # sniffs the format, so the .jpg name is fine for any type).
+                shutil.copyfile(frame["file_path"], dst)
+            else:
+                raise RuntimeError(f"frame {p + 1}: no image data in source")
+        return frames
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        try:
+            mod = _get_interp13()
+        except Exception as e:
+            self.failed_signal.emit(
+                f"Cannot load 13_interpolate_tracks.py: {e}")
+            return
+        os.makedirs(self.base_tmp_dir, exist_ok=True)
+        results_out: List[Tuple[Dict[str, Any], Dict[int, Any]]] = []
+        for n, job in enumerate(self.jobs):
+            if self._cancel_requested:
+                self.cancelled_signal.emit()
+                return
+            a, b = job["a"], job["b"]
+            run_dir = os.path.join(
+                self.base_tmp_dir, f"run_{os.getpid()}_{id(self)}")
+            os.makedirs(run_dir, exist_ok=True)
+            try:
+                frames = self._write_span(run_dir, a, b)
+                pairs = mod.interpolate_span(
+                    run_dir, frames, a, b, job["box_a"], job["box_b"],
+                    flow_method=self.flow_method,
+                    camera_model=self.camera_model)
+                results_out.append((job, pairs))
+            except Exception as e:
+                self.failed_signal.emit(
+                    f"Interpolation failed between frames {a + 1} and "
+                    f"{b + 1}: {e}")
+                return
+            finally:
+                shutil.rmtree(run_dir, ignore_errors=True)
+            self.progress_signal.emit(n + 1, len(self.jobs))
+        self.finished_signal.emit(results_out)
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1146,13 @@ class CocoState:
             self.cat_name_to_id = {c["name"]: c["id"] for c in self.categories}
             for ann in self.annotations:
                 self._ann_id_next = max(self._ann_id_next, ann["id"] + 1)
+                # Rebuild the per-category track-id counter so new boxes
+                # continue the existing numbering without reusing ids.
+                tid = ann.get("track_id")
+                if isinstance(tid, int) and not isinstance(tid, bool):
+                    cat = ann["category_id"]
+                    self._track_counter[cat] = max(
+                        self._track_counter.get(cat, 0), tid)
                 # Decode any persisted mask (base64-encoded PNG).
                 mask_b64 = ann.get("mask")
                 if isinstance(mask_b64, str) and mask_b64:
@@ -1034,6 +1180,7 @@ class CocoState:
                     data = json.load(f)
                 idx = data.get("last_index", 0)
                 self.reviewed = set(data.get("reviewed", []))
+                self.keyframes = set(data.get("keyframes", []))
                 if 0 <= idx < total_frames:
                     print(f"⏳ Resuming from frame {idx + 1}/{total_frames}")
                     return idx
@@ -1067,7 +1214,8 @@ class CocoState:
             json.dump(data, f, indent=2, ensure_ascii=False)
         with open(self.progress_file, "w") as f:
             json.dump({"last_index": self.current_idx + 1,
-                       "reviewed": sorted(self.reviewed)}, f)
+                       "reviewed": sorted(self.reviewed),
+                       "keyframes": sorted(self.keyframes)}, f)
         self.dirty = False
         print(f"✅ Saved {'final' if is_final else 'progress'} → {path} "
               f"(idx {self.current_idx + 1})")
@@ -1122,6 +1270,7 @@ class CocoState:
             "area": float(hw * 2 * hh * 2),
             "iscrowd": 0,
             "seed": True,
+            "track_id": self._next_track_id(cat_id),
         }
         self.annotations.append(ann)
         self._ann_id_next += 1
@@ -1140,6 +1289,7 @@ class CocoState:
             "bbox": [float(x), float(y), float(w), float(h)],
             "area": float(w * h),
             "iscrowd": 0,
+            "track_id": self._next_track_id(cat_id),
         }
         self.annotations.append(ann)
         self._ann_id_next += 1
@@ -1247,12 +1397,122 @@ class CocoState:
                 return True
         return False
 
+    def _next_track_id(self, cat_id: int) -> int:
+        """Assign the next sequential track id for a category (1-based).
+
+        The first "Exit Sign" box drawn becomes "Exit Sign 1", the next
+        "Exit Sign 2", and so on — across frames. Deleted boxes do not
+        recycle their ids (the counter only moves forward).
+        """
+        n = self._track_counter.get(cat_id, 0) + 1
+        self._track_counter[cat_id] = n
+        return n
+
+    def set_track_id(self, ann_id: int, value: Optional[int]) -> bool:
+        """Undoable set of the annotation's track id (None clears it)."""
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                prev = ann.get("track_id")
+                if prev == value:
+                    return True
+                if value is None:
+                    ann.pop("track_id", None)
+                else:
+                    ann["track_id"] = int(value)
+                self.dirty = True
+                shown = value if value is not None else "(none)"
+                self.undo_stack.push(
+                    f"set track id #{ann_id} → {shown}",
+                    undo=lambda: self._undo_set_track(ann_id, prev),
+                    redo=lambda: self._undo_set_track(ann_id, value),
+                )
+                return True
+        return False
+
+    def add_interp_box(self, image_id: int, x: float, y: float,
+                       w: float, h: float, cat_id: int,
+                       track_id: Optional[int], source: str,
+                       confidence: float) -> int:
+        """Add a flow-interpolated box (undoable, like add_box).
+
+        Carries provenance: ``interp=True``, ``source`` (flow/linear/...),
+        ``confidence`` in [0,1], and the track id inherited from the start
+        anchor box.
+        """
+        ann = {
+            "id": self._ann_id_next,
+            "image_id": image_id,
+            "category_id": cat_id,
+            "bbox": [float(x), float(y), float(w), float(h)],
+            "area": float(w * h),
+            "iscrowd": 0,
+            "interp": True,
+            "source": source,
+            "confidence": float(confidence),
+        }
+        if track_id is not None:
+            ann["track_id"] = int(track_id)
+        self.annotations.append(ann)
+        self._ann_id_next += 1
+        self.dirty = True
+        new_id = ann["id"]
+        self.undo_stack.push(
+            f"interp box #{new_id}",
+            undo=lambda: self._undo_remove(new_id),
+            redo=lambda: self._redo_add(ann),
+        )
+        return new_id
+
+    # ------------------- interpolation helpers ------------------------- #
+
+    def labeled_frame_idxs(self) -> List[int]:
+        """Sorted frame_idxs that have at least one live annotation."""
+        boxed_img_ids = {
+            ann["image_id"] for ann in self.annotations
+            if ann["id"] not in self.removed_ids
+        }
+        out = {
+            img.get("frame_idx", 0)
+            for img in self.images if img["id"] in boxed_img_ids
+        }
+        return sorted(out)
+
+    def frame_has_boxes(self, frame_idx: int) -> bool:
+        img_id = self._img_id_by_idx.get(frame_idx)
+        if img_id is None:
+            return False
+        return any(
+            ann["image_id"] == img_id and ann["id"] not in self.removed_ids
+            for ann in self.annotations
+        )
+
+    def anchor_candidates(self) -> List[int]:
+        """Sorted frame_idxs usable as interpolation anchors (have boxes).
+
+        Keyframes (K) take priority: if any keyframe has boxes, only those
+        are candidates — so the user can pin exactly which frames bound an
+        interpolation span even when other frames also have boxes.
+        """
+        boxed = self.labeled_frame_idxs()
+        keyed = [f for f in boxed if f in self.keyframes]
+        return sorted(keyed if keyed else boxed)
+
     # ---- undo/redo primitives (called via lambdas on the stack) ---- #
 
     def _undo_set_cat(self, ann_id: int, cat_id: int) -> None:
         for ann in self.annotations:
             if ann["id"] == ann_id:
                 ann["category_id"] = cat_id
+                self.dirty = True
+                return
+
+    def _undo_set_track(self, ann_id: int, value: Optional[int]) -> None:
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                if value is None:
+                    ann.pop("track_id", None)
+                else:
+                    ann["track_id"] = value
                 self.dirty = True
                 return
 
@@ -1607,7 +1867,10 @@ class CanvasWidget(QWidget):
             tl = self._img_to_widget(x, y)
             br = self._img_to_widget(x + w, y + h)
             p.drawRect(QtCore.QRectF(tl, br))
-            label = f"{box.get('cat_name','?')} (id:{box['id']})"
+            tid = box.get("track_id")
+            ttxt = f"T{tid} " if tid is not None else ""
+            itxt = "~" if box.get("interp") else ""
+            label = f"{itxt}{ttxt}{box.get('cat_name','?')} (id:{box['id']})"
             p.fillRect(
                 int(tl.x()), max(0, int(tl.y() - 16)),
                 8 * len(label) + 6, 16, QColor(0, 0, 0, 160)
@@ -1936,6 +2199,10 @@ class SidePanel(QWidget):
     cancel_sam3_clicked = pyqtSignal()   # "Cancel SAM3" button
     recat_selected = pyqtSignal(int)     # new cat_id for the selected box
     sam3_all_frames_clicked = pyqtSignal()  # "SAM3 ALL frames" button
+    toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
+    interpolate_clicked = pyqtSignal()       # "Interpolate" button (I)
+    cancel_interp_clicked = pyqtSignal()     # "Stop" button (running interp)
+    track_id_selected = pyqtSignal(object)   # new track id (int) or None
 
     def __init__(self, coco: CocoState, parent=None):
         super().__init__(parent)
@@ -1973,6 +2240,20 @@ class SidePanel(QWidget):
         recat_row.addWidget(self.recat_edit, 1)
         layout.addLayout(recat_row)
 
+        # Track id of the selected box: type a number + Enter to set it,
+        # clear the field + Enter to unset. Auto-assigned on draw (per-
+        # category, in draw order); edit it when a track continues/merges.
+        track_row = QHBoxLayout()
+        track_row.addWidget(QLabel("Track of selected:"))
+        self.track_edit = QLineEdit()
+        self.track_edit.setPlaceholderText("id, e.g. 2 (empty clears)")
+        self.track_edit.setToolTip(
+            "Select a box, type a track id, press Enter to set it. "
+            "Clear the field and press Enter to unset. Press T to focus.")
+        self.track_edit.returnPressed.connect(self._on_track_entered)
+        track_row.addWidget(self.track_edit, 1)
+        layout.addLayout(track_row)
+
         # Frame playback controls: play/pause + speed.
         play_row = QHBoxLayout()
         self.btn_play = QPushButton("▶ Play")
@@ -2000,6 +2281,35 @@ class SidePanel(QWidget):
             jump_row.addWidget(btn)
         jump_row.addStretch(1)
         layout.addLayout(jump_row)
+
+        # Interpolation controls.
+        interp_row = QHBoxLayout()
+        self.btn_keyframe = QPushButton("★ Keyframe")
+        self.btn_keyframe.setCheckable(True)
+        self.btn_keyframe.setToolTip(
+            "Mark / unmark this frame as an interpolation keyframe (K). "
+            "Keyframes with boxes become the preferred interpolation "
+            "anchors.")
+        self.btn_keyframe.clicked.connect(self.toggle_keyframe_clicked.emit)
+        interp_row.addWidget(self.btn_keyframe)
+        self.btn_interpolate = QPushButton("Interpolate (I)")
+        self.btn_interpolate.setToolTip(
+            "Fill the gap between the nearest labeled frames with "
+            "optical-flow interpolated boxes. Frames that already have "
+            "boxes are skipped. Ctrl+Z undoes the whole fill.")
+        self.btn_interpolate.clicked.connect(self.interpolate_clicked.emit)
+        interp_row.addWidget(self.btn_interpolate)
+        self.btn_cancel_interp = QPushButton("Stop")
+        self.btn_cancel_interp.setToolTip("Stop the running interpolation.")
+        self.btn_cancel_interp.setEnabled(False)
+        self.btn_cancel_interp.clicked.connect(
+            self.cancel_interp_clicked.emit)
+        interp_row.addWidget(self.btn_cancel_interp)
+        layout.addLayout(interp_row)
+
+        self.interp_status = QLabel("Interpolation: idle")
+        self.interp_status.setWordWrap(True)
+        layout.addWidget(self.interp_status)
 
         # SAM3 controls
         sam_layout = QHBoxLayout()
@@ -2081,6 +2391,8 @@ class SidePanel(QWidget):
             "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause<br>"
             "Z = zoom to sel &nbsp; Ctrl+Z = undo &nbsp; Ctrl+Shift+Z = redo<br>"
             "U = jump to next unlabeled frame &nbsp; C = focus cat-id field<br>"
+            "T = focus track-id field &nbsp; K = toggle keyframe<br>"
+            "I = interpolate between nearest labeled frames<br>"
             "<i>Click a category first to preselect it for the next draw.<br>"
             "New draws reuse the previous box's category automatically.</i>"
         )
@@ -2095,7 +2407,10 @@ class SidePanel(QWidget):
         self.box_list.clear()
         for i, b in enumerate(boxes):
             x, y, w, h = b["bbox"]
-            txt = (f"{b.get('cat_name','?')} (id: {b['id']})  "
+            tid = b.get("track_id")
+            ttxt = f" T{tid}" if tid is not None else ""
+            itxt = " ~interp" if b.get("interp") else ""
+            txt = (f"{b.get('cat_name','?')}{ttxt}{itxt} (id: {b['id']})  "
                    f"[{int(x)},{int(y)},{int(w)},{int(h)}]")
             it = QListWidgetItem(txt)
             it.setData(Qt.UserRole, i)  # store the box index, not ann_id
@@ -2153,6 +2468,15 @@ class SidePanel(QWidget):
         self.btn_sam3_all_frames.setEnabled(not running)
         self.btn_cancel_sam3.setEnabled(running)
 
+    def set_interp_status(self, text: str) -> None:
+        self.interp_status.setText(text)
+
+    def set_interp_running(self, running: bool) -> None:
+        """Enable Stop and disable the trigger buttons while busy."""
+        self.btn_interpolate.setEnabled(not running)
+        self.btn_keyframe.setEnabled(not running)
+        self.btn_cancel_interp.setEnabled(running)
+
     def set_annotated_progress(self, annotated: int, total: int) -> None:
         self.annot_progress.setMaximum(max(total, 1))
         self.annot_progress.setValue(min(annotated, max(total, 1)))
@@ -2164,6 +2488,21 @@ class SidePanel(QWidget):
             self.recat_edit.clear()
         else:
             self.recat_edit.selectAll()
+
+    def _on_track_entered(self) -> None:
+        txt = self.track_edit.text().strip()
+        if txt == "":
+            self.track_id_selected.emit(None)
+            self.track_edit.clear()
+        elif txt.isdigit():
+            self.track_id_selected.emit(int(txt))
+            self.track_edit.clear()
+        else:
+            self.track_edit.selectAll()
+
+    def prefill_track(self, track_id: Optional[int]) -> None:
+        """Show a box's track id (or empty) in the track field."""
+        self.track_edit.setText("" if track_id is None else str(track_id))
 
     def set_mask_opacity(self, pct: int) -> None:
         """Sync the opacity slider without re-emitting (e.g. on restore)."""
@@ -2312,11 +2651,13 @@ class ReviewWindow(QMainWindow):
                  grpc_uri: str, web_port: int,
                  sam3_model: Optional[str] = None,
                  sam3_device: str = "cuda",
-                 sam3_conf: float = 0.25,
-                 auto_segment: bool = False,
-                 seed_from_rrd: bool = True,
-                 has_viewer: bool = True,
-                 parent=None):
+                  sam3_conf: float = 0.25,
+                  auto_segment: bool = False,
+                  seed_from_rrd: bool = True,
+                  interp_flow_method: str = "dis",
+                  interp_camera_model: str = "none",
+                  has_viewer: bool = True,
+                  parent=None):
         super().__init__(parent)
         self.rrd_index = rrd_index
         self.coco = coco
@@ -2327,6 +2668,8 @@ class ReviewWindow(QMainWindow):
         self.sam3_device = sam3_device
         self.sam3_conf = sam3_conf
         self.auto_segment = auto_segment
+        self.interp_flow_method = interp_flow_method
+        self.interp_camera_model = interp_camera_model
 
         self.setWindowTitle("Computer Vision Label Review Tool")
         self.resize(1600, 900)
@@ -2340,6 +2683,7 @@ class ReviewWindow(QMainWindow):
         self._sam3_worker: Optional[SAM3Worker] = None
         self._sam3_batch_worker: Optional[SAM3BatchWorker] = None
         self._batch_frames_done: int = 0
+        self._interp_worker: Optional[InterpBatchWorker] = None
         # Tmp file path for the current frame's image (run_sam3 needs a path).
         self._tmp_image_path: Optional[str] = None
 
@@ -2463,6 +2807,10 @@ class ReviewWindow(QMainWindow):
         self.side.cancel_sam3_clicked.connect(self._on_cancel_sam3)
         self.side.recat_selected.connect(self._on_recat_selected)
         self.side.sam3_all_frames_clicked.connect(self._on_sam3_all_frames)
+        self.side.toggle_keyframe_clicked.connect(self._on_toggle_keyframe)
+        self.side.interpolate_clicked.connect(self._on_interpolate)
+        self.side.cancel_interp_clicked.connect(self._on_cancel_interp)
+        self.side.track_id_selected.connect(self._on_track_selected)
 
         if self.bridge is not None:
             self.bridge.time_changed.connect(self._on_viewer_time_changed)
@@ -2491,6 +2839,9 @@ class ReviewWindow(QMainWindow):
             (Qt.Key_Z, self._on_zoom_to_selected),
             (Qt.Key_U, self._on_next_unlabeled),
             (Qt.Key_C, self._focus_recat_edit),
+            (Qt.Key_T, self._focus_track_edit),
+            (Qt.Key_K, self._on_toggle_keyframe),
+            (Qt.Key_I, self._on_interpolate),
         ]:
             sc = QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(slot)
@@ -2782,6 +3133,8 @@ class ReviewWindow(QMainWindow):
                 "cat_id": ann["category_id"],
                 "cat_name": self.coco.cat_map.get(ann["category_id"], "?"),
                 "mask": ann.get("_mask"),
+                "track_id": ann.get("track_id"),
+                "interp": ann.get("interp", False),
             })
         self.canvas.set_image(arr)
         self.canvas.set_boxes(boxes)
@@ -2799,6 +3152,7 @@ class ReviewWindow(QMainWindow):
         #   - on explicit N/B/X keystrokes (see _on_frame_nav / _on_discard_all)
         #   - on quit (closeEvent, _on_save_quit, _on_quit)
         self.coco.current_idx = idx
+        self._sync_keyframe_button()
         self._update_progress()
 
     # ----------------------- event handlers ---------------------------- #
@@ -2887,6 +3241,274 @@ class ReviewWindow(QMainWindow):
             f"Zoomed to box #{self.canvas._boxes[sel]['id']}", 2000
         )
 
+    # ----------------------- interpolation ----------------------------- #
+
+    def _sync_keyframe_button(self) -> None:
+        """Reflect whether the current frame is a marked keyframe."""
+        self.side.btn_keyframe.blockSignals(True)
+        self.side.btn_keyframe.setChecked(
+            self._current_idx in self.coco.keyframes)
+        self.side.btn_keyframe.blockSignals(False)
+
+    def _on_toggle_keyframe(self) -> None:
+        """K key / ★ Keyframe button: mark or unmark the current frame."""
+        idx = self._current_idx
+        if idx in self.coco.keyframes:
+            self.coco.keyframes.discard(idx)
+            msg = f"Keyframe unmarked (frame {idx + 1})"
+        else:
+            self.coco.keyframes.add(idx)
+            msg = f"Keyframe marked (frame {idx + 1})"
+        self._sync_keyframe_button()
+        self.coco.save(is_final=False)
+        self.statusBar().showMessage(msg, 2500)
+
+    @staticmethod
+    def _ann_to_interp_dict(ann: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert a COCO annotation to a 13-style box dict."""
+        x, y, w, h = (float(v) for v in ann["bbox"])
+        return {
+            "ann_id": ann["id"],
+            "category_id": int(ann["category_id"]),
+            "track_id": ann.get("track_id"),
+            "xywh": [x, y, w, h],
+            "xyxy": [x, y, x + w, y + h],
+            "center": np.array([x + w / 2.0, y + h / 2.0]),
+        }
+
+    def _pair_boxes(self, boxes_a: List[Dict[str, Any]],
+                    boxes_b: List[Dict[str, Any]],
+                    max_dist: float) -> Tuple[List, List[str]]:
+        """Match anchor boxes for interpolation.
+
+        Exact (category_id, track_id) pairs first; the remainder falls back
+        to 13's greedy nearest-center match within max_dist (same category).
+        Returns (pairs, warnings): pairs is a list of (box_a, box_b).
+        """
+        mod = _get_interp13()
+        pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        warnings: List[str] = []
+        unmatched_a: List[int] = []
+        matched_b: set = set()
+        for i, ba in enumerate(boxes_a):
+            hit = None
+            tid = ba.get("track_id")
+            if tid is not None:
+                for j, bb in enumerate(boxes_b):
+                    if j in matched_b:
+                        continue
+                    if (bb.get("track_id") == tid
+                            and bb["category_id"] == ba["category_id"]):
+                        hit = j
+                        break
+            if hit is not None:
+                matched_b.add(hit)
+                pairs.append((ba, boxes_b[hit]))
+            else:
+                unmatched_a.append(i)
+        unmatched_b = [j for j in range(len(boxes_b))
+                       if j not in matched_b]
+        # Track ids present on only one anchor side → mismatch warnings.
+        tids_a = {ba.get("track_id") for ba in boxes_a}
+        tids_b = {bb.get("track_id") for bb in boxes_b}
+        for tid in sorted((tids_a - tids_b) - {None}):
+            warnings.append(
+                f"track {tid}: box on the start frame but no box with the "
+                f"same track id on the end frame")
+        for tid in sorted((tids_b - tids_a) - {None}):
+            warnings.append(
+                f"track {tid}: box on the end frame but no box with the "
+                f"same track id on the start frame")
+        # Nearest-center fallback for the leftovers.
+        if unmatched_a and unmatched_b and max_dist > 0:
+            subs_a = [boxes_a[i] for i in unmatched_a]
+            subs_b = [boxes_b[j] for j in unmatched_b]
+            matches, _ua, _ub = mod.match_pairs(subs_a, subs_b, max_dist)
+            for i2, j2, _d in matches:
+                i, j = unmatched_a[i2], unmatched_b[j2]
+                pairs.append((boxes_a[i], boxes_b[j]))
+                name = self.coco.cat_map.get(boxes_a[i]["category_id"], "?")
+                warnings.append(
+                    f"{name}: no shared track id — paired by nearest center "
+                    f"(box #{boxes_a[i]['ann_id']} ↔ box #{boxes_b[j]['ann_id']})")
+        return pairs, warnings
+
+    def _ensure_image_id(self, frame_idx: int) -> Optional[int]:
+        """Ensure a COCO image record exists for frame_idx (no full decode).
+
+        Borrows the size from any already-visited image record; only decodes
+        the frame itself if no dimensions are known at all.
+        """
+        known = self.coco._img_id_by_idx.get(frame_idx)
+        if known is not None:
+            return known
+        frame = self.rrd_index.frame_at(frame_idx)
+        w = h = 0
+        for img in self.coco.images:
+            if img.get("width") and img.get("height"):
+                w, h = img["width"], img["height"]
+                break
+        if not w or not h:
+            arr = self.rrd_index.decode_image(frame_idx)
+            h, w = arr.shape[:2]
+        return self.coco.ensure_image(frame, w, h)
+
+    def _on_interpolate(self) -> None:
+        """I key / Interpolate button: flow-interpolate the gap around the
+        current frame between the nearest labeled anchor frames.
+
+        If the current frame has boxes it is the END anchor and the gap is
+        filled backward; otherwise anchors are needed on both sides. Interior
+        frames that already have boxes are skipped.
+        """
+        if (self._interp_worker is not None
+                and self._interp_worker.isRunning()):
+            self.statusBar().showMessage("Interpolation already running", 2500)
+            return
+        cur = self._current_idx
+        total = len(self.rrd_index)
+        if cur < 0 or cur >= total:
+            return
+        anchors = self.coco.anchor_candidates()
+        if not anchors:
+            self.statusBar().showMessage(
+                "Interpolate: label at least one frame first", 3000)
+            return
+        before = [f for f in anchors if f < cur]
+        after = [f for f in anchors if f > cur]
+        if self.coco.frame_has_boxes(cur):
+            if not before:
+                self.statusBar().showMessage(
+                    "Interpolate: no earlier labeled frame to start from",
+                    4000)
+                return
+            a, b = max(before), cur
+        else:
+            if not before or not after:
+                self.statusBar().showMessage(
+                    "Interpolate: need a labeled frame before AND after the "
+                    "current frame", 4500)
+                return
+            a, b = max(before), min(after)
+        if b - a < 2:
+            self.statusBar().showMessage(
+                f"Nothing to interpolate between frames {a + 1} and {b + 1}",
+                3000)
+            return
+        img_a = self.coco._img_id_by_idx.get(a)
+        img_b = self.coco._img_id_by_idx.get(b)
+        anns_a = self.coco.anns_for_image(img_a) if img_a else []
+        anns_b = self.coco.anns_for_image(img_b) if img_b else []
+        if not anns_a or not anns_b:
+            self.statusBar().showMessage(
+                "Interpolate: anchor frames must have boxes", 3000)
+            return
+        boxes_a = [self._ann_to_interp_dict(ann) for ann in anns_a]
+        boxes_b = [self._ann_to_interp_dict(ann) for ann in anns_b]
+        # Match threshold: fraction of the smaller frame dimension (same
+        # default as 13's --match-max-dist), from the anchor image records.
+        max_dist = 0.0
+        for img_id in (img_a, img_b):
+            for img in self.coco.images:
+                if img["id"] == img_id and img.get("width") \
+                        and img.get("height"):
+                    max_dist = max(max_dist, 0.2 * min(img["width"],
+                                                       img["height"]))
+                    break
+        pairs, warnings = self._pair_boxes(boxes_a, boxes_b, max_dist)
+        if not pairs:
+            self.statusBar().showMessage(
+                "Interpolate: no box pairs to interpolate", 3000)
+            return
+        if warnings:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle("Track id mismatch")
+            msg.setText(
+                f"Interpolating frames {a + 1} → {b + 1}:\n\n"
+                + "\n".join(f"• {w_}" for w_ in warnings)
+                + "\n\nProceed with this pairing?")
+            msg.setStandardButtons(
+                QMessageBox.StandardButton.Ok
+                | QMessageBox.StandardButton.Cancel)
+            msg.setDefaultButton(QMessageBox.StandardButton.Ok)
+            if msg.exec() != QMessageBox.StandardButton.Ok:
+                return
+        jobs = [{"a": a, "b": b, "box_a": ba, "box_b": bb}
+                for ba, bb in pairs]
+        tmp_base = str(Path(self.coco.output_json).parent
+                       / "_tmp_interp_imgs")
+        self.side.set_interp_running(True)
+        self.side.set_interp_status(
+            f"Interpolating {len(jobs)} pair(s), frames {a + 1}–{b + 1}…")
+        self.canvas.setEnabled(False)
+        self._interp_worker = InterpBatchWorker(
+            self.rrd_index, jobs, tmp_base,
+            flow_method=self.interp_flow_method,
+            camera_model=self.interp_camera_model,
+            parent=self)
+        self._interp_worker.progress_signal.connect(self._on_interp_progress)
+        self._interp_worker.finished_signal.connect(self._on_interp_finished)
+        self._interp_worker.failed_signal.connect(self._on_interp_failed)
+        self._interp_worker.cancelled_signal.connect(
+            self._on_interp_cancelled)
+        self._interp_worker.start()
+
+    def _on_cancel_interp(self) -> None:
+        if self._interp_worker is not None:
+            self._interp_worker.cancel()
+
+    def _on_interp_progress(self, done: int, total: int) -> None:
+        self.side.set_interp_status(
+            f"Interpolating {done}/{total} pair(s)…")
+
+    def _on_interp_finished(self, results: list) -> None:
+        self.canvas.setEnabled(True)
+        self.side.set_interp_running(False)
+        added = 0
+        skipped = 0
+        with self.coco.undo_stack.group("interpolate boxes"):
+            for job, pairs in results:
+                for p in range(job["a"] + 1, job["b"]):
+                    res = pairs.get(p)
+                    if res is None:
+                        continue
+                    if self.coco.frame_has_boxes(p):
+                        skipped += 1
+                        continue
+                    img_id = self._ensure_image_id(p)
+                    if img_id is None:
+                        continue
+                    x1, y1, x2, y2 = res["xyxy"]
+                    self.coco.add_interp_box(
+                        img_id, x1, y1, x2 - x1, y2 - y1,
+                        job["box_a"]["category_id"],
+                        job["box_a"].get("track_id"),
+                        res.get("source", "flow"),
+                        res.get("conf", 0.5))
+                    added += 1
+        self.coco.save(is_final=False)
+        self.side.set_interp_status(
+            f"Interpolated {added} box(es)"
+            + (f", skipped {skipped} labeled frame(s)" if skipped else ""))
+        self._refresh_boxes()
+        self.statusBar().showMessage(
+            f"Interpolation done: {added} box(es) added (Ctrl+Z undoes all)",
+            4000)
+
+    def _on_interp_failed(self, err: str) -> None:
+        self.canvas.setEnabled(True)
+        self.side.set_interp_running(False)
+        self.side.set_interp_status("Interpolation failed")
+        QMessageBox.critical(self, "Interpolation failed", err)
+
+    def _on_interp_cancelled(self) -> None:
+        self.canvas.setEnabled(True)
+        self.side.set_interp_running(False)
+        self.side.set_interp_status("Interpolation cancelled")
+        self._refresh_boxes()
+        self.statusBar().showMessage("Interpolation cancelled", 3000)
+
     # ----------------------- undo / redo -------------------------------- #
 
     def _on_undo(self) -> None:
@@ -2922,8 +3544,11 @@ class ReviewWindow(QMainWindow):
         new_ann_id = self.coco.add_box(image_id, x, y, w, h, cat_id)
         self._last_cat_id = cat_id
         self._refresh_boxes()
+        ann = self.coco.get_box(new_ann_id)
+        tid = ann.get("track_id") if ann else None
+        tid_txt = f" T{tid}" if tid is not None else ""
         self.statusBar().showMessage(
-            f"Added box cat={self.coco.cat_map.get(cat_id, '?')} "
+            f"Added box cat={self.coco.cat_map.get(cat_id, '?')}{tid_txt} "
             f"(ann_id={new_ann_id})", 3000
         )
         if self.auto_segment and _SAM3_AVAILABLE:
@@ -3090,6 +3715,8 @@ class ReviewWindow(QMainWindow):
                 "cat_id": ann["category_id"],
                 "cat_name": self.coco.cat_map.get(ann["category_id"], "?"),
                 "mask": ann.get("_mask"),
+                "track_id": ann.get("track_id"),
+                "interp": ann.get("interp", False),
             })
         self.canvas.set_boxes(boxes)
         self.side.set_boxes(boxes)
@@ -3139,17 +3766,41 @@ class ReviewWindow(QMainWindow):
             self.canvas.setFocus()  # keep hotkeys working after Enter
 
     def _prefill_recat(self) -> None:
-        """Show the selected box's current category id in the recat field."""
+        """Show the selected box's cat id + track id in their fields."""
         sel = self.canvas._selected_idx
         if 0 <= sel < len(self.canvas._boxes):
-            self.side.recat_edit.setText(
-                str(self.canvas._boxes[sel].get("cat_id", "")))
+            box = self.canvas._boxes[sel]
+            self.side.recat_edit.setText(str(box.get("cat_id", "")))
+            self.side.prefill_track(box.get("track_id"))
 
     def _focus_recat_edit(self) -> None:
         """C key: prefill with the current cat and focus the recat field."""
         self._prefill_recat()
         self.side.recat_edit.setFocus()
         self.side.recat_edit.selectAll()
+
+    def _focus_track_edit(self) -> None:
+        """T key: prefill with the current track id and focus the field."""
+        self._prefill_recat()
+        self.side.track_edit.setFocus()
+        self.side.track_edit.selectAll()
+
+    def _on_track_selected(self, value) -> None:
+        """Set the selected box's track id (typed id + Enter; None clears)."""
+        sel = self.canvas._selected_idx
+        if not (0 <= sel < len(self.canvas._boxes)):
+            self.statusBar().showMessage("Select a box first", 2500)
+            return
+        ann_id = self.canvas._boxes[sel]["id"]
+        if self.coco.set_track_id(ann_id, value):
+            self._refresh_boxes()
+            self.canvas._selected_idx = sel
+            self.canvas.update()
+            self.side.prefill_track(value)
+            self.statusBar().showMessage(
+                f"Box #{ann_id} track id → "
+                f"{value if value is not None else '(cleared)'}", 2500)
+            self.canvas.setFocus()  # keep hotkeys working after Enter
 
     def _update_progress(self) -> None:
         """Refresh the annotation-coverage progress bar in the side panel."""
@@ -3609,6 +4260,17 @@ def main():
     parser.add_argument("--no-seed", action="store_true",
                         help="Do not seed boxes from the .rrd's existing "
                              "Boxes2D track (start with a blank canvas).")
+    # Interpolation options (I key / Interpolate button)
+    parser.add_argument("--interp-flow-method",
+                        choices=["dis", "klt", "farneback"], default="dis",
+                        help="Optical flow method for gap interpolation "
+                             "(default: dis — dense inverse search, best for "
+                             "handheld camera shake).")
+    parser.add_argument("--interp-camera-model",
+                        choices=["none", "global"], default="none",
+                        help="Camera motion model for gap interpolation "
+                             "(default: none; 'global' fits a per-frame "
+                             "RANSAC similarity transform).")
     args = parser.parse_args()
 
     if not args.rrd and not args.images:
@@ -3677,9 +4339,11 @@ def main():
                        sam3_model=args.sam3_model,
                        sam3_device=args.sam3_device,
                        sam3_conf=args.sam3_conf,
-                       auto_segment=args.auto_segment,
-                       seed_from_rrd=not args.no_seed and bool(args.rrd),
-                       has_viewer=bool(args.rrd))
+                        auto_segment=args.auto_segment,
+                        seed_from_rrd=not args.no_seed and bool(args.rrd),
+                        has_viewer=bool(args.rrd),
+                        interp_flow_method=args.interp_flow_method,
+                        interp_camera_model=args.interp_camera_model)
     win.show()
     exit_code = app.exec()
 
