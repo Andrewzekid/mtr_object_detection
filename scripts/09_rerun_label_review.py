@@ -1965,7 +1965,7 @@ class SidePanel(QWidget):
         self.box_list.clear()
         for i, b in enumerate(boxes):
             x, y, w, h = b["bbox"]
-            txt = (f"#{b['id']}  {b.get('cat_name','?')}  "
+            txt = (f"{b.get('cat_name','?')} (id: {b['id']})  "
                    f"[{int(x)},{int(y)},{int(w)},{int(h)}]")
             it = QListWidgetItem(txt)
             it.setData(Qt.UserRole, i)  # store the box index, not ann_id
@@ -2183,12 +2183,14 @@ class ReviewWindow(QMainWindow):
                  sam3_device: str = "cuda",
                  sam3_conf: float = 0.25,
                  auto_segment: bool = False,
+                 seed_from_rrd: bool = True,
                  parent=None):
         super().__init__(parent)
         self.rrd_index = rrd_index
         self.coco = coco
         self.grpc_uri = grpc_uri
         self.web_port = web_port
+        self.seed_from_rrd = seed_from_rrd
         self.sam3_model = sam3_model
         self.sam3_device = sam3_device
         self.sam3_conf = sam3_conf
@@ -2301,6 +2303,7 @@ class ReviewWindow(QMainWindow):
         self.canvas.play_pause.connect(self._on_play_pause)
         self.canvas.fit_view.connect(lambda: self.canvas._fit_to_view())
         self.canvas.selection_changed.connect(self.side.highlight_box_row)
+        self.canvas.selection_changed.connect(lambda _i: self._prefill_recat())
         self.canvas.zoom_to_selected.connect(self._on_zoom_to_selected)
         self.canvas.next_unlabeled.connect(self._on_next_unlabeled)
         self.side.cat_clicked.connect(self._on_side_cat_clicked)
@@ -2343,8 +2346,7 @@ class ReviewWindow(QMainWindow):
             (Qt.Key_R, self._on_resegment_selected),
             (Qt.Key_Z, self._on_zoom_to_selected),
             (Qt.Key_U, self._on_next_unlabeled),
-            (Qt.Key_C, lambda: (self.side.recat_edit.setFocus(),
-                                self.side.recat_edit.selectAll())),
+            (Qt.Key_C, self._focus_recat_edit),
         ]:
             sc = QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(slot)
@@ -2556,10 +2558,10 @@ class ReviewWindow(QMainWindow):
         image_id = self.coco.ensure_image(frame, w, h)
         self._current_image_id = image_id
 
-        # Seed existing boxes from the .rrd on first visit.
+        # Seed existing boxes from the .rrd on first visit (unless --no-seed).
         existing = frame.get("existing_boxes", [])
         already = self.coco.anns_for_image(image_id)
-        if not already and existing:
+        if self.seed_from_rrd and not already and existing:
             for (cx, cy, hw, hh, label) in existing:
                 self.coco.seed_box(image_id, cx, cy, hw, hh, label)
 
@@ -2892,6 +2894,7 @@ class ReviewWindow(QMainWindow):
             self.canvas._selected_idx = box_idx
             self.canvas.update()
             self.side.highlight_box_row(box_idx)
+            self._prefill_recat()
 
     def _on_preselect_cat(self, cat_id: int) -> None:
         """A category was clicked in the side panel — remember it for the
@@ -2919,7 +2922,21 @@ class ReviewWindow(QMainWindow):
             self.canvas.update()
             name = self.coco.cat_map.get(cat_id, "?")
             self.statusBar().showMessage(
-                f"Box #{ann_id} → category {cat_id} ({name})", 2500)
+                f"Box #{ann_id} → {name} (cat {cat_id})", 2500)
+            self.canvas.setFocus()  # keep hotkeys working after Enter
+
+    def _prefill_recat(self) -> None:
+        """Show the selected box's current category id in the recat field."""
+        sel = self.canvas._selected_idx
+        if 0 <= sel < len(self.canvas._boxes):
+            self.side.recat_edit.setText(
+                str(self.canvas._boxes[sel].get("cat_id", "")))
+
+    def _focus_recat_edit(self) -> None:
+        """C key: prefill with the current cat and focus the recat field."""
+        self._prefill_recat()
+        self.side.recat_edit.setFocus()
+        self.side.recat_edit.selectAll()
 
     def _update_progress(self) -> None:
         """Refresh the annotation-coverage progress bar in the side panel."""
@@ -3370,6 +3387,9 @@ def main():
                         help="SAM3 confidence threshold (default: 0.25).")
     parser.add_argument("--auto-segment", action="store_true",
                         help="Automatically run SAM3 after each new bbox is drawn.")
+    parser.add_argument("--no-seed", action="store_true",
+                        help="Do not seed boxes from the .rrd's existing "
+                             "Boxes2D track (start with a blank canvas).")
     args = parser.parse_args()
 
     rrd_path = os.path.abspath(args.rrd)
@@ -3426,7 +3446,8 @@ def main():
                        sam3_model=args.sam3_model,
                        sam3_device=args.sam3_device,
                        sam3_conf=args.sam3_conf,
-                       auto_segment=args.auto_segment)
+                       auto_segment=args.auto_segment,
+                       seed_from_rrd=not args.no_seed)
     win.show()
     exit_code = app.exec()
 
