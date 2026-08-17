@@ -2,6 +2,11 @@
 
 # GUI Framework
 PyQt6>=6.4.0
+PyQt6-WebEngine>=6.5.0  # for 09_rerun_label_review.py embedded viewer
+
+# Rerun (for 09_rerun_label_review.py — review .rrd recordings + label)
+rerun-sdk>=0.34.0
+pyarrow>=14.0.0
 
 # Image Processing (use headless to avoid Qt conflicts with PyQt6)
 opencv-python-headless>=4.8.0
