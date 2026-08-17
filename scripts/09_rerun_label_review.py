@@ -31,7 +31,10 @@ What this does
   source from the File menu.
 * New categories can be added from the side panel at any time (name field +
   Add button under the category list); the new category gets the next free
-  id and is preselected for the next draw.
+  id and is preselected for the next draw. The Rename / Delete buttons next
+  to it act on the category selected in the list: rename only changes the
+  name (boxes keep their category), delete asks for confirmation and removes
+  the boxes using that category too.
 * The File menu switches the frame source at runtime (the current session
   is saved first, categories are kept): ``Ctrl+O`` open image files,
   ``Ctrl+Shift+O`` open folder, ``Ctrl+R`` load a Rerun .rrd (indexes it,
@@ -2325,6 +2328,8 @@ class SidePanel(QWidget):
     cancel_interp_clicked = pyqtSignal()     # "Stop" button (running interp)
     track_id_selected = pyqtSignal(object)   # new track id (int) or None
     add_cat_clicked = pyqtSignal(str)        # new category name
+    rename_cat_clicked = pyqtSignal(int)     # cat_id to rename
+    del_cat_clicked = pyqtSignal(int)        # cat_id to delete
 
     def __init__(self, coco: CocoState, parent=None):
         super().__init__(parent)
@@ -2355,6 +2360,21 @@ class SidePanel(QWidget):
         self.btn_add_cat.clicked.connect(self._on_add_cat_entered)
         add_cat_row.addWidget(self.btn_add_cat)
         layout.addLayout(add_cat_row)
+
+        # Rename / delete the category selected in the list above.
+        edit_cat_row = QHBoxLayout()
+        self.btn_rename_cat = QPushButton("Rename")
+        self.btn_rename_cat.setToolTip(
+            "Rename the category selected in the list above.")
+        self.btn_rename_cat.clicked.connect(self._on_rename_cat)
+        edit_cat_row.addWidget(self.btn_rename_cat)
+        self.btn_del_cat = QPushButton("Delete")
+        self.btn_del_cat.setToolTip(
+            "Delete the selected category (asks first; boxes using it "
+            "are deleted too).")
+        self.btn_del_cat.clicked.connect(self._on_del_cat)
+        edit_cat_row.addWidget(self.btn_del_cat)
+        layout.addLayout(edit_cat_row)
 
         # Boxes on current frame list.
         self.boxes_label = QLabel("Boxes on this frame:")
@@ -2657,6 +2677,23 @@ class SidePanel(QWidget):
         if name:
             self.add_cat_clicked.emit(name)
             self.add_cat_edit.clear()
+
+    def _selected_cat_id(self) -> Optional[int]:
+        item = self.cat_list.currentItem()
+        if item is None:
+            return None
+        cat_id = item.data(Qt.UserRole)
+        return int(cat_id) if cat_id is not None else None
+
+    def _on_rename_cat(self) -> None:
+        cat_id = self._selected_cat_id()
+        if cat_id is not None:
+            self.rename_cat_clicked.emit(cat_id)
+
+    def _on_del_cat(self) -> None:
+        cat_id = self._selected_cat_id()
+        if cat_id is not None:
+            self.del_cat_clicked.emit(cat_id)
 
     def _on_cat_clicked(self, item: QListWidgetItem) -> None:
         cat_id = item.data(Qt.UserRole)
@@ -3242,6 +3279,8 @@ class ReviewWindow(QMainWindow):
         self.side.cancel_interp_clicked.connect(self._on_cancel_interp)
         self.side.track_id_selected.connect(self._on_track_selected)
         self.side.add_cat_clicked.connect(self._on_add_category)
+        self.side.rename_cat_clicked.connect(self._on_rename_category)
+        self.side.del_cat_clicked.connect(self._on_delete_category)
 
         if self.bridge is not None:
             self.bridge.time_changed.connect(self._on_viewer_time_changed)
@@ -4327,6 +4366,78 @@ class ReviewWindow(QMainWindow):
         self._on_preselect_cat(new_id)
         self.statusBar().showMessage(
             f"Added category {new_id} — {name} (preselected)", 4000)
+
+    def _on_rename_category(self, cat_id: int) -> None:
+        """Rename a category from the side panel's Rename button.
+
+        Annotations reference category_id, so a rename touches only the
+        category name — all boxes keep their assignment."""
+        old = self.coco.cat_map.get(cat_id)
+        if old is None:
+            return
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename category", f"New name for category {cat_id}:",
+            text=old)
+        name = name.strip()
+        if not ok or not name or name == old:
+            return
+        if name in self.coco.cat_name_to_id:
+            self.statusBar().showMessage(
+                f"⚠️ Category {name!r} already exists", 3000)
+            return
+        for c in self.coco.categories:
+            if c["id"] == cat_id:
+                c["name"] = name
+                break
+        self.coco.cat_map[cat_id] = name
+        del self.coco.cat_name_to_id[old]
+        self.coco.cat_name_to_id[name] = cat_id
+        self.coco.dirty = True
+        self.side._rebuild_cat_list()
+        self._refresh_boxes()  # canvas labels / box list show the name
+        self.statusBar().showMessage(
+            f"Renamed category {cat_id}: {old!r} → {name!r}", 4000)
+
+    def _on_delete_category(self, cat_id: int) -> None:
+        """Delete a category from the side panel's Delete button.
+
+        Boxes using the category are deleted too (soft delete via
+        removed_ids, so the undo stack's per-box undo can still restore
+        them if the category were re-added — in practice treat as final)."""
+        name = self.coco.cat_map.get(cat_id)
+        if name is None:
+            return
+        affected = [a["id"] for a in self.coco.annotations
+                    if a["category_id"] == cat_id
+                    and a["id"] not in self.coco.removed_ids]
+        msg = f"Delete category {cat_id} — {name!r}?"
+        if affected:
+            msg += (f"\n\n{len(affected)} box(es) use this category and "
+                    "will be deleted too.")
+        ret = QMessageBox.question(
+            self, "Delete category", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self.coco.removed_ids.update(affected)
+        self.coco.categories = [
+            c for c in self.coco.categories if c["id"] != cat_id]
+        del self.coco.cat_map[cat_id]
+        del self.coco.cat_name_to_id[name]
+        self.coco.dirty = True
+        # Clear any pending preselection pointing at the deleted category.
+        if self._pending_cat_id == cat_id:
+            self._pending_cat_id = None
+            self.canvas._drawing = False
+        if self.side._preselected_cat_id == cat_id:
+            self.side._preselected_cat_id = None
+        self.side._rebuild_cat_list()
+        self._refresh_boxes()
+        self.statusBar().showMessage(
+            f"Deleted category {cat_id} — {name!r}"
+            + (f" ({len(affected)} box(es) removed)" if affected else ""),
+            4000)
 
     def _on_preselect_cat(self, cat_id: int) -> None:
         """A category was clicked in the side panel — remember it for the
