@@ -29,6 +29,9 @@ What this does
   them; otherwise the UI shows the plain image index. Without ``--rrd`` or
   ``--images`` the app starts idle (no Rerun viewer) until you load a
   source from the File menu.
+* New categories can be added from the side panel at any time (name field +
+  Add button under the category list); the new category gets the next free
+  id and is preselected for the next draw.
 * The File menu switches the frame source at runtime (the current session
   is saved first, categories are kept): ``Ctrl+O`` open image files,
   ``Ctrl+Shift+O`` open folder, ``Ctrl+R`` load a Rerun .rrd (indexes it,
@@ -2316,6 +2319,7 @@ class SidePanel(QWidget):
     interpolate_clicked = pyqtSignal()       # "Interpolate" button (I)
     cancel_interp_clicked = pyqtSignal()     # "Stop" button (running interp)
     track_id_selected = pyqtSignal(object)   # new track id (int) or None
+    add_cat_clicked = pyqtSignal(str)        # new category name
 
     def __init__(self, coco: CocoState, parent=None):
         super().__init__(parent)
@@ -2331,6 +2335,21 @@ class SidePanel(QWidget):
         self.cat_list.itemClicked.connect(self._on_cat_clicked)
         self._rebuild_cat_list()
         self._preselected_cat_id: Optional[int] = None
+
+        # Add a new category: type a name, press Enter or click Add.
+        add_cat_row = QHBoxLayout()
+        self.add_cat_edit = QLineEdit()
+        self.add_cat_edit.setPlaceholderText("new category name…")
+        self.add_cat_edit.setToolTip(
+            "Type a name and press Enter (or Add) to create a category. "
+            "It gets the next free id and is preselected for the next draw.")
+        self.add_cat_edit.returnPressed.connect(self._on_add_cat_entered)
+        add_cat_row.addWidget(self.add_cat_edit, 1)
+        self.btn_add_cat = QPushButton("Add")
+        self.btn_add_cat.setToolTip("Create the category.")
+        self.btn_add_cat.clicked.connect(self._on_add_cat_entered)
+        add_cat_row.addWidget(self.btn_add_cat)
+        layout.addLayout(add_cat_row)
 
         # Boxes on current frame list.
         self.boxes_label = QLabel("Boxes on this frame:")
@@ -2354,8 +2373,8 @@ class SidePanel(QWidget):
         layout.addLayout(recat_row)
 
         # Track id of the selected box: type a number + Enter to set it,
-        # clear the field + Enter to unset. Auto-assigned on draw (per-
-        # category, in draw order); edit it when a track continues/merges.
+        # clear the field + Enter to unset. Auto-assigned globally in
+        # creation order (1, 2, 3, ...); edit it when a track continues.
         track_row = QHBoxLayout()
         track_row.addWidget(QLabel("Track of selected:"))
         self.track_edit = QLineEdit()
@@ -2627,6 +2646,12 @@ class SidePanel(QWidget):
         self.opacity_slider.blockSignals(False)
 
     # ---- categories ---- #
+
+    def _on_add_cat_entered(self) -> None:
+        name = self.add_cat_edit.text().strip()
+        if name:
+            self.add_cat_clicked.emit(name)
+            self.add_cat_edit.clear()
 
     def _on_cat_clicked(self, item: QListWidgetItem) -> None:
         cat_id = item.data(Qt.UserRole)
@@ -2988,6 +3013,7 @@ class ReviewWindow(QMainWindow):
         self.side.interpolate_clicked.connect(self._on_interpolate)
         self.side.cancel_interp_clicked.connect(self._on_cancel_interp)
         self.side.track_id_selected.connect(self._on_track_selected)
+        self.side.add_cat_clicked.connect(self._on_add_category)
 
         if self.bridge is not None:
             self.bridge.time_changed.connect(self._on_viewer_time_changed)
@@ -4052,6 +4078,26 @@ class ReviewWindow(QMainWindow):
             self.canvas.update()
             self.side.highlight_box_row(box_idx)
             self._prefill_recat()
+
+    def _on_add_category(self, name: str) -> None:
+        """Add a new category from the side panel's name field."""
+        name = name.strip()
+        if not name:
+            return
+        if name in self.coco.cat_name_to_id:
+            self.statusBar().showMessage(
+                f"⚠️ Category {name!r} already exists", 3000)
+            return
+        new_id = max((c["id"] for c in self.coco.categories), default=-1) + 1
+        self.coco.categories.append({"id": new_id, "name": name})
+        self.coco.cat_map[new_id] = name
+        self.coco.cat_name_to_id[name] = new_id
+        self.coco.dirty = True
+        self.side._rebuild_cat_list()
+        # Preselect it so the next draw uses it without a keypress.
+        self._on_preselect_cat(new_id)
+        self.statusBar().showMessage(
+            f"Added category {new_id} — {name} (preselected)", 4000)
 
     def _on_preselect_cat(self, cat_id: int) -> None:
         """A category was clicked in the side panel — remember it for the
