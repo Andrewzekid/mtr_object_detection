@@ -141,6 +141,14 @@ Qt.Key_Z = Qt.Key.Key_Z  # type: ignore[attr-defined]
 Qt.Key_Control = Qt.Key.Key_Control  # type: ignore[attr-defined]
 Qt.Key_Y = Qt.Key.Key_Y  # type: ignore[attr-defined]
 Qt.Key_U = Qt.Key.Key_U  # type: ignore[attr-defined]
+# Cursor shapes (PyQt6 scoped enums)
+Qt.SizeFDiagCursor = Qt.CursorShape.SizeFDiagCursor  # type: ignore[attr-defined]
+Qt.SizeBDiagCursor = Qt.CursorShape.SizeBDiagCursor  # type: ignore[attr-defined]
+Qt.SizeAllCursor = Qt.CursorShape.SizeAllCursor  # type: ignore[attr-defined]
+Qt.CrossCursor = Qt.CursorShape.CrossCursor  # type: ignore[attr-defined]
+Qt.NoModifier = Qt.KeyboardModifier.NoModifier  # type: ignore[attr-defined]
+Qt.ControlModifier = Qt.KeyboardModifier.ControlModifier  # type: ignore[attr-defined]
+Qt.ShiftModifier = Qt.KeyboardModifier.ShiftModifier  # type: ignore[attr-defined]
 from PyQt6.QtGui import QPen, QColor, QPainter, QPixmap, QFont, QTransform
 # PyQt6 scoped-enum shims for QtGui
 QPainter.Antialiasing = QPainter.RenderHint.Antialiasing  # type: ignore[attr-defined]
@@ -779,6 +787,33 @@ class CocoState:
                 self.dirty = True
                 return
 
+    def move_box(self, ann_id: int, new_x: float, new_y: float,
+                 w: float, h: float) -> None:
+        """Update an annotation's bbox position (size unchanged)."""
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                ann["bbox"] = [float(new_x), float(new_y), float(w), float(h)]
+                ann["area"] = float(w * h)
+                self.dirty = True
+                return
+
+    def resize_box(self, ann_id: int, new_x: float, new_y: float,
+                   new_w: float, new_h: float) -> None:
+        """Update an annotation's bbox size and position (corner drag)."""
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                ann["bbox"] = [float(new_x), float(new_y),
+                               float(new_w), float(new_h)]
+                ann["area"] = float(new_w * new_h)
+                self.dirty = True
+                return
+
+    def get_box(self, ann_id: int) -> Optional[Dict[str, Any]]:
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                return ann
+        return None
+
     def get_mask(self, ann_id: int) -> Optional[np.ndarray]:
         for ann in self.annotations:
             if ann["id"] == ann_id:
@@ -819,6 +854,8 @@ class CanvasWidget(QWidget):
 
     box_added = pyqtSignal(int, float, float, float, float, int)  # img_id,x,y,w,h,cat_id
     box_deleted = pyqtSignal(int)  # ann_id
+    box_moved = pyqtSignal(int, float, float, float, float)   # ann_id, new_x, new_y, w, h
+    box_resized = pyqtSignal(int, float, float, float, float)  # ann_id, x, y, w, h
     frame_nav = pyqtSignal(int)    # delta (-1 / +1)
     save_quit = pyqtSignal()
     quit_request = pyqtSignal()
@@ -829,6 +866,7 @@ class CanvasWidget(QWidget):
     play_pause = pyqtSignal()          # Space key
     fit_view = pyqtSignal()            # F key
     selection_changed = pyqtSignal(int)  # selected box index (or -1)
+    zoom_to_selected = pyqtSignal()    # Z key
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -847,6 +885,18 @@ class CanvasWidget(QWidget):
         self._draw_current: Optional[Tuple[float, float]] = None
         self._waiting_cat: bool = False
         self._pending_rect: Optional[Tuple[float, float, float, float]] = None
+
+        # Box editing state. _edit_mode is one of:
+        #   "idle" | "draw" | "move" | "resize_tl" | "resize_tr" |
+        #   "resize_bl" | "resize_br"
+        # where tl/tr/bl/br = top-left/top-right/bottom-left/bottom-right corner.
+        self._edit_mode: str = "idle"
+        # Starting bbox + cursor position when a move/resize began, in
+        # image coords. Used to compute the new bbox on each mousemove.
+        self._edit_start_box: Optional[Tuple[float, float, float, float]] = None
+        self._edit_start_cursor: Optional[Tuple[float, float]] = None
+        # Radius (in widget px) within which a corner handle is "grabbed".
+        self._handle_radius_px: int = 8
 
         # Pan / zoom transforms. We display image in 'fit' mode by default.
         self._scale = 1.0
@@ -941,6 +991,27 @@ class CanvasWidget(QWidget):
     def _color_for_cat(self, cat_id: int) -> Tuple[int, int, int]:
         return self._MASK_COLORS[cat_id % len(self._MASK_COLORS)]
 
+    def _corner_handles(self, box_idx: int) -> List[Tuple[float, float]]:
+        """Return widget-coord centers of the 4 corner handles for box_idx,
+        in order: top-left, top-right, bottom-left, bottom-right."""
+        x, y, w, h = self._boxes[box_idx]["bbox"]
+        tl = self._img_to_widget(x, y)
+        tr = self._img_to_widget(x + w, y)
+        bl = self._img_to_widget(x, y + h)
+        br = self._img_to_widget(x + w, y + h)
+        return [(tl.x(), tl.y()), (tr.x(), tr.y()),
+                (bl.x(), bl.y()), (br.x(), br.y())]
+
+    def _hit_corner(self, box_idx: int, px: float, py: float) -> Optional[str]:
+        """Return 'tl'/'tr'/'bl'/'br' if (px,py) is on a corner handle, else None."""
+        handles = self._corner_handles(box_idx)
+        names = ["tl", "tr", "bl", "br"]
+        r = self._handle_radius_px + 2  # small tolerance
+        for (hx, hy), name in zip(handles, names):
+            if (px - hx) ** 2 + (py - hy) ** 2 <= r * r:
+                return name
+        return None
+
     def _paint_masks(self, p: QPainter) -> None:
         """Paint semi-transparent masks for every box that has one."""
         iw, ih = self._image_size
@@ -1015,6 +1086,15 @@ class CanvasWidget(QWidget):
             p.setPen(color)
             p.drawText(int(tl.x() + 3), max(12, int(tl.y() - 4)), label)
 
+        # Draw corner handles on the selected box.
+        if 0 <= self._selected_idx < len(self._boxes):
+            handles = self._corner_handles(self._selected_idx)
+            p.setPen(QPen(QColor(255, 80, 80), 1.5))
+            p.setBrush(QColor(255, 255, 255, 200))
+            r = self._handle_radius_px
+            for hx, hy in handles:
+                p.drawRect(int(hx - r), int(hy - r), 2 * r, 2 * r)
+
         # Draw pending rectangle while dragging.
         if self._drawing and self._draw_start and self._draw_current:
             x0, y0 = self._draw_start
@@ -1050,27 +1130,88 @@ class CanvasWidget(QWidget):
                 ix, iy = self._widget_to_img(px, py)
                 self._draw_start = (ix, iy)
                 self._draw_current = (ix, iy)
-            else:
-                # Hit-test: topmost box first.
-                ix, iy = self._widget_to_img(px, py)
-                hit = -1
-                for i in range(len(self._boxes) - 1, -1, -1):
-                    x, y, w, h = self._boxes[i]["bbox"]
-                    if x <= ix <= x + w and y <= iy <= y + h:
-                        hit = i
-                        break
+                self._edit_mode = "draw"
+                return
+            # 1. Hit-test corner handles on the currently selected box.
+            if 0 <= self._selected_idx < len(self._boxes):
+                corner = self._hit_corner(self._selected_idx, px, py)
+                if corner is not None:
+                    # Begin resize.
+                    bx, by, bw, bh = self._boxes[self._selected_idx]["bbox"]
+                    self._edit_mode = f"resize_{corner}"
+                    self._edit_start_box = (bx, by, bw, bh)
+                    ix, iy = self._widget_to_img(px, py)
+                    self._edit_start_cursor = (ix, iy)
+                    return
+            # 2. Hit-test box bodies (topmost first).
+            ix, iy = self._widget_to_img(px, py)
+            hit = -1
+            for i in range(len(self._boxes) - 1, -1, -1):
+                x, y, w, h = self._boxes[i]["bbox"]
+                if x <= ix <= x + w and y <= iy <= y + h:
+                    hit = i
+                    break
+            if hit >= 0:
+                # Select the box and begin move.
                 self._selected_idx = hit
                 self.selection_changed.emit(hit)
+                bx, by, bw, bh = self._boxes[hit]["bbox"]
+                self._edit_mode = "move"
+                self._edit_start_box = (bx, by, bw, bh)
+                self._edit_start_cursor = (ix, iy)
+                self.update()
+            else:
+                # Click in empty space — deselect.
+                self._selected_idx = -1
+                self.selection_changed.emit(-1)
                 self.update()
         elif ev.button() == Qt.MiddleButton:
             self._panning = True
             self._pan_start = ev.position()
 
     def mouseMoveEvent(self, ev: QtGui.QMouseEvent) -> None:
-        if self._drawing and self._draw_start is not None:
-            ix, iy = self._widget_to_img(ev.position().x(), ev.position().y())
+        px, py = ev.position().x(), ev.position().y()
+        # Cursor feedback.
+        if self._edit_mode == "idle" and not self._drawing and not self._panning:
+            self._update_cursor(px, py)
+
+        if self._edit_mode == "draw" and self._draw_start is not None:
+            ix, iy = self._widget_to_img(px, py)
             self._draw_current = (ix, iy)
             self.update()
+        elif self._edit_mode == "move":
+            ix, iy = self._widget_to_img(px, py)
+            sx, sy = self._edit_start_cursor
+            dx, dy = ix - sx, iy - sy
+            bx, by, bw, bh = self._edit_start_box
+            new_x, new_y = bx + dx, by + dy
+            # Update the box in-place so the canvas shows it moving.
+            self._boxes[self._selected_idx]["bbox"] = [new_x, new_y, bw, bh]
+            self.update()
+        elif self._edit_mode.startswith("resize_"):
+            ix, iy = self._widget_to_img(px, py)
+            sx, sy = self._edit_start_cursor
+            dx, dy = ix - sx, iy - sy
+            bx, by, bw, bh = self._edit_start_box
+            corner = self._edit_mode.split("_", 1)[1]
+            new_x, new_y, new_w, new_h = bx, by, bw, bh
+            if corner == "tl":
+                new_x = bx + dx; new_y = by + dy
+                new_w = bw - dx; new_h = bh - dy
+            elif corner == "tr":
+                new_y = by + dy
+                new_w = bw + dx; new_h = bh - dy
+            elif corner == "bl":
+                new_x = bx + dx
+                new_w = bw - dx; new_h = bh + dy
+            elif corner == "br":
+                new_w = bw + dx; new_h = bh + dy
+            # Clamp: don't allow the box to flip (negative w/h).
+            if new_w > 2 and new_h > 2:
+                self._boxes[self._selected_idx]["bbox"] = [
+                    new_x, new_y, new_w, new_h
+                ]
+                self.update()
         elif self._panning and self._pan_start is not None:
             delta = ev.position() - self._pan_start
             self._offset += delta
@@ -1078,13 +1219,14 @@ class CanvasWidget(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, ev: QtGui.QMouseEvent) -> None:
-        if ev.button() == Qt.LeftButton and self._drawing:
-            if self._draw_start and self._draw_current:
+        if ev.button() == Qt.LeftButton:
+            if self._edit_mode == "draw" and self._draw_start and self._draw_current:
                 x0, y0 = self._draw_start
                 x1, y1 = self._draw_current
                 x = min(x0, x1); y = min(y0, y1)
                 w = abs(x1 - x0); h = abs(y1 - y0)
                 self._drawing = False
+                self._edit_mode = "idle"
                 self._draw_start = None
                 self._draw_current = None
                 if w > 2 and h > 2:
@@ -1109,9 +1251,48 @@ class CanvasWidget(QWidget):
                         self.cat_pick_requested.emit(x, y, w, h)
                 else:
                     self.update()
+            elif self._edit_mode == "move":
+                # Commit the new position.
+                if 0 <= self._selected_idx < len(self._boxes):
+                    box = self._boxes[self._selected_idx]
+                    x, y, w, h = box["bbox"]
+                    self.box_moved.emit(box["id"], x, y, w, h)
+                self._edit_mode = "idle"
+                self._edit_start_box = None
+                self._edit_start_cursor = None
+            elif self._edit_mode.startswith("resize_"):
+                if 0 <= self._selected_idx < len(self._boxes):
+                    box = self._boxes[self._selected_idx]
+                    x, y, w, h = box["bbox"]
+                    self.box_resized.emit(box["id"], x, y, w, h)
+                self._edit_mode = "idle"
+                self._edit_start_box = None
+                self._edit_start_cursor = None
         elif ev.button() == Qt.MiddleButton:
             self._panning = False
             self._pan_start = None
+
+    def _update_cursor(self, px: float, py: float) -> None:
+        """Set the cursor shape based on what's under it (handle / box / empty)."""
+        if 0 <= self._selected_idx < len(self._boxes):
+            corner = self._hit_corner(self._selected_idx, px, py)
+            if corner in ("tl", "br"):
+                self.setCursor(Qt.SizeFDiagCursor)
+                return
+            if corner in ("tr", "bl"):
+                self.setCursor(Qt.SizeBDiagCursor)
+                return
+        # Hit-test box body.
+        ix, iy = self._widget_to_img(px, py)
+        for i in range(len(self._boxes) - 1, -1, -1):
+            x, y, w, h = self._boxes[i]["bbox"]
+            if x <= ix <= x + w and y <= iy <= y + h:
+                self.setCursor(Qt.SizeAllCursor)
+                return
+        if self._drawing:
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.unsetCursor()
 
     def resizeEvent(self, ev: QtGui.QResizeEvent) -> None:
         if self._pixmap is not None and self._scale < 1e-6:
@@ -1176,6 +1357,8 @@ class CanvasWidget(QWidget):
             self.play_pause.emit()
         elif k == Qt.Key_F:
             self._fit_to_view()
+        elif k == Qt.Key_Z:
+            self.zoom_to_selected.emit()
         elif k in (Qt.Key_Plus, Qt.Key_Equal):
             self._scale = min(40.0, self._scale * 1.2); self.update()
         elif k == Qt.Key_Minus:
@@ -1582,6 +1765,8 @@ class ReviewWindow(QMainWindow):
         # ---------- signals ----------
         self.canvas.box_added.connect(self._on_box_added)
         self.canvas.box_deleted.connect(self._on_box_deleted)
+        self.canvas.box_moved.connect(self._on_box_moved)
+        self.canvas.box_resized.connect(self._on_box_resized)
         self.canvas.frame_nav.connect(self._on_frame_nav)
         self.canvas.save_quit.connect(self._on_save_quit)
         self.canvas.quit_request.connect(self._on_quit)
@@ -1592,6 +1777,7 @@ class ReviewWindow(QMainWindow):
         self.canvas.play_pause.connect(self._on_play_pause)
         self.canvas.fit_view.connect(lambda: self.canvas._fit_to_view())
         self.canvas.selection_changed.connect(self.side.highlight_box_row)
+        self.canvas.zoom_to_selected.connect(self._on_zoom_to_selected)
         self.side.cat_clicked.connect(self._on_side_cat_clicked)
         self.side.slider_moved.connect(self._on_slider_moved)
         self.side.run_sam3_clicked.connect(self._on_run_sam3_all)
@@ -1626,6 +1812,7 @@ class ReviewWindow(QMainWindow):
                 QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, Qt.Key_X, Qt.NoModifier))),
             (Qt.Key_M, self._on_toggle_masks),
             (Qt.Key_R, self._on_resegment_selected),
+            (Qt.Key_Z, self._on_zoom_to_selected),
         ]:
             sc = QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(slot)
@@ -1875,6 +2062,52 @@ class ReviewWindow(QMainWindow):
         self.coco.remove_box(ann_id)
         self._refresh_boxes()
         self.statusBar().showMessage(f"Deleted box #{ann_id}", 2500)
+
+    def _on_box_moved(self, ann_id: int, x: float, y: float,
+                     w: float, h: float) -> None:
+        """Commit a drag-move of an existing box. Mask stays attached;
+        the user can press R to re-segment if they want a fresh mask."""
+        self.coco.move_box(ann_id, x, y, w, h)
+        # Don't call _refresh_boxes() — the canvas already shows the new
+        # position from the live drag. Just update the side panel info.
+        self.side.set_boxes(self.canvas._boxes)
+        self.statusBar().showMessage(
+            f"Moved box #{ann_id} to ({int(x)},{int(y)})", 2500
+        )
+
+    def _on_box_resized(self, ann_id: int, x: float, y: float,
+                        w: float, h: float) -> None:
+        self.coco.resize_box(ann_id, x, y, w, h)
+        self.side.set_boxes(self.canvas._boxes)
+        self.statusBar().showMessage(
+            f"Resized box #{ann_id} to {int(w)}x{int(h)}", 2500
+        )
+
+    def _on_zoom_to_selected(self) -> None:
+        """Zoom the canvas so the selected box fills ~80% of the view."""
+        sel = self.canvas._selected_idx
+        if sel < 0 or sel >= len(self.canvas._boxes):
+            self.statusBar().showMessage("No box selected to zoom to", 2000)
+            return
+        x, y, w, h = self.canvas._boxes[sel]["bbox"]
+        iw, ih = self.canvas._image_size
+        if iw <= 0 or ih <= 0 or w <= 0 or h <= 0:
+            return
+        vw, vh = self.canvas.width(), self.canvas.height()
+        # Scale so the box fills 80% of the smaller view dimension.
+        scale = min(vw / (w * 1.25), vh / (h * 1.25))
+        scale = max(0.05, min(40.0, scale))
+        self.canvas._scale = scale
+        # Center the box in the view.
+        cx_img = x + w / 2.0
+        cy_img = y + h / 2.0
+        self.canvas._offset = QtCore.QPointF(
+            vw / 2.0 - cx_img * scale, vh / 2.0 - cy_img * scale
+        )
+        self.canvas.update()
+        self.statusBar().showMessage(
+            f"Zoomed to box #{self.canvas._boxes[sel]['id']}", 2000
+        )
 
     def _on_box_added(self, image_id: int, x: float, y: float,
                       w: float, h: float, cat_id: int) -> None:
