@@ -617,6 +617,9 @@ class CocoState:
         self._img_id_by_ts: Dict[int, int] = {}
         self._img_id_by_idx: Dict[int, int] = {}
         self._ann_id_next = 1
+        # Dirty flag — True when there are unsaved mutations since the last
+        # successful save(). Cleared by save(). UI shows a "●" indicator.
+        self.dirty: bool = False
 
     # ------------------------- persistence ---------------------------- #
 
@@ -690,6 +693,7 @@ class CocoState:
             json.dump(data, f, indent=2, ensure_ascii=False)
         with open(self.progress_file, "w") as f:
             json.dump({"last_index": self.current_idx + 1}, f)
+        self.dirty = False
         print(f"✅ Saved {'final' if is_final else 'progress'} → {path} "
               f"(idx {self.current_idx + 1})")
 
@@ -737,6 +741,7 @@ class CocoState:
         }
         self.annotations.append(ann)
         self._ann_id_next += 1
+        self.dirty = True
 
     def add_box(self, image_id: int, x: float, y: float,
                 w: float, h: float, cat_id: int) -> int:
@@ -750,10 +755,12 @@ class CocoState:
         }
         self.annotations.append(ann)
         self._ann_id_next += 1
+        self.dirty = True
         return ann["id"]
 
     def remove_box(self, ann_id: int) -> None:
         self.removed_ids.add(ann_id)
+        self.dirty = True
 
     def set_mask(self, ann_id: int, mask: Optional[np.ndarray]) -> None:
         """Attach (or clear) a SAM3 mask to an annotation, in-memory only."""
@@ -763,6 +770,7 @@ class CocoState:
                     ann.pop("_mask", None)
                 else:
                     ann["_mask"] = mask
+                self.dirty = True
                 return
 
     def get_mask(self, ann_id: int) -> Optional[np.ndarray]:
@@ -1367,6 +1375,9 @@ class ReviewWindow(QMainWindow):
         # Tmp file path for the current frame's image (run_sam3 needs a path).
         self._tmp_image_path: Optional[str] = None
 
+        # Persisted UI state (collapsed Rerun panel etc.).
+        self._ui_state_path = Path.home() / ".config" / "rerun_label_review" / "state.json"
+
         # ---------- layout ----------
         splitter = QSplitter(_QT_HORZ)
         self.canvas = CanvasWidget()
@@ -1377,16 +1388,33 @@ class ReviewWindow(QMainWindow):
         splitter.addWidget(self.side)
         splitter.setSizes([1200, 360])
 
-        # Right column: web viewer below the canvas
+        # Right column: web viewer (in a collapsible container) below the canvas
         right_split = QSplitter(_QT_VERT)
         right_split.addWidget(splitter)
+
+        # Rerun viewer wrapped in a container with a toggle button.
+        self.rerun_container = QWidget()
+        rerun_layout = QVBoxLayout(self.rerun_container)
+        rerun_layout.setContentsMargins(0, 0, 0, 0)
+        rerun_layout.setSpacing(0)
+        # Toggle toolbar.
+        self.rerun_toolbar = QWidget()
+        tb_layout = QHBoxLayout(self.rerun_toolbar)
+        tb_layout.setContentsMargins(6, 2, 6, 2)
+        self.btn_toggle_rerun = QPushButton("Hide Rerun ▾")
+        self.btn_toggle_rerun.setCheckable(True)
+        self.btn_toggle_rerun.clicked.connect(self._on_toggle_rerun)
+        tb_layout.addWidget(self.btn_toggle_rerun)
+        tb_layout.addStretch(1)
+        rerun_layout.addWidget(self.rerun_toolbar)
 
         self.web_view: Optional[QWebEngineView] = None
         self.bridge: Optional[TimeBridge] = None
         self.channel: Optional[QWebChannel] = None
         if _HAS_WEBENGINE:
             self.web_view = QWebEngineView()
-            right_split.addWidget(self.web_view)
+            rerun_layout.addWidget(self.web_view, 1)
+            right_split.addWidget(self.rerun_container)
             right_split.setSizes([700, 600])
             self._setup_web_bridge()
         else:
@@ -1396,9 +1424,22 @@ class ReviewWindow(QMainWindow):
                 "Run `rerun` separately and scrub its timeline."
             )
             placeholder.setAlignment(Qt.AlignCenter)
-            right_split.addWidget(placeholder)
+            rerun_layout.addWidget(placeholder, 1)
+            right_split.addWidget(self.rerun_container)
+            self.btn_toggle_rerun.setEnabled(False)
 
         self.setCentralWidget(right_split)
+
+        # ---------- status bar (save indicator + transient messages) ----------
+        self._save_indicator = QLabel("✓ Saved")
+        self._save_indicator.setStyleSheet("padding: 0 6px;")
+        self.statusBar().addPermanentWidget(self._save_indicator)
+        self.statusBar().showMessage("Ready", 3000)
+        # Refresh the indicator whenever the dirty flag may have changed.
+        # We piggyback on a 250ms timer instead of patching every mutation site.
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self._refresh_save_indicator)
+        self._status_timer.start(250)
 
         # ---------- signals ----------
         self.canvas.box_added.connect(self._on_box_added)
@@ -1432,8 +1473,9 @@ class ReviewWindow(QMainWindow):
             sc = QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(slot)
 
-        # Load first frame
+        # Load first frame, then restore persisted UI state.
         QTimer.singleShot(50, self._load_current)
+        QTimer.singleShot(150, self._load_ui_state)
 
     # ----------------------- web bridge setup -------------------------- #
 
@@ -1462,6 +1504,63 @@ class ReviewWindow(QMainWindow):
             QTimer.singleShot(500 * (attempt + 1),
                               lambda: self.web_view and
                               self.web_view.page().runJavaScript(js))
+
+    # ----------------------- status bar + save indicator ----------------- #
+
+    def _refresh_save_indicator(self) -> None:
+        """Update the permanent '✓ Saved' / '● Unsaved' label in the status bar."""
+        if self.coco.dirty:
+            self._save_indicator.setText("● Unsaved")
+            self._save_indicator.setStyleSheet(
+                "padding: 0 6px; color: #ff8040; font-weight: bold;"
+            )
+        else:
+            self._save_indicator.setText("✓ Saved")
+            self._save_indicator.setStyleSheet("padding: 0 6px; color: #40c060;")
+
+    def _on_toggle_rerun(self) -> None:
+        """Collapse or expand the embedded Rerun web viewer."""
+        collapsed = self.btn_toggle_rerun.isChecked()
+        # Hide/show the web view itself; keep the toggle button visible.
+        if self.web_view is not None:
+            self.web_view.setVisible(not collapsed)
+        # Hide/show any non-button widgets in the rerun container layout
+        # (placeholder etc.). The toolbar (with the button) stays.
+        for i in range(self.rerun_container.layout().count()):
+            w = self.rerun_container.layout().itemAt(i).widget()
+            if w is self.rerun_toolbar:
+                continue
+            if w is not None:
+                w.setVisible(not collapsed)
+        self.btn_toggle_rerun.setText("Show Rerun ▸" if collapsed else "Hide Rerun ▾")
+        # Save preference.
+        try:
+            self._ui_state_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._ui_state_path, "w") as f:
+                json.dump({"web_collapsed": collapsed}, f)
+        except Exception:
+            pass
+        # Force the splitter to give the freed space to the canvas.
+        rs = self.centralWidget()
+        if isinstance(rs, QSplitter):
+            sizes = rs.sizes()
+            if collapsed:
+                rs.setSizes([sizes[0] + sizes[1], 0])
+            else:
+                rs.setSizes([700, 600])
+
+    def _load_ui_state(self) -> None:
+        """Apply persisted UI state (web collapsed etc.)."""
+        try:
+            if not self._ui_state_path.exists():
+                return
+            with open(self._ui_state_path, "r") as f:
+                state = json.load(f)
+            if state.get("web_collapsed") and self.btn_toggle_rerun.isEnabled():
+                self.btn_toggle_rerun.setChecked(True)
+                self._on_toggle_rerun()
+        except Exception:
+            pass
 
     # ----------------------- frame loading ----------------------------- #
 
