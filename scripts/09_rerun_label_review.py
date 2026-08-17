@@ -195,6 +195,11 @@ Qt.Key_Control = Qt.Key.Key_Control  # type: ignore[attr-defined]
 Qt.Key_Y = Qt.Key.Key_Y  # type: ignore[attr-defined]
 Qt.Key_U = Qt.Key.Key_U  # type: ignore[attr-defined]
 Qt.Key_C = Qt.Key.Key_C  # type: ignore[attr-defined]
+# Generic fallback: alias every remaining Qt.Key.Key_* member as Qt.Key_*,
+# so newly added shortcuts (T, K, I, ...) don't each need a line above.
+for _qn in dir(Qt.Key):
+    if _qn.startswith("Key_") and not hasattr(Qt, _qn):
+        setattr(Qt, _qn, getattr(Qt.Key, _qn))
 # Cursor shapes (PyQt6 scoped enums)
 Qt.SizeFDiagCursor = Qt.CursorShape.SizeFDiagCursor  # type: ignore[attr-defined]
 Qt.SizeBDiagCursor = Qt.CursorShape.SizeBDiagCursor  # type: ignore[attr-defined]
