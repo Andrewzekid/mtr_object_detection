@@ -1409,6 +1409,11 @@ class CanvasWidget(QWidget):
             (py - self._offset.y()) / self._scale,
         )
 
+    def _clamp_img_pt(self, x: float, y: float) -> Tuple[float, float]:
+        """Clamp an image-coord point to the image bounds."""
+        iw, ih = self._image_size
+        return (min(max(x, 0.0), float(iw)), min(max(y, 0.0), float(ih)))
+
     # ----------------------- painting ---------------------------------- #
 
     # Per-class color palette (RGB) for mask overlays.
@@ -1557,7 +1562,7 @@ class CanvasWidget(QWidget):
                 return
             px, py = ev.position().x(), ev.position().y()
             if self._drawing:
-                ix, iy = self._widget_to_img(px, py)
+                ix, iy = self._clamp_img_pt(*self._widget_to_img(px, py))
                 self._draw_start = (ix, iy)
                 self._draw_current = (ix, iy)
                 self._edit_mode = "draw"
@@ -1606,15 +1611,18 @@ class CanvasWidget(QWidget):
             self._update_cursor(px, py)
 
         if self._edit_mode == "draw" and self._draw_start is not None:
-            ix, iy = self._widget_to_img(px, py)
-            self._draw_current = (ix, iy)
+            self._draw_current = self._clamp_img_pt(
+                *self._widget_to_img(px, py))
             self.update()
         elif self._edit_mode == "move":
             ix, iy = self._widget_to_img(px, py)
             sx, sy = self._edit_start_cursor
             dx, dy = ix - sx, iy - sy
             bx, by, bw, bh = self._edit_start_box
-            new_x, new_y = bx + dx, by + dy
+            # Keep the whole box inside the image.
+            iw, ih = self._image_size
+            new_x = min(max(bx + dx, 0.0), max(iw - bw, 0.0))
+            new_y = min(max(by + dy, 0.0), max(ih - bh, 0.0))
             # Update the box in-place so the canvas shows it moving.
             self._boxes[self._selected_idx]["bbox"] = [new_x, new_y, bw, bh]
             self.update()
@@ -1636,6 +1644,12 @@ class CanvasWidget(QWidget):
                 new_w = bw - dx; new_h = bh + dy
             elif corner == "br":
                 new_w = bw + dx; new_h = bh + dy
+            # Clamp: keep the box inside the image bounds.
+            iw, ih = self._image_size
+            new_x = max(new_x, 0.0)
+            new_y = max(new_y, 0.0)
+            new_w = min(new_w, iw - new_x)
+            new_h = min(new_h, ih - new_y)
             # Clamp: don't allow the box to flip (negative w/h).
             if new_w > 2 and new_h > 2:
                 self._boxes[self._selected_idx]["bbox"] = [
