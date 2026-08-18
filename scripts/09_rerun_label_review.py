@@ -872,6 +872,15 @@ class CocoState:
         return len(frames_matched), n_imported, n_skipped
 
     def save(self, is_final: bool) -> None:
+        tmp_path = self.output_json.replace(".json", "_tmp.json")
+        if not is_final and not self.dirty and os.path.exists(tmp_path):
+            # Nothing changed since the last full write (pure navigation,
+            # review marks, slider drags) — only refresh the tiny progress
+            # file. The full dump re-polygonizes every mask and rewrites
+            # the whole JSON, which made plain frame navigation laggy and
+            # spammed "Saved progress" on every step.
+            self._write_progress()
+            return
         final_anns = []
         for ann in self.annotations:
             if ann["id"] in self.removed_ids:
@@ -891,18 +900,21 @@ class CocoState:
             "annotations": final_anns,
             "categories": self.categories,
         }
-        path = self.output_json if is_final else self.output_json.replace(
-            ".json", "_tmp.json"
-        )
+        path = self.output_json if is_final else tmp_path
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        self._write_progress()
+        self.dirty = False
+        print(f"✅ Saved {'final' if is_final else 'progress'} → {path} "
+              f"(idx {self.current_idx + 1})")
+
+    def _write_progress(self) -> None:
+        """Write only the small .progress sidecar (resume position,
+        reviewed set, keyframes). Cheap — safe to call per navigation."""
         with open(self.progress_file, "w") as f:
             json.dump({"last_index": self.current_idx + 1,
                        "reviewed": sorted(self.reviewed),
                        "keyframes": sorted(self.keyframes)}, f)
-        self.dirty = False
-        print(f"✅ Saved {'final' if is_final else 'progress'} → {path} "
-              f"(idx {self.current_idx + 1})")
 
     # ------------------------- mutation -------------------------------- #
 
