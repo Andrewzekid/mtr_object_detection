@@ -2155,10 +2155,11 @@ class SidePanel(QWidget):
         play_row.addWidget(self.btn_play)
         play_row.addWidget(QLabel("speed:"))
         self.combo_speed = QtWidgets.QComboBox()
-        for label, ms in [("1x", 1000), ("2x", 500), ("5x", 200),
-                          ("10x", 100), ("0.5x", 2000)]:
+        # Speeds are ms-per-frame; 1x = 100 ms/frame (what used to be 10x).
+        for label, ms in [("0.25x", 400), ("0.5x", 200), ("1x", 100),
+                          ("2x", 50), ("5x", 20), ("10x", 10)]:
             self.combo_speed.addItem(label, ms)
-        self.combo_speed.setCurrentIndex(0)  # 1x default
+        self.combo_speed.setCurrentIndex(2)  # 1x default
         self.combo_speed.currentIndexChanged.connect(self._on_speed_changed)
         play_row.addWidget(self.combo_speed, 1)
         layout.addLayout(play_row)
@@ -2883,7 +2884,7 @@ class ReviewWindow(QMainWindow):
         self._play_timer = QTimer(self)
         self._play_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._play_timer.timeout.connect(self._on_play_tick)
-        self._play_interval_ms: int = 1000  # 1x default
+        self._play_interval_ms: int = 100  # 1x default (matches combo_speed)
         self._playing: bool = False
         # Session-only opt-out from the X discard-all confirmation dialog.
         self._skip_discard_confirm: bool = False
