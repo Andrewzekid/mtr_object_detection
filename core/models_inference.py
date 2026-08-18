@@ -80,6 +80,24 @@ except ImportError:
     pass  # python-dotenv not installed, will use os.environ directly
 
 
+# SAM predictors are expensive to build (weights load + device setup). Propagate
+# runs one predict() per frame, so rebuilding the model each call dominated the
+# runtime. Cache per (model_path, device, quantize); the GIL makes the get/set
+# race benign (worst case one model is built twice and orphaned).
+_SAM_PREDICTOR_CACHE: Dict[Tuple, Any] = {}
+
+
+def _get_sam_predictor(model_path, device: str, quantize=None):
+    """Cached Ultralytics SAM predictor for (model_path, device, quantize)."""
+    from ultralytics import SAM
+    key = (str(model_path), str(device), quantize)
+    model = _SAM_PREDICTOR_CACHE.get(key)
+    if model is None:
+        model = SAM(str(model_path))
+        _SAM_PREDICTOR_CACHE[key] = model
+    return model
+
+
 def run_sam3(
     image_path: str | Path,
     bboxes: Optional[List[List[float]]] = None,
@@ -154,8 +172,8 @@ def run_sam3(
             log_callback("No bboxes or concepts supplied — predictor will fall back to its defaults.")
 
     try:
-        # Use the high-level Ultralytics SAM API (recommended for SAM3)
-        from ultralytics import SAM
+        # The Ultralytics SAM import happens inside _get_sam_predictor; an
+        # ImportError there is caught below and reported as "not installed".
 
         # Read the source image so we can generate an overlay ourselves
         image = cv2.imread(str(image_file))
@@ -186,7 +204,7 @@ def run_sam3(
         if quantize is not None:
             predict_kwargs["quantize"] = quantize
 
-        model = SAM(str(model_path))
+        model = _get_sam_predictor(model_path, device, quantize)
 
         if progress_callback:
             progress_callback(40)

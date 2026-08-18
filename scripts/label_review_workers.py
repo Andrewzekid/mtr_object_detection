@@ -204,9 +204,35 @@ def _segment_concepts(image_path: str, bboxes_xyxy: list, concepts: list,
                 continue
 
         if not res.get("success"):
-            _fail_all(idxs, concept, res.get("error", "SAM3 failed"))
-            _progress(concept)
-            continue
+            # run_sam3 swallows CUDA OOM into {"success": False, "error":
+            # ...} (it never raises), so the except branch above is dead for
+            # OOM — key the CPU fallback off the returned error instead.
+            err = str(res.get("error", ""))
+            if device != "cpu" and "out of memory" in err.lower():
+                print("⚠️ SAM3 CUDA OOM — retrying on CPU "
+                      "(and using CPU for the remaining concepts)")
+                device = "cpu"
+                try:
+                    res = run_sam3(
+                        image_path=image_path,
+                        bboxes=bxs,
+                        concepts=[concept],
+                        model_path=model_path,
+                        device=device,
+                        conf=conf,
+                    )
+                except Exception as e2:
+                    _fail_all(idxs, concept, str(e2))
+                    _progress(concept)
+                    continue
+                if not res.get("success"):
+                    _fail_all(idxs, concept, res.get("error", "SAM3 failed"))
+                    _progress(concept)
+                    continue
+            else:
+                _fail_all(idxs, concept, res.get("error", "SAM3 failed"))
+                _progress(concept)
+                continue
 
         masks = res.get("masks", []) or []
         dets = res.get("detections", []) or []
@@ -375,18 +401,23 @@ def _autolabel_frame(pred, image_path: str,
 
 def _autolabel_with_fallback(image_path: str, concepts: List[str],
                              model_path: Optional[str], device: str,
-                             conf: float
-                             ) -> Tuple[List[Dict[str, Any]], str]:
+                             conf: float, pred=None
+                             ) -> Tuple[List[Dict[str, Any]], str, Any]:
     """_autolabel_frame with model load + CUDA-OOM→CPU retry.
-    Returns (detections, device_in_use)."""
-    pred = _load_sam3_semantic(model_path, device, conf)
+
+    If `pred` is None a predictor is built here; otherwise it is reused (the
+    batch worker loads once and passes it in per frame). Returns
+    (detections, device_in_use, predictor_in_use) so a caller can keep the
+    (possibly CPU-fallback) predictor for the next frame."""
+    if pred is None:
+        pred = _load_sam3_semantic(model_path, device, conf)
     try:
-        return _autolabel_frame(pred, image_path, concepts), device
+        return _autolabel_frame(pred, image_path, concepts), device, pred
     except Exception as e:
         if device != "cpu" and "out of memory" in str(e).lower():
             print("⚠️ SAM3 CUDA OOM — retrying autolabel on CPU")
             pred = _load_sam3_semantic(model_path, "cpu", conf)
-            return _autolabel_frame(pred, image_path, concepts), "cpu"
+            return _autolabel_frame(pred, image_path, concepts), "cpu", pred
         raise
 
 
@@ -419,7 +450,7 @@ class SAM3AutolabelWorker(QThread):
             self.failed_signal.emit("SAM3 is not installed.")
             return
         try:
-            dets, _dev = _autolabel_with_fallback(
+            dets, _dev, _pred = _autolabel_with_fallback(
                 self.image_path, self.concepts, self.model_path,
                 self.device, self.conf)
         except Exception as e:
@@ -471,6 +502,14 @@ class SAM3AutolabelBatchWorker(QThread):
         os.makedirs(self.tmp_dir, exist_ok=True)
         cat_by_name = dict(zip(self.concepts, self.cat_ids))
         device = self.device
+        # Load the predictor once and reuse it across frames; it is only
+        # rebuilt if a CUDA OOM forces a CPU fallback mid-run. (Kept in a
+        # try so a load failure reports failed_signal like the per-frame path.)
+        try:
+            pred = _load_sam3_semantic(self.model_path, device, self.conf)
+        except Exception as e:
+            self.failed_signal.emit(f"model load: {e}")
+            return
         total_dets = 0
         for n, frame_idx in enumerate(self.frame_idxs):
             if self._cancel_requested:
@@ -484,9 +523,9 @@ class SAM3AutolabelBatchWorker(QThread):
                                         f"autolabel_{frame_idx:06d}.png")
                 Image.fromarray(arr).save(img_path)
             try:
-                dets, device = _autolabel_with_fallback(
+                dets, device, pred = _autolabel_with_fallback(
                     img_path, self.concepts, self.model_path, device,
-                    self.conf)
+                    self.conf, pred=pred)
             except Exception as e:
                 self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
                 return
@@ -502,9 +541,17 @@ class SAM3AutolabelBatchWorker(QThread):
 # SAM3 track propagation: seed with one box, re-detect frame-by-frame.
 # ---------------------------------------------------------------------------
 
+# A detection this far from the previous box (IoU below this) is not "the
+# same object" — treat the track as lost instead of latching onto an
+# unrelated instance. IoU is 0 when boxes don't overlap at all.
+_PROPAGATE_MIN_IOU = 0.05
+
+
 def _propagate_step(image_path: str, prev_bbox_xyxy: List[float],
                     concept: str, model_path: Optional[str], device: str,
-                    conf: float) -> Tuple[Optional[Dict[str, Any]], str]:
+                    conf: float,
+                    min_iou: float = _PROPAGATE_MIN_IOU
+                    ) -> Tuple[Optional[Dict[str, Any]], str]:
     """One propagation step: re-detect the tracked object on a new frame.
 
     Prompts SAM3 with the previous frame's box as the exemplar and picks
@@ -531,6 +578,13 @@ def _propagate_step(image_path: str, prev_bbox_xyxy: List[float],
             res = _run(device)
         else:
             raise
+    # run_sam3 swallows CUDA OOM into a failure dict (it never raises), so
+    # also detect it here on the returned error before giving up.
+    if (not res.get("success") and device != "cpu"
+            and "out of memory" in str(res.get("error", "")).lower()):
+        print("⚠️ SAM3 CUDA OOM — retrying propagation on CPU")
+        device = "cpu"
+        res = _run(device)
     if not res.get("success"):
         raise RuntimeError(res.get("error", "SAM3 failed"))
     dets = res.get("detections", []) or []
@@ -542,6 +596,11 @@ def _propagate_step(image_path: str, prev_bbox_xyxy: List[float],
         iou = _iou_xyxy(prev_bbox_xyxy, d.get("bbox", [0, 0, 0, 0]))
         if iou > best_iou:
             best_iou, best_i = iou, i
+    # Reject a "match" that doesn't actually overlap the previous box —
+    # otherwise a lost track latches onto an unrelated similar object and
+    # the chain chases it for the rest of the clip.
+    if best_iou < min_iou:
+        return None, device
     d = dets[best_i]
     return {
         "bbox_xyxy": d["bbox"],

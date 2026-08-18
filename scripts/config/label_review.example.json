@@ -19,6 +19,6 @@
   },
   "tracking": {
     "sticky_ids": false,
-    "show_ids": false
+    "show_ids": true
   }
 }

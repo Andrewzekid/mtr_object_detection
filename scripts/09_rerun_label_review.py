@@ -152,9 +152,10 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
                (e.g. 13) and press Enter to reassign the selected box
     T        : focus the "Track of selected" field — type a track id and
                press Enter to set it (clear the field to unset). Track ids
-               are hidden by default (no T<id> labels, field hidden);
-               enable them via Config → Advanced settings → Interpolation →
-               "Show track ids" (tracking.show_ids). Track ids
+                are shown by default (T<id> canvas labels, box-list suffix,
+                "Track of selected" row); hide them by unchecking "Show track
+                ids" in Config → Advanced settings → Interpolation
+                (tracking.show_ids). Track ids
                are auto-assigned by inheritance: the k-th box drawn on a
                frame gets the k-th track id from the nearest earlier
                annotated frame (box 1 on frame 2 → track 1, etc.), falling
@@ -227,12 +228,12 @@ config override the corresponding CLI flags. Example:
                                       // inherits the k-th track id from the
                                       // nearest earlier annotated frame
                                       // (what interpolation pairing expects)
-        "show_ids": false             // false (default): track ids are not
-                                      // displayed (no "T<id>" canvas labels,
-                                      // no box-list suffix, "Track of
-                                      // selected" row hidden); true shows
-                                      // them. Editable under the dialog's
-                                      // advanced Interpolation section.
+        "show_ids": true              // true (default): track ids are
+                                       // displayed ("T<id>" canvas labels,
+                                       // box-list suffix, "Track of selected"
+                                       // row); false hides them. Editable
+                                       // under the dialog's advanced
+                                       // Interpolation section.
       }
     }
 
@@ -964,7 +965,12 @@ class CocoState:
         # looking at. Deleting a seeded box is itself undoable.
 
     def add_box(self, image_id: int, x: float, y: float,
-                w: float, h: float, cat_id: int) -> int:
+                w: float, h: float, cat_id: int,
+                track_id: Optional[int] = None) -> int:
+        if track_id is None:
+            track_id = (self._next_track_id(image_id, cat_id)
+                        if self.sticky_track_ids
+                        else self._fresh_track_id())
         ann = {
             "id": self._ann_id_next,
             "image_id": image_id,
@@ -972,9 +978,7 @@ class CocoState:
             "bbox": [float(x), float(y), float(w), float(h)],
             "area": float(w * h),
             "iscrowd": 0,
-            "track_id": (self._next_track_id(image_id, cat_id)
-                         if self.sticky_track_ids
-                         else self._fresh_track_id()),
+            "track_id": track_id,
         }
         self.annotations.append(ann)
         self._ann_id_next += 1
@@ -1090,6 +1094,11 @@ class CocoState:
         n = self._track_next
         self._track_next += 1
         return n
+
+    def peek_fresh_track_id(self) -> int:
+        """The id the next _fresh_track_id() would return, without
+        consuming it (for previews, e.g. the propagate confirm dialog)."""
+        return self._track_next
 
     def _reference_track_ids(self, image_id: int) -> List[Optional[int]]:
         """Track ids of the nearest earlier annotated frame, in that
@@ -1386,8 +1395,8 @@ class CanvasWidget(QWidget):
         self._masks_visible: bool = True
         self._mask_alpha: int = 120  # 0-255 overlay alpha for mask fill
         # Whether "T<id>" track labels are drawn next to boxes (config:
-        # tracking.show_ids; hidden by default).
-        self.show_track_ids: bool = False
+        # tracking.show_ids; shown by default).
+        self.show_track_ids: bool = True
         self._selected_idx: int = -1
         # All currently selected box indices (includes _selected_idx, which
         # is the "primary" selection used for move/resize/recat/track).
@@ -2005,6 +2014,10 @@ class SidePanel(QWidget):
         self.cat_list.itemClicked.connect(self._on_cat_clicked)
         self._rebuild_cat_list()
         self._preselected_cat_id: Optional[int] = None
+        # True only while the highlight came from an explicit Ctrl/Shift
+        # multi-select. A plain single-click preselects a category for the
+        # next drawn box but must NOT restrict an autolabel run to it.
+        self._restrict_selection: bool = False
 
         # Add a new category: type a name, press Enter or click Add.
         add_cat_row = QHBoxLayout()
@@ -2073,11 +2086,9 @@ class SidePanel(QWidget):
         self.track_edit.returnPressed.connect(self._on_track_entered)
         track_row.addWidget(self.track_edit, 1)
         layout.addLayout(track_row)
-        # Track ids are hidden by default; the window flips this via
-        # set_track_ids_visible() from the tracking.show_ids config.
-        self.show_track_ids: bool = False
-        self.track_row_label.hide()
-        self.track_edit.hide()
+        # Track ids are shown by default; the window applies the authoritative
+        # value via set_track_ids_visible() from the tracking.show_ids config.
+        self.show_track_ids: bool = True
 
         # Frame playback controls: play/pause + speed.
         play_row = QHBoxLayout()
@@ -2431,6 +2442,12 @@ class SidePanel(QWidget):
         if cat_id is not None:
             cat_id = int(cat_id)
             self._preselected_cat_id = cat_id
+            # Only an explicit Ctrl/Shift click marks the highlight as an
+            # autolabel restriction; a plain click just preselects.
+            self._restrict_selection = bool(
+                QtWidgets.QApplication.keyboardModifiers()
+                & (Qt.KeyboardModifier.ControlModifier
+                   | Qt.KeyboardModifier.ShiftModifier))
             # Visual hint: bold the clicked row.
             f = item.font()
             f.setBold(True)
@@ -2450,7 +2467,13 @@ class SidePanel(QWidget):
         return self._preselected_cat_id
 
     def get_selected_cat_ids(self) -> List[int]:
-        """All highlighted categories (Ctrl/Shift multi-select), sorted."""
+        """All highlighted categories (Ctrl/Shift multi-select), sorted.
+
+        Empty unless the highlight came from an explicit Ctrl/Shift click —
+        a plain single-click preselects a category for drawing but must not
+        silently restrict an autolabel run to it."""
+        if not self._restrict_selection:
+            return []
         ids = []
         for item in self.cat_list.selectedItems():
             cid = item.data(Qt.UserRole)
@@ -2615,7 +2638,7 @@ class ConfigDialog(QtWidgets.QDialog):
         sam3_box = QtWidgets.QGroupBox("SAM3")
         sam3_form = QtWidgets.QFormLayout(sam3_box)
         self.combo_device = QtWidgets.QComboBox()
-        self.combo_device.addItems(["cuda", "cpu"])
+        self.combo_device.addItems(["auto", "cuda", "cpu"])
         sam3_form.addRow("Device", self.combo_device)
         self.spin_sam3_conf = QtWidgets.QDoubleSpinBox()
         self.spin_sam3_conf.setRange(0.0, 1.0)
@@ -2758,7 +2781,7 @@ class ConfigDialog(QtWidgets.QDialog):
             self.check_confirm_mismatch.setChecked(
                 bool(interp["confirm_mismatch"]))
         sam3 = cfg.get("sam3", {})
-        if sam3.get("device") in ("cuda", "cpu"):
+        if sam3.get("device") in ("auto", "cuda", "cpu"):
             self.combo_device.setCurrentText(sam3["device"])
         if "conf" in sam3:
             self.spin_sam3_conf.setValue(float(sam3["conf"]))
@@ -2878,9 +2901,9 @@ class ReviewWindow(QMainWindow):
                   interp_confirm_mismatch: bool = True,
                   ui_hide: Optional[List[str]] = None,
                   mask_opacity: Optional[int] = None,
-                  advanced_ui: bool = False,
-                  show_track_ids: bool = False,
-                  parent=None):
+                   advanced_ui: bool = False,
+                   show_track_ids: bool = True,
+                   parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
         self.coco = coco
@@ -2901,7 +2924,7 @@ class ReviewWindow(QMainWindow):
         # from the Config dialog's "Advanced settings" checkbox.
         self.advanced_ui: bool = advanced_ui
         # Whether track ids are shown (canvas "T<id>" labels, box-list
-        # suffix, "Track of selected" row). Off by default; config key
+        # suffix, "Track of selected" row). On by default; config key
         # tracking.show_ids, editable under the dialog's advanced section.
         self.show_track_ids: bool = show_track_ids
         # Whether to show the track-id mismatch confirmation dialog before
@@ -3235,6 +3258,16 @@ class ReviewWindow(QMainWindow):
                   self._sam3_propagate_worker, self._interp_worker):
             if w is not None and w.isRunning():
                 w.cancel()
+        # Reset the SAM3 + interpolation UI. A cancelled worker's terminal
+        # signals are dropped as stale (see _stale_sender), so they can't
+        # re-enable the batch buttons / disable Cancel / re-enable the canvas
+        # on their own — do it here, or a switch out of a running job leaves
+        # Cancel stuck on and the canvas locked.
+        self.side.set_sam3_running(False)
+        self._set_sam3_status("idle")
+        self.canvas.setEnabled(True)
+        self.side.set_interp_running(False)
+        self.side.set_interp_status("Interpolation: idle")
         # Save the current session before switching away from it.
         try:
             self.coco.save(is_final=False)
@@ -3326,8 +3359,10 @@ class ReviewWindow(QMainWindow):
                 interp_cfg["confirm_mismatch"])
         sam3_cfg = cfg.get("sam3", {})
         dev = sam3_cfg.get("device")
-        if dev in ("cuda", "cpu"):
-            self.sam3_device = dev
+        if dev in ("auto", "cuda", "cpu"):
+            # 'auto' must resolve to a concrete device here — workers hand
+            # sam3_device straight to run_sam3, which won't interpret 'auto'.
+            self.sam3_device = _resolve_device(dev)
         if "conf" in sam3_cfg:
             self.sam3_conf = float(sam3_cfg["conf"])
         if "auto_segment" in sam3_cfg:
@@ -3774,6 +3809,7 @@ class ReviewWindow(QMainWindow):
             flow_method=self.interp_flow_method,
             camera_model=self.interp_camera_model,
             parent=self)
+        self._interp_worker._lr_session = self._session_seq
         self._interp_worker.progress_signal.connect(self._on_interp_progress)
         self._interp_worker.finished_signal.connect(self._on_interp_finished)
         self._interp_worker.failed_signal.connect(self._on_interp_failed)
@@ -3790,6 +3826,8 @@ class ReviewWindow(QMainWindow):
             f"Interpolating {done}/{total} pair(s)…")
 
     def _on_interp_finished(self, results: list) -> None:
+        if self._stale_sender():
+            return
         self.canvas.setEnabled(True)
         self.side.set_interp_running(False)
         added = 0
@@ -3824,12 +3862,18 @@ class ReviewWindow(QMainWindow):
             4000)
 
     def _on_interp_failed(self, err: str) -> None:
+        if self._stale_sender():
+            print(f"⚠️ Dropping stale interpolation failure from previous "
+                  f"source: {err}")
+            return
         self.canvas.setEnabled(True)
         self.side.set_interp_running(False)
         self.side.set_interp_status("Interpolation failed")
         QMessageBox.critical(self, "Interpolation failed", err)
 
     def _on_interp_cancelled(self) -> None:
+        if self._stale_sender():
+            return
         self.canvas.setEnabled(True)
         self.side.set_interp_running(False)
         self.side.set_interp_status("Interpolation cancelled")
@@ -4700,6 +4744,7 @@ class ReviewWindow(QMainWindow):
             return
         tmp_dir = str(Path(self.coco.output_json).parent / "_tmp_sam3_imgs")
         self._batch_frames_done = 0
+        self._batch_added = 0
         self._set_sam3_status(f"autolabel all: 0/{n} frames…")
         self.side.set_sam3_running(True)
         self._sam3_autolabel_batch_worker = SAM3AutolabelBatchWorker(
@@ -4748,7 +4793,8 @@ class ReviewWindow(QMainWindow):
                 arr = self.frame_index.decode_image(frame_idx)
                 h, w = arr.shape[:2]
             image_id = self.coco.ensure_image(frame, w, h)
-            self._apply_autolabel_dets(image_id, dets)
+            added, _skipped = self._apply_autolabel_dets(image_id, dets)
+            self._batch_added += added
             if frame_idx == self._current_idx:
                 self._refresh_boxes()
         self._batch_frames_done += 1
@@ -4760,11 +4806,15 @@ class ReviewWindow(QMainWindow):
         if self._stale_sender():
             return
         self.side.set_sam3_running(False)
-        self._set_sam3_status(f"autolabel all: done — {total_dets} box(es)")
+        # total_dets is the raw detection count; NMS + existing-box dedup
+        # drop many, so report the boxes actually added.
+        added = self._batch_added
+        self._set_sam3_status(f"autolabel all: done — {added} box(es) added")
         self.coco.save(is_final=False)
         self._refresh_boxes()
         self.statusBar().showMessage(
-            f"Autolabel finished: {total_dets} boxes added", 4000)
+            f"Autolabel finished: {added} box(es) added "
+            f"({total_dets} detected)", 4000)
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     # ------------------- SAM3 track propagation ------------------------- #
@@ -4803,28 +4853,34 @@ class ReviewWindow(QMainWindow):
             return
         ann_id = box["id"]
         tid = box.get("track_id")
-        if tid is None:
-            # Seed without a track id: assign a fresh one first (undoable).
-            tid = self.coco._fresh_track_id()
-            self.coco.set_track_id(ann_id, tid)
-            box["track_id"] = tid
         cat_id = box.get("cat_id", 0)
         concept = self.coco.cat_map.get(cat_id, "object")
         x, y, w, h = box["bbox"]
+        # A seedless box would get a fresh id, but only commit it after the
+        # user confirms — otherwise "No" leaves a stray track id on the box
+        # and consumes a counter value. Preview it without consuming.
+        tid_shown = (tid if tid is not None
+                     else self.coco.peek_fresh_track_id())
         ret = QMessageBox.question(
             self, "Propagate track forward?",
-            f"Propagate T{tid} ({concept}) from frame "
+            f"Propagate T{tid_shown} ({concept}) from frame "
             f"{self._current_idx + 1} to the end ({n - self._current_idx - 1} "
             f"frame(s))?\n\nSAM3 re-detects the object frame-by-frame, "
             f"chained from the previous frame's box. It stops automatically "
-            f"when the object is lost. Frames that already have a T{tid} "
-            f"box are skipped. Runs in the background (device: "
+            f"when the object is lost. Frames that already have a "
+            f"T{tid_shown} box are skipped. Runs in the background (device: "
             f"{self.sam3_device}); Cancel anytime. One Ctrl+Z undoes the "
             f"whole run.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes)
         if ret != QMessageBox.StandardButton.Yes:
             return
+        if tid is None:
+            # Seed without a track id: assign a fresh one now that it's
+            # confirmed (its own undoable entry).
+            tid = self.coco._fresh_track_id()
+            self.coco.set_track_id(ann_id, tid)
+            box["track_id"] = tid
         self._start_propagate_worker(
             self._current_idx, [x, y, x + w, y + h], concept, tid, cat_id)
 
@@ -4897,10 +4953,13 @@ class ReviewWindow(QMainWindow):
                     # re-pushes the whole run as ONE undo entry, so user
                     # edits made while the run is in flight stay separate.
                     with self.coco.undo_stack.mute():
+                        # Pass the track id in — a separate add_box (which
+                        # consumes a fresh id) + set_track_id would leak the
+                        # global counter every frame.
                         ann_id = self.coco.add_box(image_id, x1, y1,
                                                    x2 - x1, y2 - y1,
-                                                   meta["cat_id"])
-                        self.coco.set_track_id(ann_id, meta["track_id"])
+                                                   meta["cat_id"],
+                                                   track_id=meta["track_id"])
                         ann = self.coco.get_box(ann_id)
                         if ann is not None:
                             ann["propagated"] = True
@@ -4942,11 +5001,15 @@ class ReviewWindow(QMainWindow):
         if self._stale_sender():
             return
         tid = self._propagate_meta["track_id"]
+        # n_found counts detections, but frames that already carried the
+        # track id (or a sub-2px box) were skipped — report boxes actually
+        # added.
+        added = self._propagate_meta["added"]
         if lost_at >= 0:
             status = f"propagate T{tid}: lost at frame {lost_at + 1} " \
-                     f"({n_found} box(es) added)"
+                     f"({added} box(es) added)"
         else:
-            status = f"propagate T{tid}: done — {n_found} box(es) added"
+            status = f"propagate T{tid}: done — {added} box(es) added"
         self._end_propagate(status, status.replace("propagate", "Propagate"))
 
     def _on_propagate_failed(self, err: str) -> None:
@@ -5366,8 +5429,8 @@ def main():
                         ui_hide=ui_cfg.get("hide", ["autolabel"]),
                         mask_opacity=ui_cfg.get("mask_opacity"),
                         advanced_ui=bool(ui_cfg.get("advanced", False)),
-                        show_track_ids=bool(tracking_cfg.get("show_ids",
-                                                             False)))
+                         show_track_ids=bool(tracking_cfg.get("show_ids",
+                                                              True)))
     win.show()
     exit_code = app.exec()
 
