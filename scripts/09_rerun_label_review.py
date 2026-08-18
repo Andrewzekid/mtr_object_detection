@@ -8,7 +8,7 @@ Run it
     python scripts/09_rerun_label_review.py \
         --rrd complete3/output.rrd \
         --output_json output/complete3/coco_fresh.json \
-        --db complete3/inspection_v2.db --no-seed --sam3-device cpu
+        --no-seed --sam3-device cpu
 
     # Image mode (plain files, no Rerun viewer):
     python scripts/09_rerun_label_review.py \
@@ -82,9 +82,10 @@ The script auto-detects:
   * the image entity path (first entity with archetype EncodedImage),
   * the matching ``Boxes2D`` sibling entity (``<image>/bboxes2d`` by default),
   * the timeline to use (prefers ``ros_time`` if present, else ``log_time``),
-  * categories from the ``Boxes2D:labels`` column if it contains category
-    names; otherwise uses the categories from a seeded ``--json`` COCO file
-    or falls back to integer ids.
+  * categories start empty; they are created from the side panel's Add
+    field, come back with a resumed labels file, or are created on the fly
+    from the ``Boxes2D:labels`` column of an .rrd (``--json`` can still
+    seed an explicit category list).
 
 Timestamps are stored in the COCO output as the ``timestamp_ns`` field on
 each image, and a side-table ``timestamp_ns → image_id`` is written into the
@@ -111,7 +112,7 @@ USAGE
     python scripts/09_rerun_label_review.py
 
 Key bindings (in the 2D canvas, when it has focus — click it once):
-    D / del  : delete selected box
+    D / del / backspace : delete selected box
     A        : toggle draw mode (click-drag a new box)
     N / →    : next frame
     B / ←    : previous frame
@@ -194,7 +195,6 @@ import json
 import os
 import shutil
 import signal
-import sqlite3
 import sys
 import threading
 import time
@@ -2313,7 +2313,7 @@ class CanvasWidget(QWidget):
                 self.parent_window._assign_pending_cat(int(txt))
             return
 
-        if k in (Qt.Key_D, Qt.Key_Delete):
+        if k in (Qt.Key_D, Qt.Key_Delete, Qt.Key_Backspace):
             if 0 <= self._selected_idx < len(self._boxes):
                 ann_id = self._boxes[self._selected_idx]["id"]
                 self.box_deleted.emit(ann_id)
@@ -2362,7 +2362,7 @@ class SidePanel(QWidget):
 
     cat_clicked = pyqtSignal(int)  # cat_id
     slider_moved = pyqtSignal(int)  # frame_idx
-    nav_delta = pyqtSignal(int)     # +5 / +10 frame jump buttons
+    nav_delta = pyqtSignal(int)     # -10 / -5 / +5 / +10 frame jump buttons
     run_sam3_clicked = pyqtSignal()      # "Run SAM3 (all)" button
     toggle_masks_clicked = pyqtSignal()  # "Masks: on/off" button
     resegment_clicked = pyqtSignal()     # "Re-segment selected" button
@@ -2480,13 +2480,14 @@ class SidePanel(QWidget):
         play_row.addWidget(self.combo_speed, 1)
         layout.addLayout(play_row)
 
-        # Big forward jumps.
+        # Big jumps, both directions.
         jump_row = QHBoxLayout()
         jump_row.addWidget(QLabel("Jump:"))
         self.jump_buttons = []  # kept for config-driven hiding
-        for delta in (5, 10):
-            btn = QPushButton(f"+{delta} frames")
-            btn.setToolTip(f"Jump forward {delta} frames.")
+        for delta in (-10, -5, 5, 10):
+            sign = "+" if delta > 0 else ""
+            btn = QPushButton(f"{sign}{delta}")
+            btn.setToolTip(f"Jump {delta:+d} frames.")
             btn.clicked.connect(lambda _c=False, d=delta: self.nav_delta.emit(d))
             jump_row.addWidget(btn)
             self.jump_buttons.append(btn)
@@ -2928,7 +2929,7 @@ class ConfigDialog(QtWidgets.QDialog):
     _HIDE_LABELS = {
         "keyframe": "Keyframe controls",
         "interpolate": "Interpolate controls",
-        "jump": "Jump buttons (+5/+10)",
+        "jump": "Jump buttons (−10/−5/+5/+10)",
         "sam3_run": "SAM3 run buttons",
         "sam3_all_frames": "SAM3 all-frames button",
         "masks": "Mask toggle + opacity slider",
@@ -3654,11 +3655,11 @@ class ReviewWindow(QMainWindow):
                 self.bridge.time_changed.connect(
                     self._on_viewer_time_changed)
         self.btn_toggle_rerun.setEnabled(True)
-        # If categories are still the untouched placeholder, seed them from
-        # the recording's labels instead.
+        # If no categories yet (fresh empty start), seed them from the
+        # recording's labels.
         cats = self.coco.categories
-        if cats == [{"id": 0, "name": "object"}]:
-            seeded = _seed_categories(new_index, None, None)
+        if not cats:
+            seeded = _seed_categories(new_index, None)
             if seeded != cats:
                 self.coco.categories = seeded
                 self.coco.cat_map = {c["id"]: c["name"] for c in seeded}
@@ -4905,40 +4906,20 @@ def _spawn_rerun_web_viewer(rrd_path: str, web_port: int,
 # ---------------------------------------------------------------------------
 
 def _seed_categories(rrd_index: RrdFrameIndex,
-                     seed_json: Optional[str],
-                     db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+                     seed_json: Optional[str]) -> List[Dict[str, Any]]:
     """Build the category list. Priority:
 
     1. If --json is given, use its categories (and merge any labels found
        in the .rrd as new categories).
-    2. Else if a SQLite db path is given (e.g. ``inspection_v2.db``),
-       read categories from its ``categories`` table.
-    3. Else scan the .rrd's Boxes2D:labels: if any label parses as a name
-       (non-integer), use those as category names; otherwise fall back to
-       numeric ids 0..N-1 with placeholder names "cat_0".."cat_N-1".
+    2. Otherwise start empty — categories are created as needed: from the
+       side panel's Add field, from a resumed labels file, or on the fly
+       from .rrd box labels (see CocoState._resolve_cat_id).
+
+    For .rrd sources the recording's Boxes2D:labels are still merged in so
+    seeded boxes get proper category names instead of bare ids.
     """
     cats: List[Dict[str, Any]] = []
     seen: Dict[str, int] = {}
-
-    if seed_json and os.path.exists(seed_json):
-        with open(seed_json, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for c in data.get("categories", []):
-            cats.append({"id": c["id"], "name": c["name"]})
-            seen[c["name"]] = c["id"]
-
-    if not cats and db_path and os.path.exists(db_path):
-        try:
-            con = sqlite3.connect(db_path)
-            cur = con.cursor()
-            cur.execute("SELECT id, name FROM categories ORDER BY id")
-            for cid, cname in cur.fetchall():
-                cats.append({"id": cid - 1, "name": cname})  # 0-based for COCO
-                seen[cname] = cid - 1
-            con.close()
-            print(f"🏷️  Loaded {len(cats)} categories from {db_path}")
-        except Exception as e:
-            print(f"⚠️ Could not read categories from {db_path}: {e}")
 
     if seed_json and os.path.exists(seed_json):
         with open(seed_json, "r", encoding="utf-8") as f:
@@ -4968,9 +4949,9 @@ def _seed_categories(rrd_index: RrdFrameIndex,
                 seen[n] = next_id
                 next_id += 1
 
-    if not cats:
-        # No labels found and no seed. Provide a single placeholder.
-        cats = [{"id": 0, "name": "object"}]
+    # No seed file and no .rrd labels → start with an empty category list;
+    # the user adds categories from the side panel (or a resumed labels
+    # file brings its own).
     return cats
 
 
@@ -4996,8 +4977,8 @@ def main():
                              "for --images, <rrd>_labels.json for --rrd, "
                              "./untitled_labels_coco.json in idle mode.")
     parser.add_argument("--json", help="Seed COCO JSON for categories / existing labels.")
-    parser.add_argument("--db", help="SQLite inspection DB (e.g. complete3/inspection_v2.db) "
-                        "to read categories from when --json is not given.")
+    parser.add_argument("--db", help="Deprecated/unused: categories are no longer read "
+                        "from a SQLite DB. Kept so old commands still parse.")
     parser.add_argument("--image-entity", help="Override the image entity path (auto-detect by default).")
     parser.add_argument("--bboxes-entity", help="Override the Boxes2D entity path (auto-detect).")
     parser.add_argument("--timeline", help="Timeline to use (auto-detect; prefers ros_time).")
@@ -5117,7 +5098,7 @@ def main():
         sys.exit(1)
 
     # ---------- 2. Categories / COCO state ----------
-    categories = _seed_categories(rrd_index, args.json, args.db)
+    categories = _seed_categories(rrd_index, args.json)
     print(f"🏷️  Categories: {[c['name'] for c in categories]}")
     coco = CocoState(args.output_json, categories)
     coco.load_existing()
