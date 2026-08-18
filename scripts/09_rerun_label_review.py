@@ -3372,6 +3372,10 @@ class ReviewWindow(QMainWindow):
         self.coco.load_existing()
         self._update_source_label()
         self.side.coco = self.coco  # side panel keeps its own reference
+        # load_existing may have merged categories saved in the project
+        # file — refresh the visible list (it still shows the previous
+        # session's categories, e.g. empty after an idle start).
+        self.side._rebuild_cat_list()
         self._current_idx = self.coco.load_progress(len(self.rrd_index))
         self._current_image_id = None
         self._last_cat_id = None
