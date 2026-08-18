@@ -17,6 +17,7 @@
     "mask_opacity": 47
   },
   "tracking": {
-    "sticky_ids": false
+    "sticky_ids": false,
+    "show_ids": false
   }
 }

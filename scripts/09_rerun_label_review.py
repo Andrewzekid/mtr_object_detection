@@ -118,6 +118,9 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
                (e.g. 13) and press Enter to reassign the selected box
     T        : focus the "Track of selected" field — type a track id and
                press Enter to set it (clear the field to unset). Track ids
+               are hidden by default (no T<id> labels, field hidden);
+               enable them via Config → Advanced settings → Interpolation →
+               "Show track ids" (tracking.show_ids). Track ids
                are auto-assigned by inheritance: the k-th box drawn on a
                frame gets the k-th track id from the nearest earlier
                annotated frame (box 1 on frame 2 → track 1, etc.), falling
@@ -174,12 +177,18 @@ config override the corresponding CLI flags. Example:
         "mask_opacity": 47            // initial mask overlay opacity (0-100)
       },
       "tracking": {
-        "sticky_ids": false           // false (default): every new box gets
+        "sticky_ids": false,          // false (default): every new box gets
                                       // a fresh auto-increment track id;
                                       // true: the k-th box on a frame
                                       // inherits the k-th track id from the
                                       // nearest earlier annotated frame
                                       // (what interpolation pairing expects)
+        "show_ids": false             // false (default): track ids are not
+                                      // displayed (no "T<id>" canvas labels,
+                                      // no box-list suffix, "Track of
+                                      // selected" row hidden); true shows
+                                      // them. Editable under the dialog's
+                                      // advanced Interpolation section.
       }
     }
 
@@ -1219,6 +1228,9 @@ class CanvasWidget(QWidget):
         self._boxes: List[Dict[str, Any]] = []  # see set_boxes
         self._masks_visible: bool = True
         self._mask_alpha: int = 120  # 0-255 overlay alpha for mask fill
+        # Whether "T<id>" track labels are drawn next to boxes (config:
+        # tracking.show_ids; hidden by default).
+        self.show_track_ids: bool = False
         self._selected_idx: int = -1
         # All currently selected box indices (includes _selected_idx, which
         # is the "primary" selection used for move/resize/recat/track).
@@ -1443,7 +1455,8 @@ class CanvasWidget(QWidget):
             br = self._img_to_widget(x + w, y + h)
             p.drawRect(QtCore.QRectF(tl, br))
             tid = box.get("track_id")
-            ttxt = f"T{tid} " if tid is not None else ""
+            ttxt = (f"T{tid} " if (tid is not None and self.show_track_ids)
+                    else "")
             itxt = "~" if box.get("interp") else ""
             label = f"{itxt}{ttxt}{box.get('cat_name','?')} (id:{box['id']})"
             p.fillRect(
@@ -1881,9 +1894,11 @@ class SidePanel(QWidget):
         # Track id of the selected box: type a number + Enter to set it,
         # clear the field + Enter to unset. Auto-assigned by inheritance
         # from the nearest earlier annotated frame (global counter as
-        # fallback); edit it when a track continues.
+        # fallback); edit it when a track continues. The whole row is
+        # hidden unless track ids are enabled (tracking.show_ids config).
         track_row = QHBoxLayout()
-        track_row.addWidget(QLabel("Track of selected:"))
+        self.track_row_label = QLabel("Track of selected:")
+        track_row.addWidget(self.track_row_label)
         self.track_edit = QLineEdit()
         self.track_edit.setPlaceholderText("id, e.g. 2 (empty clears)")
         self.track_edit.setToolTip(
@@ -1892,6 +1907,11 @@ class SidePanel(QWidget):
         self.track_edit.returnPressed.connect(self._on_track_entered)
         track_row.addWidget(self.track_edit, 1)
         layout.addLayout(track_row)
+        # Track ids are hidden by default; the window flips this via
+        # set_track_ids_visible() from the tracking.show_ids config.
+        self.show_track_ids: bool = False
+        self.track_row_label.hide()
+        self.track_edit.hide()
 
         # Frame playback controls: play/pause + speed.
         play_row = QHBoxLayout()
@@ -2051,7 +2071,8 @@ class SidePanel(QWidget):
         for i, b in enumerate(boxes):
             x, y, w, h = b["bbox"]
             tid = b.get("track_id")
-            ttxt = f" T{tid}" if tid is not None else ""
+            ttxt = (f" T{tid}" if (tid is not None and self.show_track_ids)
+                    else "")
             itxt = " ~interp" if b.get("interp") else ""
             txt = (f"{b.get('cat_name','?')}{ttxt}{itxt} (id: {b['id']})  "
                    f"[{int(x)},{int(y)},{int(w)},{int(h)}]")
@@ -2250,6 +2271,14 @@ class SidePanel(QWidget):
             print(f"⚠️ Unknown ui.hide group: {g!r} "
                   f"(known: {sorted(self._HIDEABLE)})")
 
+    def set_track_ids_visible(self, visible: bool) -> None:
+        """Show/hide everything track-id related: the "Track of selected"
+        row and the " T<id>" suffix in the box list (the canvas labels are
+        gated separately via CanvasWidget.show_track_ids)."""
+        self.show_track_ids = visible
+        self.track_row_label.setVisible(visible)
+        self.track_edit.setVisible(visible)
+
     def set_slider_max(self, n: int) -> None:
         self.frame_slider.setMaximum(max(0, n - 1))
 
@@ -2305,17 +2334,17 @@ class ConfigDialog(QtWidgets.QDialog):
         self.win = win
         self.setWindowTitle("Config settings")
         self.setModal(True)
+        self.resize(480, 640)
         root = QVBoxLayout(self)
 
-        # --- Advanced toggle -------------------------------------------------
-        self.check_advanced = QCheckBox(
-            "Advanced settings (interpolation, tracking, keyframe/interpolate "
-            "controls)")
-        self.check_advanced.setToolTip(
-            "Unchecked (default): the interpolation and tracking sections\n"
-            "below are hidden, and the keyframe/interpolate buttons stay\n"
-            "hidden in the side panel.")
-        root.addWidget(self.check_advanced)
+        # Scrollable content (the dialog has grown past one screen).
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        content = QtWidgets.QWidget()
+        body = QVBoxLayout(content)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
 
         # --- UI visibility -------------------------------------------------
         ui_box = QtWidgets.QGroupBox("Hide UI elements")
@@ -2326,7 +2355,7 @@ class ConfigDialog(QtWidgets.QDialog):
             cb = QCheckBox(label)
             self.hide_checks[key] = cb
             ui_form.addWidget(cb)
-        root.addWidget(ui_box)
+        body.addWidget(ui_box)
 
         # --- Interpolation -------------------------------------------------
         self.interp_box = QtWidgets.QGroupBox("Interpolation")
@@ -2344,7 +2373,14 @@ class ConfigDialog(QtWidgets.QDialog):
         interp_form.addRow("Match max dist frac", self.spin_match_frac)
         self.check_confirm_mismatch = QCheckBox("Confirm on mismatch")
         interp_form.addRow(self.check_confirm_mismatch)
-        root.addWidget(self.interp_box)
+        self.check_show_track_ids = QCheckBox(
+            "Show track ids (T<id> labels + track edit field)")
+        self.check_show_track_ids.setToolTip(
+            "Unchecked (default): track ids are not displayed — box labels\n"
+            "and the box list show only the category and annotation id, and\n"
+            "the \"Track of selected\" row is hidden. Checked: show them.")
+        interp_form.addRow(self.check_show_track_ids)
+        body.addWidget(self.interp_box)
 
         # --- SAM3 ----------------------------------------------------------
         sam3_box = QtWidgets.QGroupBox("SAM3")
@@ -2367,7 +2403,7 @@ class ConfigDialog(QtWidgets.QDialog):
             "polygons — filters the scattered specks SAM3 occasionally\n"
             "produces. 0 keeps every contour.")
         sam3_form.addRow("Min polygon area", self.spin_min_poly_area)
-        root.addWidget(sam3_box)
+        body.addWidget(sam3_box)
 
         # --- Mask opacity --------------------------------------------------
         mask_box = QtWidgets.QGroupBox("Masks")
@@ -2376,7 +2412,7 @@ class ConfigDialog(QtWidgets.QDialog):
         self.spin_opacity.setRange(0, 100)
         self.spin_opacity.setSuffix(" %")
         mask_form.addRow("Mask opacity", self.spin_opacity)
-        root.addWidget(mask_box)
+        body.addWidget(mask_box)
 
         # --- Tracking ------------------------------------------------------
         self.track_box = QtWidgets.QGroupBox("Tracking")
@@ -2389,7 +2425,17 @@ class ConfigDialog(QtWidgets.QDialog):
             "k-th track id\nfrom the nearest earlier annotated frame (what "
             "interpolation expects).")
         track_form.addRow(self.check_sticky_ids)
-        root.addWidget(self.track_box)
+        body.addWidget(self.track_box)
+
+        # --- Advanced toggle (at the very bottom of the settings) ----------
+        self.check_advanced = QCheckBox(
+            "Advanced settings (interpolation, tracking, keyframe/interpolate "
+            "controls)")
+        self.check_advanced.setToolTip(
+            "Unchecked (default): the interpolation and tracking sections\n"
+            "above are hidden, and the keyframe/interpolate buttons stay\n"
+            "hidden in the side panel.")
+        body.addWidget(self.check_advanced)
 
         # --- Buttons -------------------------------------------------------
         btn_row = QHBoxLayout()
@@ -2450,6 +2496,7 @@ class ConfigDialog(QtWidgets.QDialog):
         self.combo_cam.setCurrentText(win.interp_camera_model)
         self.spin_match_frac.setValue(win.interp_match_frac)
         self.check_confirm_mismatch.setChecked(win.interp_confirm_mismatch)
+        self.check_show_track_ids.setChecked(win.show_track_ids)
         self.combo_device.setCurrentText(win.sam3_device)
         self.spin_sam3_conf.setValue(win.sam3_conf)
         self.check_auto_segment.setChecked(win.auto_segment)
@@ -2493,6 +2540,8 @@ class ConfigDialog(QtWidgets.QDialog):
         tracking = cfg.get("tracking", {})
         if "sticky_ids" in tracking:
             self.check_sticky_ids.setChecked(bool(tracking["sticky_ids"]))
+        if "show_ids" in tracking:
+            self.check_show_track_ids.setChecked(bool(tracking["show_ids"]))
 
     def _collect(self) -> Dict[str, Any]:
         """Widget state as a config dict (same schema as the example JSON)."""
@@ -2523,6 +2572,7 @@ class ConfigDialog(QtWidgets.QDialog):
             },
             "tracking": {
                 "sticky_ids": self.check_sticky_ids.isChecked(),
+                "show_ids": self.check_show_track_ids.isChecked(),
             },
         }
 
@@ -2584,6 +2634,7 @@ class ReviewWindow(QMainWindow):
                   ui_hide: Optional[List[str]] = None,
                   mask_opacity: Optional[int] = None,
                   advanced_ui: bool = False,
+                  show_track_ids: bool = False,
                   parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -2601,6 +2652,10 @@ class ReviewWindow(QMainWindow):
         # keyframe/interpolate buttons) are exposed. Off by default; toggled
         # from the Config dialog's "Advanced settings" checkbox.
         self.advanced_ui: bool = advanced_ui
+        # Whether track ids are shown (canvas "T<id>" labels, box-list
+        # suffix, "Track of selected" row). Off by default; config key
+        # tracking.show_ids, editable under the dialog's advanced section.
+        self.show_track_ids: bool = show_track_ids
         # Whether to show the track-id mismatch confirmation dialog before
         # interpolating.
         self.interp_confirm_mismatch = interp_confirm_mismatch
@@ -2651,6 +2706,10 @@ class ReviewWindow(QMainWindow):
         self.side = SidePanel(coco)
         splitter.addWidget(self.side)
         splitter.setSizes([1200, 360])
+
+        # Track-id visibility (canvas labels + side-panel row/list).
+        self.canvas.show_track_ids = self.show_track_ids
+        self.side.set_track_ids_visible(self.show_track_ids)
 
         self.setCentralWidget(splitter)
         self._build_menu()
@@ -2973,6 +3032,11 @@ class ReviewWindow(QMainWindow):
         tracking_cfg = cfg.get("tracking", {})
         if "sticky_ids" in tracking_cfg:
             self.coco.sticky_track_ids = bool(tracking_cfg["sticky_ids"])
+        if "show_ids" in tracking_cfg:
+            self.show_track_ids = bool(tracking_cfg["show_ids"])
+            self.canvas.show_track_ids = self.show_track_ids
+            self.side.set_track_ids_visible(self.show_track_ids)
+            self._refresh_boxes()  # re-render labels without/with the T-ids
 
 
     def _open_image_files(self) -> None:
@@ -3846,6 +3910,11 @@ class ReviewWindow(QMainWindow):
 
     def _focus_track_edit(self) -> None:
         """T key: prefill with the current track id and focus the field."""
+        if not self.show_track_ids:
+            self.statusBar().showMessage(
+                "Track ids are hidden — enable them in Config → Advanced "
+                "settings → Interpolation", 3500)
+            return
         self._prefill_recat()
         self.side.track_edit.setFocus()
         self.side.track_edit.selectAll()
@@ -4422,7 +4491,9 @@ def main():
                         # additional groups on top.
                         ui_hide=ui_cfg.get("hide", []),
                         mask_opacity=ui_cfg.get("mask_opacity"),
-                        advanced_ui=bool(ui_cfg.get("advanced", False)))
+                        advanced_ui=bool(ui_cfg.get("advanced", False)),
+                        show_track_ids=bool(tracking_cfg.get("show_ids",
+                                                             False)))
     win.show()
     exit_code = app.exec()
 
