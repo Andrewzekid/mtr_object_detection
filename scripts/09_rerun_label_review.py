@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Interactive 2D bbox reviewer for a Rerun .rrd recording OR a folder of images.
+Interactive 2D bbox reviewer for image files and folders.
 
 Code layout: this file holds the UI (canvas, side panel, main window) and
 the COCO/undo state. The background worker threads (SAM3 segmentation,
@@ -9,13 +9,7 @@ this file and are imported back at the top of this module.
 
 Run it
 ------
-    # Rerun mode (recording + embedded Rerun web viewer):
-    python scripts/09_rerun_label_review.py \
-        --rrd complete3/output.rrd \
-        --output_json output/complete3/coco_fresh.json \
-        --no-seed --sam3-device cpu
-
-    # Image mode (plain files, no Rerun viewer):
+    # With an image source:
     python scripts/09_rerun_label_review.py \
         --images /path/to/folder_or_image.jpg \
         --output_json output/my_labels/coco.json
@@ -26,14 +20,13 @@ Run it
 
 What this does
 ---------------
-* Opens an existing Rerun ``.rrd`` recording — or, with ``--images``, a set
-  of plain image files (one or more files/folders; folders are scanned for
-  jpg/jpeg/png/bmp/webp/tif, sorted by name). If every file stem is a bare
-  integer (e.g. ``1712345678901234567.jpg``), the filenames are treated as
+* Opens a set of plain image files (``--images`` with one or more
+  files/folders; folders are scanned for jpg/jpeg/png/bmp/webp/tif, sorted
+  by name). If every file stem is a bare integer
+  (e.g. ``1712345678901234567.jpg``), the filenames are treated as
   nanosecond timestamps: frames sort by timestamp and the slider/info show
-  them; otherwise the UI shows the plain image index. Without ``--rrd`` or
-  ``--images`` the app starts idle (no Rerun viewer) until you load a
-  source from the File menu.
+  them; otherwise the UI shows the plain image index. Without ``--images``
+  the app starts idle until you load a source from the File menu.
 * New categories can be added from the side panel at any time (name field +
   Add button under the category list); the new category gets the next free
   id and is preselected for the next draw. The Rename / Delete buttons next
@@ -42,29 +35,20 @@ What this does
   the boxes using that category too.
 * The File menu switches the frame source at runtime (the current session
   is saved first, categories are kept): ``Ctrl+O`` open image files,
-  ``Ctrl+Shift+O`` open folder, ``Ctrl+R`` load a Rerun .rrd (indexes it,
-  spawns the web viewer, and embeds it on the spot). ``Ctrl+G`` opens the
+  ``Ctrl+Shift+O`` open folder. ``Ctrl+G`` opens the
   Config settings dialog. ``Ctrl+S`` saves the COCO JSON to the current
   output path without quitting; ``Ctrl+Shift+S`` (Save as…) picks a new
   location and keeps saving there. Image sessions write
-  ``labels_coco.json`` next to the chosen images; rrd sessions write
-  ``<name>_labels.json`` beside the recording unless ``--output_json``
+  ``labels_coco.json`` next to the chosen images unless ``--output_json``
   is given.
-* Embeds the official Rerun *web* viewer inside a PyQt6 window using
-  ``QWebEngineView`` pointed at a locally hosted ``rerun.serve_web_viewer()``
-  instance. The viewer shows the full 3D world + camera images, and you can
-  scrub the timeline there exactly like in the native viewer.
-* Alongside the Rerun viewer, renders a 2D canvas of the *current frame's*
-  camera image, with the existing 2D bboxes loaded from the recording, plus
-  any new bboxes you draw. Number keys pick the category (same UX as
+* Renders a 2D canvas of the *current frame's* image, plus any bboxes you
+  draw. Number keys pick the category (same UX as
   ``08_click_review_coco.py``).
 * Persists edits to a COCO json + ``.progress`` file in the same on-disk
   format that ``08_click_review_coco.py`` produces, so downstream scripts
   (08b, 13_interpolate_tracks.py, ...) keep working unchanged.
-* The current frame is *driven by the Rerun viewer's timeline*: when you drag
-  the timeline in the embedded Rerun viewer, a JS→Python event propagates the
-  new time, the script looks up the matching frame, and the 2D canvas updates
-  automatically. You can also navigate with N/B keys or a slider.
+* Navigate frames with N/B keys, the arrow keys, or the slider; a play
+  button auto-advances at 0.25x–10x speed.
 
 SAM3 segmentation
 -----------------
@@ -89,36 +73,21 @@ SAM3 segmentation
   mask on every frame; the progress bar above the frame slider shows how
   many frames have at least one box.
 
-The .rrd must contain at least one ``EncodedImage`` entity (auto-detected).
-The script auto-detects:
-  * the image entity path (first entity with archetype EncodedImage),
-  * the matching ``Boxes2D`` sibling entity (``<image>/bboxes2d`` by default),
-  * the timeline to use (prefers ``ros_time`` if present, else ``log_time``),
-  * categories start empty; they are created from the side panel's Add
-    field, come back with a resumed labels file, or are created on the fly
-    from the ``Boxes2D:labels`` column of an .rrd (``--json`` can still
-    seed an explicit category list).
+Categories start empty; they are created from the side panel's Add
+field, come back with a resumed labels file, or are seeded from a COCO
+json via ``--json``.
 
 Timestamps are stored in the COCO output as the ``timestamp_ns`` field on
 each image, and a side-table ``timestamp_ns → image_id`` is written into the
-JSON so the result can be joined back to the inspection SQLite database
-(``complete3/inspection_v2.db`` ``images.timestamp_ns`` column).
+JSON so the result can be joined back to external databases by timestamp.
 
 USAGE
 -----
     python scripts/09_rerun_label_review.py \
-        --rrd complete3/output.rrd \
-        --output_json output/complete3/coco_reviewed.json \
-        [--json <seed coco>] \
-        [--image-entity /world/leveled/camera_init/body/camera_right/image] \
-        [--timeline ros_time] \
-        [--output-yolo-dir ...] [--data-yaml ...] \
-        [--grpc-port 9876] [--web-port 9090]
-
-    # or, without an .rrd (mutually exclusive with --rrd):
-    python scripts/09_rerun_label_review.py \
         --images <folder | image file> [more paths ...] \
-        --output_json output/my_labels/coco.json
+        --output_json output/my_labels/coco.json \
+        [--json <seed coco>] \
+        [--output-yolo-dir ...] [--data-yaml ...]
 
     # or with no source at all (idle; pick one later from the File menu):
     python scripts/09_rerun_label_review.py
@@ -193,7 +162,7 @@ config override the corresponding CLI flags. Example:
         "hide": ["sam3_all_frames"],  // button groups to hide; known groups:
                                       // keyframe, interpolate, jump,
                                       // sam3_run, sam3_all_frames, masks,
-                                      // play, rerun_toggle.
+                                      // play.
                                       // Default (no config): ["interpolate",
                                       // "keyframe"]; set [] to show all.
         "mask_opacity": 47            // initial mask overlay opacity (0-100)
@@ -233,10 +202,6 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 from PIL import Image
-
-# Rerun
-import rerun as rr
-import rerun.blueprint as rrb
 
 # Qt
 import PyQt6.QtCore as QtCore
@@ -311,23 +276,6 @@ QSizePolicy.Expanding = QSizePolicy.Policy.Expanding  # type: ignore[attr-define
 QSizePolicy.Fixed = QSizePolicy.Policy.Fixed  # type: ignore[attr-defined]
 QSizePolicy.Preferred = QSizePolicy.Policy.Preferred  # type: ignore[attr-defined]
 from PyQt6.QtGui import QShortcut, QAction
-try:
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWebChannel import QWebChannel
-    _HAS_WEBENGINE = True
-except Exception:
-    _HAS_WEBENGINE = False
-    QWebEngineView = None  # type: ignore[assignment]
-    QWebChannel = None  # type: ignore[assignment]
-
-# Rerun experimental chunk reader for parsing the .rrd
-try:
-    import rerun.experimental as exp
-    _HAS_EXP = True
-except Exception:
-    _HAS_EXP = False
-
-import pyarrow as pa
 
 # Worker threads (SAM3 / interpolation) live in a sibling module to keep
 # this file UI-focused. The script dir goes on sys.path so the import also
@@ -408,250 +356,10 @@ def _polygons_to_mask(polys: List[List[float]], height: int,
 
 
 
-# ---------------------------------------------------------------------------
-# RrdFrameIndex: scan the .rrd, build (frame_idx -> timestamp_ns, image bytes)
-# ---------------------------------------------------------------------------
-
-class RrdFrameIndex:
-    """Scan a .rrd once and build an index of frames for one image entity.
-
-    A "frame" is a unique value of the chosen timeline at which an
-    ``EncodedImage`` was logged for ``image_entity``. Each frame stores:
-      * ``frame_idx`` (0-based, ordered by timeline value)
-      * ``timestamp_ns`` (int nanos since epoch, taken from the chosen timeline)
-      * ``log_time_ns`` (int nanos since epoch from ``log_time``)
-      * ``image_bytes`` (the EncodedImage blob, JPEG/PNG bytes)
-      * ``existing_boxes`` (list of (cx, cy, hw, hh, label) from Boxes2D)
-    """
-
-    def __init__(
-        self,
-        rrd_path: str,
-        image_entity: Optional[str] = None,
-        bboxes_entity: Optional[str] = None,
-        timeline: Optional[str] = None,
-        progress_cb=None,
-    ):
-        if not _HAS_EXP:
-            raise RuntimeError(
-                "rerun.experimental is required to read .rrd files. "
-                "Install rerun-sdk >= 0.30."
-            )
-        self.rrd_path = str(rrd_path)
-        self.progress_cb = progress_cb
-        reader = exp.RrdReader(self.rrd_path)
-        recs = reader.recordings()
-        if not recs:
-            raise RuntimeError(f"No recordings found in {self.rrd_path}")
-        store = reader.store(store=recs[0])
-
-        # ---- Auto-detect image entity, bboxes entity, timeline ----
-        schema_cols = list(store.schema())
-        image_entities = sorted({
-            str(c.entity_path)
-            for c in schema_cols
-            if getattr(c, "archetype", None) == "rerun.archetypes.EncodedImage"
-        })
-        if not image_entities:
-            raise RuntimeError(
-                "No EncodedImage entity found in this .rrd. "
-                "Cannot label images without an image stream."
-            )
-        self.image_entity = image_entity or image_entities[0]
-        if image_entity and image_entity not in image_entities:
-            raise RuntimeError(
-                f"--image-entity {image_entity} not found. "
-                f"Available: {image_entities}"
-            )
-        self.image_entity = image_entity or image_entities[0]
-
-        # Bboxes sibling: <image_entity>/bboxes2d (auto) unless overridden.
-        candidate_bbox = bboxes_entity or f"{self.image_entity}/bboxes2d"
-        bbox_entities = sorted({
-            str(c.entity_path)
-            for c in schema_cols
-            if getattr(c, "archetype", None) == "rerun.archetypes.Boxes2D"
-        })
-        self.bboxes_entity = (
-            candidate_bbox if candidate_bbox in bbox_entities
-            else (bbox_entities[0] if bbox_entities else None)
-        )
-
-        # Timeline: prefer ros_time, then log_time.
-        if timeline is None:
-            timeline = "ros_time"
-        # Validate the timeline exists. Timeline index columns appear as
-        # top-level columns named just `log_time`, `ros_time`, etc., without
-        # an entity_path attribute (they apply to the whole recording).
-        available_timelines = set()
-        for c in schema_cols:
-            if hasattr(c, "entity_path"):
-                continue
-            name = getattr(c, "name", "")
-            if name and not name.startswith("/") and not name.startswith("Index("):
-                available_timelines.add(name)
-        if timeline not in available_timelines:
-            if "log_time" in available_timelines:
-                timeline = "log_time"
-            elif available_timelines:
-                timeline = next(iter(sorted(available_timelines)))
-            else:
-                raise RuntimeError("Image entity has no timeline column.")
-        self.timeline = timeline
-
-        # ---- Stream chunks and collect per-frame data ----
-        self.frames: List[Dict[str, Any]] = []
-        self._scan(store)
-
-    # ------------------------------------------------------------------ #
-
-    def _scan(self, store) -> None:
-        """Walk the chunk stream, collect image + bboxes for each timeline value."""
-        # First pass: collect image chunks. We accumulate per-timestamp rows.
-        # Each chunk's rows share a timeline column; we de-duplicate by
-        # (ros_time) to handle multi-row chunks (rare but possible).
-        img_rows: Dict[int, Dict[str, Any]] = {}
-        bbox_rows: Dict[int, List[Tuple[float, float, float, float, str]]] = {}
-
-        stream = store.stream()
-        n_chunks = 0
-        for ch in stream:
-            n_chunks += 1
-            ep = str(ch.entity_path)
-            if ep != self.image_entity and ep != self.bboxes_entity:
-                continue
-            rb = ch.to_record_batch()
-            schema_names = rb.schema.names
-
-            # Determine which timeline column to use.
-            tl_name = None
-            for nm in schema_names:
-                if nm == self.timeline:
-                    tl_name = nm
-                    break
-            if tl_name is None:
-                continue
-
-            tl_col = rb.column(tl_name)
-            # Convert timestamp[ns] → int64
-            try:
-                tl_int = tl_col.cast(pa.int64())
-            except Exception:
-                # already int64
-                tl_int = tl_col
-
-            if ep == self.image_entity:
-                blob_col = rb.column("EncodedImage:blob")
-                mt_col = (
-                    rb.column("EncodedImage:media_type")
-                    if "EncodedImage:media_type" in schema_names
-                    else None
-                )
-                log_col = (
-                    rb.column("log_time").cast(pa.int64())
-                    if "log_time" in schema_names else None
-                )
-                n = len(tl_int)
-                for i in range(n):
-                    if tl_col[i].is_valid is False if hasattr(tl_col[i], "is_valid") else False:
-                        continue
-                    ts_ns = int(tl_int[i].as_py())
-                    blob_val = blob_col[i].as_py()
-                    # blob is list[list[uint8]] per rerun schema — flatten.
-                    blob = b"".join(bytes(x) for x in blob_val) if blob_val else b""
-                    mt = None
-                    if mt_col is not None:
-                        mt_list = mt_col[i].as_py()
-                        if mt_list:
-                            mt = mt_list[0] if isinstance(mt_list, list) else mt_list
-                    log_ns = int(log_col[i].as_py()) if log_col is not None else ts_ns
-                    # If multiple rows share the same timestamp, prefer the
-                    # first non-empty one (they should be identical anyway).
-                    if ts_ns not in img_rows or not img_rows[ts_ns].get("blob"):
-                        img_rows[ts_ns] = {
-                            "blob": blob,
-                            "media_type": mt,
-                            "log_time_ns": log_ns,
-                        }
-            elif ep == self.bboxes_entity:
-                centers_col = rb.column("Boxes2D:centers")
-                hs_col = rb.column("Boxes2D:half_sizes")
-                labels_col = (
-                    rb.column("Boxes2D:labels")
-                    if "Boxes2D:labels" in schema_names
-                    else None
-                )
-                n = len(tl_int)
-                for i in range(n):
-                    ts_ns = int(tl_int[i].as_py())
-                    centers = centers_col[i].as_py() or []
-                    hsizes = hs_col[i].as_py() or []
-                    labels = labels_col[i].as_py() if labels_col is not None else []
-                    boxes = []
-                    for j in range(min(len(centers), len(hsizes))):
-                        cx, cy = centers[j]
-                        hw, hh = hsizes[j]
-                        lbl = labels[j] if j < len(labels) else ""
-                        boxes.append((float(cx), float(cy),
-                                      float(hw), float(hh), str(lbl)))
-                    bbox_rows.setdefault(ts_ns, []).extend(boxes)
-
-            if self.progress_cb and n_chunks % 50 == 0:
-                self.progress_cb(n_chunks, len(img_rows))
-
-        # Build ordered frame list.
-        ts_sorted = sorted(img_rows.keys())
-        for idx, ts in enumerate(ts_sorted):
-            info = img_rows[ts]
-            self.frames.append({
-                "frame_idx": idx,
-                "timestamp_ns": ts,
-                "log_time_ns": info["log_time_ns"],
-                "image_blob": info["blob"],
-                "media_type": info["media_type"],
-                "existing_boxes": bbox_rows.get(ts, []),
-            })
-
-    # ------------------------- accessors ------------------------------ #
-
-    def __len__(self) -> int:
-        return len(self.frames)
-
-    def frame_at(self, idx: int) -> Dict[str, Any]:
-        return self.frames[idx]
-
-    def decode_image(self, idx: int) -> np.ndarray:
-        blob = self.frames[idx]["image_blob"]
-        if not blob:
-            # Return a small placeholder so the canvas doesn't crash.
-            return np.zeros((4, 4, 3), dtype=np.uint8)
-        with Image.open(io.BytesIO(blob)) as im:
-            return np.array(im.convert("RGB"))
-
-    def find_idx_by_timestamp(self, ts_ns: int) -> int:
-        """Binary search the sorted timeline. Returns -1 if not found."""
-        lo, hi = 0, len(self.frames) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            v = self.frames[mid]["timestamp_ns"]
-            if v == ts_ns:
-                return mid
-            elif v < ts_ns:
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        # Snap to nearest.
-        if lo >= len(self.frames):
-            return len(self.frames) - 1
-        if hi < 0:
-            return 0
-        return lo if abs(self.frames[lo]["timestamp_ns"] - ts_ns) < \
-                    abs(self.frames[hi]["timestamp_ns"] - ts_ns) else hi
-
 
 # ---------------------------------------------------------------------------
-# Image-folder frame index — same interface as RrdFrameIndex, backed by
-# plain image files instead of an .rrd recording (used with --images).
+# Image-folder frame index — the frame source for the whole tool, backed by
+# plain image files (from --images or the File menu).
 # ---------------------------------------------------------------------------
 
 class ImageFolderIndex:
@@ -664,9 +372,9 @@ class ImageFolderIndex:
     by timestamp and the slider/info show the real timestamps. Otherwise
     timestamps are synthetic (1 ms per frame) and the UI shows the image
     index instead.
-    Exposes the same interface as RrdFrameIndex: ``__len__``, ``frame_at``,
-    ``decode_image``, ``find_idx_by_timestamp``, and a ``.frames`` list with
-    timestamp_ns / log_time_ns / frame_idx / existing_boxes / image_blob keys.
+    Interface: ``__len__``, ``frame_at``, ``decode_image``,
+    ``find_idx_by_timestamp``, and a ``.frames`` list with
+    timestamp_ns / log_time_ns / frame_idx / existing_boxes keys.
     """
 
     IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -2100,7 +1808,7 @@ class SidePanel(QWidget):
 
         self.source_label = QLabel("Source: —")
         self.source_label.setToolTip(
-            "Current frame source (image folder / rrd recording).")
+            "Current frame source (image file / folder).")
         layout.addWidget(self.source_label)
 
         self.cat_label = QLabel("Categories (click to preselect for next draw, or press 0-9 when drawing):")
@@ -2522,8 +2230,7 @@ class SidePanel(QWidget):
     def set_hidden_groups(self, groups: List[str]) -> None:
         """Hide the widget groups named in `groups` (see _HIDEABLE) and
         re-show any known group not listed, so a runtime config reload can
-        both hide and un-hide. ``rerun_toggle`` is valid but handled by the
-        main window, not this panel."""
+        both hide and un-hide."""
         want = set(groups)
         for g, attrs in self._HIDEABLE.items():
             for attr in attrs:
@@ -2532,9 +2239,9 @@ class SidePanel(QWidget):
                     continue
                 for widget in (w if isinstance(w, list) else [w]):
                     widget.setVisible(g not in want)
-        for g in sorted(want - set(self._HIDEABLE) - {"rerun_toggle"}):
+        for g in sorted(want - set(self._HIDEABLE)):
             print(f"⚠️ Unknown ui.hide group: {g!r} "
-                  f"(known: {sorted(self._HIDEABLE)}, rerun_toggle)")
+                  f"(known: {sorted(self._HIDEABLE)})")
 
     def set_slider_max(self, n: int) -> None:
         self.frame_slider.setMaximum(max(0, n - 1))
@@ -2555,84 +2262,6 @@ class SidePanel(QWidget):
             f"Boxes on frame: {boxes}"
         )
 
-
-# ---------------------------------------------------------------------------
-# Time-bridge: receive time_update events from the embedded web viewer.
-# ---------------------------------------------------------------------------
-
-# Minimal JS injected into the web viewer page that hooks the rerun
-# notebook widget's `on_viewer_event` and posts JSON back to PyQt via
-# `QWebChannel`.
-_BRIDGE_JS = r"""
-(function(){
-  function tryHook(){
-    if (window.rrWidgetBridge) return;
-    if (!window.qWebChannel) return;
-    new QWebChannel(qt.webChannelTransport, function(channel){
-      window.rrWidgetBridge = channel.objects.bridge;
-      // Hook the viewer's event dispatch.
-      var origSend = null;
-      function patchWidget(){
-        var w = window.rerunWidget;
-        if (!w || !w._on_raw_event) { setTimeout(patchWidget, 100); return; }
-        // Wrap the model.send path so we get a copy of every raw event.
-        if (!w.__patched){
-          w.__patched = true;
-          var origDispatch = w._dispatch_raw_event
-            ? w._dispatch_raw_event.bind(w)
-            : null;
-          if (origDispatch){
-            w._dispatch_raw_event = function(json){
-              try {
-                if (window.rrWidgetBridge){
-                  window.rrWidgetBridge.onViewerEvent(json);
-                }
-              } catch(e){}
-              origDispatch(json);
-            };
-          }
-        }
-      }
-      patchWidget();
-    });
-  }
-  tryHook();
-})();
-"""
-
-class TimeBridge(QObject):
-    """Receives raw viewer events (JSON strings) from the web widget.
-
-    Parses the `time_update` event and re-emits as a Qt signal with the
-    integer nanosecond timestamp. Other event types are ignored here but
-    could be extended (e.g. selection_change).
-    """
-
-    time_changed = pyqtSignal(int)  # timestamp in nanos since epoch
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-    @pyqtSlot(str)
-    def onViewerEvent(self, event_json: str) -> None:
-        try:
-            ev = json.loads(event_json)
-        except Exception:
-            return
-        if not isinstance(ev, dict):
-            return
-        etype = ev.get("type")
-        if etype == "time_update":
-            t = ev.get("time")
-            if t is None:
-                return
-            # `time` is in seconds (float) per rerun notebook widget convention.
-            ns = int(round(float(t) * 1e9))
-            self.time_changed.emit(ns)
-        elif etype == "timeline_change":
-            # We could remember the active timeline here if the user
-            # switches timelines in the viewer. For now we ignore.
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2660,7 +2289,6 @@ class ConfigDialog(QtWidgets.QDialog):
         "sam3_all_frames": "SAM3 all-frames button",
         "masks": "Mask toggle + opacity slider",
         "play": "Play controls",
-        "rerun_toggle": "Rerun viewer toggle",
     }
 
     def __init__(self, win: "ReviewWindow"):
@@ -2773,8 +2401,6 @@ class ConfigDialog(QtWidgets.QDialog):
     # -- prefill / collect ---------------------------------------------------
 
     def _is_group_hidden(self, key: str) -> bool:
-        if key == "rerun_toggle":
-            return self.win.btn_toggle_rerun.isHidden()
         attrs = SidePanel._HIDEABLE.get(key, [])
         if not attrs:
             return False
@@ -2904,29 +2530,22 @@ class ConfigDialog(QtWidgets.QDialog):
 
 class ReviewWindow(QMainWindow):
 
-    def __init__(self, rrd_index: "RrdFrameIndex | ImageFolderIndex",
+    def __init__(self, frame_index: "ImageFolderIndex | EmptyIndex",
                  coco: CocoState,
-                 grpc_uri: str, web_port: int,
                  sam3_model: Optional[str] = None,
                  sam3_device: str = "cuda",
                   sam3_conf: float = 0.25,
                   auto_segment: bool = False,
-                  seed_from_rrd: bool = True,
                   interp_flow_method: str = "dis",
                   interp_camera_model: str = "none",
                   interp_match_frac: float = 0.2,
                   interp_confirm_mismatch: bool = True,
-                  has_viewer: bool = True,
                   ui_hide: Optional[List[str]] = None,
                   mask_opacity: Optional[int] = None,
-                  grpc_port: int = 9876,
                   parent=None):
         super().__init__(parent)
-        self.rrd_index = rrd_index
+        self.frame_index = frame_index
         self.coco = coco
-        self.grpc_uri = grpc_uri
-        self.web_port = web_port
-        self.seed_from_rrd = seed_from_rrd
         self.sam3_model = sam3_model
         self.sam3_device = sam3_device
         self.sam3_conf = sam3_conf
@@ -2939,9 +2558,6 @@ class ReviewWindow(QMainWindow):
         # Whether to show the track-id mismatch confirmation dialog before
         # interpolating.
         self.interp_confirm_mismatch = interp_confirm_mismatch
-        self.grpc_port = grpc_port
-        # Rerun viewer subprocess spawned at runtime (File → Load from rrd).
-        self._rerun_proc = None
 
         self.setWindowTitle("Computer Vision Label Review Tool")
         self.resize(1600, 900)
@@ -2966,8 +2582,8 @@ class ReviewWindow(QMainWindow):
         # Tmp file path for the current frame's image (run_sam3 needs a path).
         self._tmp_image_path: Optional[str] = None
 
-        # Persisted UI state (collapsed Rerun panel etc.).
-        self._ui_state_path = Path.home() / ".config" / "rerun_label_review" / "state.json"
+        # Persisted UI state (window geometry, sidebar width, etc.).
+        self._ui_state_path = Path.home() / ".config" / "cv_label_review" / "state.json"
 
         # Frame playback timer.
         self._play_timer = QTimer(self)
@@ -2990,63 +2606,12 @@ class ReviewWindow(QMainWindow):
         splitter.addWidget(self.side)
         splitter.setSizes([1200, 360])
 
-        # Right column: web viewer (in a collapsible container) below the canvas
-        right_split = QSplitter(_QT_VERT)
-        right_split.addWidget(splitter)
-
-        # Rerun viewer wrapped in a container with a toggle button.
-        self.rerun_container = QWidget()
-        rerun_layout = QVBoxLayout(self.rerun_container)
-        self._rerun_layout = rerun_layout  # kept for runtime rrd loading
-        rerun_layout.setContentsMargins(0, 0, 0, 0)
-        rerun_layout.setSpacing(0)
-        # Toggle toolbar.
-        self.rerun_toolbar = QWidget()
-        tb_layout = QHBoxLayout(self.rerun_toolbar)
-        tb_layout.setContentsMargins(6, 2, 6, 2)
-        self.btn_toggle_rerun = QPushButton("Hide Rerun ▾")
-        self.btn_toggle_rerun.setCheckable(True)
-        self.btn_toggle_rerun.clicked.connect(self._on_toggle_rerun)
-        tb_layout.addWidget(self.btn_toggle_rerun)
-        tb_layout.addStretch(1)
-        rerun_layout.addWidget(self.rerun_toolbar)
-
-        self.web_view: Optional[QWebEngineView] = None
-        self.bridge: Optional[TimeBridge] = None
-        self.channel: Optional[QWebChannel] = None
-        if _HAS_WEBENGINE and has_viewer:
-            self.web_view = QWebEngineView()
-            rerun_layout.addWidget(self.web_view, 1)
-            right_split.addWidget(self.rerun_container)
-            right_split.setSizes([700, 600])
-            self._setup_web_bridge()
-        else:
-            if has_viewer:
-                placeholder_text = (
-                    "PyQt6-WebEngine not installed.\n"
-                    "Install with: pip install PyQt6-WebEngine\n"
-                    "Run `rerun` separately and scrub its timeline."
-                )
-            else:
-                placeholder_text = (
-                    "No Rerun viewer (idle / image mode).\n"
-                    "File → Open image file(s) / Open folder /\n"
-                    "Load from rrd to pick a source."
-                )
-            placeholder = QLabel(placeholder_text)
-            placeholder.setAlignment(Qt.AlignCenter)
-            rerun_layout.addWidget(placeholder, 1)
-            right_split.addWidget(self.rerun_container)
-            self.btn_toggle_rerun.setEnabled(False)
-
-        self.setCentralWidget(right_split)
+        self.setCentralWidget(splitter)
         self._build_menu()
 
         # Config-driven UI tweaks: hide button groups, preset mask opacity.
         if ui_hide:
             self.side.set_hidden_groups(ui_hide)
-            if "rerun_toggle" in ui_hide:
-                self.btn_toggle_rerun.hide()
         if mask_opacity is not None:
             pct = max(0, min(100, int(mask_opacity)))
             self.side.opacity_slider.setValue(pct)
@@ -3108,11 +2673,8 @@ class ReviewWindow(QMainWindow):
         self.side.rename_cat_clicked.connect(self._on_rename_category)
         self.side.del_cat_clicked.connect(self._on_delete_category)
 
-        if self.bridge is not None:
-            self.bridge.time_changed.connect(self._on_viewer_time_changed)
-
         # Frame slider config
-        self.side.set_slider_max(len(self.rrd_index))
+        self.side.set_slider_max(len(self.frame_index))
 
         # Shortcuts that work even when canvas doesn't have focus.
         # These mirror the canvas keyPressEvent so the user doesn't need
@@ -3171,8 +2733,8 @@ class ReviewWindow(QMainWindow):
 
     def _update_source_label(self) -> None:
         """Show the current frame source in the side panel: the image
-        folder for file sources, the .rrd path for recordings."""
-        idx = self.rrd_index
+        folder for file sources."""
+        idx = self.frame_index
         files = getattr(idx, "files", None)
         if files:
             dirs = sorted({os.path.dirname(os.path.abspath(f))
@@ -3180,52 +2742,8 @@ class ReviewWindow(QMainWindow):
             path = (dirs[0] if len(dirs) == 1
                     else f"{len(files)} files from {len(dirs)} folders")
         else:
-            path = getattr(idx, "rrd_path", "") or ""
+            path = ""
         self.side.set_source(path)
-
-    # ----------------------- web bridge setup -------------------------- #
-
-    def _setup_web_bridge(self) -> None:
-        if self.web_view is None:
-            return
-        self.bridge = TimeBridge(self)
-        self.channel = QWebChannel()
-        self.channel.registerObject("bridge", self.bridge)
-        self.web_view.page().setWebChannel(self.channel)
-
-        # Point the embedded web view at the locally-hosted rerun web
-        # viewer (started by `rerun --serve-web --web-viewer-port <port>`).
-        url = f"http://127.0.0.1:{self.web_port}/"
-        self.web_view.setUrl(QUrl(url))
-        # Inject the bridge JS once the page finishes loading.
-        self.web_view.loadFinished.connect(self._inject_bridge_js)
-
-    def _inject_bridge_js(self, ok: bool) -> None:
-        if not ok or self.web_view is None:
-            return
-        # Allow a few retries — the wasm viewer takes a moment to expose
-        # `window.rerunWidget`.
-        js = _BRIDGE_JS + "\n;(function(){tryHook();})();"
-        for attempt in range(8):
-            QTimer.singleShot(500 * (attempt + 1),
-                              lambda: self.web_view and
-                              self.web_view.page().runJavaScript(js))
-        # After the widget is hooked, pause its timeline so it doesn't
-        # autoplay through every frame on load (which would flood the
-        # canvas with time_update events). We retry a few times because
-        # `rerunWidget` is exposed asynchronously by the wasm viewer.
-        pause_js = (
-            "(function pause(){"
-            "  var w = window.rerunWidget;"
-            "  if (w && w.set_time_ctrl){"
-            "    try { w.set_time_ctrl(null, null, false); } catch(e){}"
-            "  } else { setTimeout(pause, 250); }"
-            "})();"
-        )
-        for attempt in range(20):
-            QTimer.singleShot(750 + 250 * attempt,
-                              lambda: self.web_view and
-                              self.web_view.page().runJavaScript(pause_js))
 
     # ----------------------- status bar + save indicator ----------------- #
 
@@ -3240,45 +2758,16 @@ class ReviewWindow(QMainWindow):
             self._save_indicator.setText("✓ Saved")
             self._save_indicator.setStyleSheet("padding: 0 6px; color: #40c060;")
         self._reviewed_label.setText(
-            f"Reviewed: {len(self.coco.reviewed)}/{len(self.rrd_index)}"
+            f"Reviewed: {len(self.coco.reviewed)}/{len(self.frame_index)}"
         )
 
-    def _on_toggle_rerun(self) -> None:
-        """Collapse or expand the embedded Rerun web viewer."""
-        collapsed = self.btn_toggle_rerun.isChecked()
-        # Hide/show the web view itself; keep the toggle button visible.
-        if self.web_view is not None:
-            self.web_view.setVisible(not collapsed)
-        # Hide/show any non-button widgets in the rerun container layout
-        # (placeholder etc.). The toolbar (with the button) stays.
-        for i in range(self.rerun_container.layout().count()):
-            w = self.rerun_container.layout().itemAt(i).widget()
-            if w is self.rerun_toolbar:
-                continue
-            if w is not None:
-                w.setVisible(not collapsed)
-        self.btn_toggle_rerun.setText("Show Rerun ▸" if collapsed else "Hide Rerun ▾")
-        # Save preference.
-        self._write_ui_state(web_collapsed=collapsed)
-        # Force the splitter to give the freed space to the canvas.
-        rs = self.centralWidget()
-        if isinstance(rs, QSplitter):
-            sizes = rs.sizes()
-            if collapsed:
-                rs.setSizes([sizes[0] + sizes[1], 0])
-            else:
-                rs.setSizes([700, 600])
-
     def _load_ui_state(self) -> None:
-        """Apply persisted UI state (web collapsed etc.)."""
+        """Apply persisted UI state (mask opacity)."""
         try:
             if not self._ui_state_path.exists():
                 return
             with open(self._ui_state_path, "r") as f:
                 state = json.load(f)
-            if state.get("web_collapsed") and self.btn_toggle_rerun.isEnabled():
-                self.btn_toggle_rerun.setChecked(True)
-                self._on_toggle_rerun()
             opacity = state.get("mask_opacity")
             if isinstance(opacity, int) and 0 <= opacity <= 100:
                 self.canvas.set_mask_alpha(round(opacity * 255 / 100))
@@ -3316,11 +2805,6 @@ class ReviewWindow(QMainWindow):
         act_dir.setShortcut("Ctrl+Shift+O")
         act_dir.triggered.connect(self._open_image_folder)
         m.addAction(act_dir)
-        act_rrd = QAction("Load from rrd…", self)
-        act_rrd.setShortcut("Ctrl+R")
-        act_rrd.setToolTip("Open a Rerun .rrd recording and embed its viewer.")
-        act_rrd.triggered.connect(self._load_rrd_dialog)
-        m.addAction(act_rrd)
         m.addSeparator()
         act_save = QAction("Save", self)
         act_save.setShortcut("Ctrl+S")
@@ -3362,7 +2846,7 @@ class ReviewWindow(QMainWindow):
             pass
         self._stop_playback()
         self.side.set_playing(False)
-        self.rrd_index = new_index
+        self.frame_index = new_index
         # Settings survive the source switch.
         sticky = self.coco.sticky_track_ids
         min_poly = self.coco.min_polygon_area
@@ -3376,16 +2860,16 @@ class ReviewWindow(QMainWindow):
         # file — refresh the visible list (it still shows the previous
         # session's categories, e.g. empty after an idle start).
         self.side._rebuild_cat_list()
-        self._current_idx = self.coco.load_progress(len(self.rrd_index))
+        self._current_idx = self.coco.load_progress(len(self.frame_index))
         self._current_image_id = None
         self._last_cat_id = None
         self._pending_cat_id = None
         self.canvas.reset_state()
-        self.side.set_slider_max(len(self.rrd_index))
+        self.side.set_slider_max(len(self.frame_index))
         self.setWindowTitle(f"Computer Vision Label Review Tool — {label}")
         self._load_current()
         self.statusBar().showMessage(
-            f"Loaded {len(self.rrd_index)} frame(s) — saving to {out_json}",
+            f"Loaded {len(self.frame_index)} frame(s) — saving to {out_json}",
             5000)
 
     def _load_config_dialog(self) -> None:
@@ -3427,7 +2911,6 @@ class ReviewWindow(QMainWindow):
         if "hide" in ui_cfg:
             groups = ui_cfg["hide"] or []
             self.side.set_hidden_groups(groups)
-            self.btn_toggle_rerun.setVisible("rerun_toggle" not in groups)
         if "mask_opacity" in ui_cfg:
             pct = max(0, min(100, int(ui_cfg["mask_opacity"])))
             # Signals are connected by now, so this also updates the canvas.
@@ -3436,70 +2919,6 @@ class ReviewWindow(QMainWindow):
         if "sticky_ids" in tracking_cfg:
             self.coco.sticky_track_ids = bool(tracking_cfg["sticky_ids"])
 
-    def _load_rrd_dialog(self) -> None:
-        """File → Load from rrd: index a recording, spawn its web viewer,
-        and switch the session to it."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load RRD recording", "", "Rerun recordings (*.rrd)")
-        if not path:
-            return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self.statusBar().showMessage(
-            f"Indexing {path} — can take a minute for big recordings…")
-        QApplication.processEvents()
-        try:
-            new_index = RrdFrameIndex(
-                path,
-                progress_cb=lambda n_chunks, n_imgs: print(
-                    f"  scanned {n_chunks} chunks, {n_imgs} unique image "
-                    "timestamps", end="\r"),
-            )
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "Load rrd", str(e))
-            return
-        QApplication.restoreOverrideCursor()
-        if len(new_index) == 0:
-            QMessageBox.warning(self, "Load rrd", "No image frames found.")
-            return
-        # Replace any previously spawned viewer and start a new one.
-        if self._rerun_proc is not None:
-            try:
-                self._rerun_proc.terminate()
-            except Exception:
-                pass
-        self._rerun_proc = _spawn_rerun_web_viewer(
-            path, self.web_port, self.grpc_port)
-        QApplication.instance().aboutToQuit.connect(
-            lambda: self._rerun_proc is not None
-            and self._rerun_proc.poll() is None
-            and self._rerun_proc.terminate())
-        # Create the embedded web view now if we started without one.
-        if _HAS_WEBENGINE and self.web_view is None:
-            while self._rerun_layout.count() > 1:
-                item = self._rerun_layout.takeAt(1)
-                if item.widget() is not None:
-                    item.widget().deleteLater()
-            self.web_view = QWebEngineView()
-            self._rerun_layout.addWidget(self.web_view, 1)
-            self._setup_web_bridge()
-            if self.bridge is not None:
-                self.bridge.time_changed.connect(
-                    self._on_viewer_time_changed)
-        self.btn_toggle_rerun.setEnabled(True)
-        # If no categories yet (fresh empty start), seed them from the
-        # recording's labels.
-        cats = self.coco.categories
-        if not cats:
-            seeded = _seed_categories(new_index, None)
-            if seeded != cats:
-                self.coco.categories = seeded
-                self.coco.cat_map = {c["id"]: c["name"] for c in seeded}
-                self.coco.cat_name_to_id = {c["name"]: c["id"]
-                                            for c in seeded}
-                self.side._rebuild_cat_list()
-        out_json = os.path.splitext(path)[0] + "_labels.json"
-        self._switch_source(new_index, out_json, os.path.dirname(path))
 
     def _open_image_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -3551,10 +2970,6 @@ class ReviewWindow(QMainWindow):
             return
         self._playing = True
         self._play_timer.start(self._play_interval_ms)
-        # Pause the embedded Rerun viewer so its timeline doesn't fight
-        # with our playback timer (both would emit time_update events
-        # and double-advance the canvas).
-        self._pause_rerun_viewer()
         self.statusBar().showMessage(
             f"Playing at {self._play_interval_ms} ms/frame", 2000
         )
@@ -3568,48 +2983,24 @@ class ReviewWindow(QMainWindow):
 
     def _on_play_tick(self) -> None:
         """Advance one frame per timer tick; stop at the end."""
-        if self._current_idx + 1 >= len(self.rrd_index):
+        if self._current_idx + 1 >= len(self.frame_index):
             self._stop_playback()
             self.side.set_playing(False)
             self.statusBar().showMessage("Reached last frame", 3000)
             return
         self._on_frame_nav(+1)
 
-    def _pause_rerun_viewer(self) -> None:
-        """Send a JS command to pause the embedded Rerun viewer."""
-        if self.web_view is None:
-            return
-        js = (
-            "(function(){"
-            "  var w = window.rerunWidget;"
-            "  if (w && w.set_time_ctrl){"
-            "    try { w.set_time_ctrl(null, null, false); } catch(e){}"
-            "  }"
-            "})();"
-        )
-        try:
-            self.web_view.page().runJavaScript(js)
-        except Exception:
-            pass
-
     # ----------------------- frame loading ----------------------------- #
 
     def _load_current(self) -> None:
         idx = self._current_idx
-        if idx < 0 or idx >= len(self.rrd_index):
+        if idx < 0 or idx >= len(self.frame_index):
             return
-        frame = self.rrd_index.frame_at(idx)
-        arr = self.rrd_index.decode_image(idx)
+        frame = self.frame_index.frame_at(idx)
+        arr = self.frame_index.decode_image(idx)
         h, w = arr.shape[:2]
         image_id = self.coco.ensure_image(frame, w, h)
         self._current_image_id = image_id
-
-        # Seed existing boxes from the .rrd on first visit (unless --no-seed).
-        existing = frame.get("existing_boxes", [])
-        already = self.coco.anns_for_image(image_id)
-        if self.seed_from_rrd and not already and existing:
-            for (cx, cy, hw, hh, label) in existing:
-                self.coco.seed_box(image_id, cx, cy, hw, hh, label)
 
         # Build box list for canvas + side panel.
         boxes = []
@@ -3628,18 +3019,18 @@ class ReviewWindow(QMainWindow):
         self.canvas.set_boxes(boxes)
         self.side.set_boxes(boxes)
         self.side.highlight_box_row(-1)
-        ts_real = getattr(self.rrd_index, "timestamps_real", True)
+        ts_real = getattr(self.frame_index, "timestamps_real", True)
         pos = (f"ts={frame['timestamp_ns']}" if ts_real else f"index={idx}")
         self.canvas.set_info(
-            f"Frame {idx + 1}/{len(self.rrd_index)}  |  {pos}"
+            f"Frame {idx + 1}/{len(self.frame_index)}  |  {pos}"
         )
         self.side.set_slider(idx)
-        self.side.set_info(idx, len(self.rrd_index),
+        self.side.set_info(idx, len(self.frame_index),
                            frame["timestamp_ns"], len(boxes),
                            ts_real=ts_real)
         # Update current index for save paths. We do NOT autosave on every
-        # frame navigation (it would write the JSON every tick when the
-        # embedded Rerun viewer autoplays the timeline). Progress is saved:
+        # frame navigation (it would write the JSON every tick during
+        # playback). Progress is saved:
         #   - on explicit N/B/X keystrokes (see _on_frame_nav / _on_discard_all)
         #   - on quit (closeEvent, _on_save_quit, _on_quit)
         self.coco.current_idx = idx
@@ -3653,33 +3044,17 @@ class ReviewWindow(QMainWindow):
         if delta > 0:
             self.coco.mark_reviewed(self._current_idx)
         new_idx = self._current_idx + delta
-        if 0 <= new_idx < len(self.rrd_index):
+        if 0 <= new_idx < len(self.frame_index):
             self._current_idx = new_idx
             self._load_current()
             # Save progress (tmp) on explicit nav — not on autoplay ticks.
             self.coco.save(is_final=False)
 
     def _on_slider_moved(self, idx: int) -> None:
-        if 0 <= idx < len(self.rrd_index) and idx != self._current_idx:
+        if 0 <= idx < len(self.frame_index) and idx != self._current_idx:
             self._current_idx = idx
             self._load_current()
             self.coco.save(is_final=False)
-
-    def _on_viewer_time_changed(self, ts_ns: int) -> None:
-        # Only an RrdFrameIndex is backed by the embedded viewer. After
-        # switching to images (or in idle mode) the viewer still shows the
-        # old recording, whose timestamps are meaningless for the new index.
-        if not isinstance(self.rrd_index, RrdFrameIndex):
-            return
-        # If the user manually scrubs the Rerun viewer while our play timer
-        # is running, stop our playback so the two timelines don't fight.
-        if self._playing:
-            self._stop_playback()
-            self.side.set_playing(False)
-        idx = self.rrd_index.find_idx_by_timestamp(ts_ns)
-        if idx != self._current_idx and 0 <= idx < len(self.rrd_index):
-            self._current_idx = idx
-            self._load_current()
 
     def _on_box_deleted(self, ann_id: int) -> None:
         self.coco.remove_box(ann_id)
@@ -3833,14 +3208,14 @@ class ReviewWindow(QMainWindow):
         known = self.coco._img_id_by_idx.get(frame_idx)
         if known is not None:
             return known
-        frame = self.rrd_index.frame_at(frame_idx)
+        frame = self.frame_index.frame_at(frame_idx)
         w = h = 0
         for img in self.coco.images:
             if img.get("width") and img.get("height"):
                 w, h = img["width"], img["height"]
                 break
         if not w or not h:
-            arr = self.rrd_index.decode_image(frame_idx)
+            arr = self.frame_index.decode_image(frame_idx)
             h, w = arr.shape[:2]
         return self.coco.ensure_image(frame, w, h)
 
@@ -3857,7 +3232,7 @@ class ReviewWindow(QMainWindow):
             self.statusBar().showMessage("Interpolation already running", 2500)
             return
         cur = self._current_idx
-        total = len(self.rrd_index)
+        total = len(self.frame_index)
         if cur < 0 or cur >= total:
             return
         anchors = self.coco.anchor_candidates()
@@ -3939,7 +3314,7 @@ class ReviewWindow(QMainWindow):
             f"Interpolating {len(jobs)} pair(s), frames {a + 1}–{b + 1}…")
         self.canvas.setEnabled(False)
         self._interp_worker = InterpBatchWorker(
-            self.rrd_index, jobs, tmp_base,
+            self.frame_index, jobs, tmp_base,
             flow_method=self.interp_flow_method,
             camera_model=self.interp_camera_model,
             parent=self)
@@ -4094,7 +3469,7 @@ class ReviewWindow(QMainWindow):
         idx = self._current_idx
 
         def _jump_back(i: int = idx) -> None:
-            if 0 <= i < len(self.rrd_index) and i != self._current_idx:
+            if 0 <= i < len(self.frame_index) and i != self._current_idx:
                 self._current_idx = i
                 self._load_current()
 
@@ -4136,7 +3511,7 @@ class ReviewWindow(QMainWindow):
         counts as unlabeled when it has no live annotations AND is not in
         the reviewed set (so discarded frames are skipped too).
         """
-        total = len(self.rrd_index)
+        total = len(self.frame_index)
         for step in range(1, total + 1):
             idx = (self._current_idx + step) % total
             if idx in self.coco.reviewed:
@@ -4251,8 +3626,8 @@ class ReviewWindow(QMainWindow):
         self.canvas.set_boxes(boxes)
         self.side.set_boxes(boxes)
         self.side.highlight_box_row(self.canvas._selected_idx)
-        self.side.set_info(self._current_idx, len(self.rrd_index),
-                           self.rrd_index.frame_at(self._current_idx)["timestamp_ns"],
+        self.side.set_info(self._current_idx, len(self.frame_index),
+                           self.frame_index.frame_at(self._current_idx)["timestamp_ns"],
                            len(boxes))
         self._update_progress()
 
@@ -4442,7 +3817,7 @@ class ReviewWindow(QMainWindow):
         """Refresh the annotation-coverage progress bar in the side panel."""
         annotated = len({a["image_id"] for a in self.coco.annotations
                          if a["id"] not in self.coco.removed_ids})
-        self.side.set_annotated_progress(annotated, len(self.rrd_index))
+        self.side.set_annotated_progress(annotated, len(self.frame_index))
 
     # ----------------------- SAM3 segmentation ------------------------- #
 
@@ -4474,12 +3849,11 @@ class ReviewWindow(QMainWindow):
     def _write_tmp_image(self) -> Optional[str]:
         """Write the current frame's image to a tmp file (for run_sam3).
 
-        File-backed sources (image-folder mode) are used directly — no
-        copy. rrd frames write their blob. Falls back to decode_image →
-        PNG when a frame has neither blob nor file."""
-        if self._current_idx < 0 or self._current_idx >= len(self.rrd_index):
+        File-backed sources are used directly — no copy. Falls back to
+        decode_image → PNG when a frame has no backing file."""
+        if self._current_idx < 0 or self._current_idx >= len(self.frame_index):
             return None
-        frame = self.rrd_index.frame_at(self._current_idx)
+        frame = self.frame_index.frame_at(self._current_idx)
         fp = frame.get("file_path")
         if fp and os.path.exists(fp):
             return fp
@@ -4489,7 +3863,7 @@ class ReviewWindow(QMainWindow):
         if not blob:
             # Last resort: decode in memory and write a PNG.
             try:
-                arr = self.rrd_index.decode_image(self._current_idx)
+                arr = self.frame_index.decode_image(self._current_idx)
             except Exception as e:
                 print(f"⚠️ Failed to decode frame for SAM3: {e}")
                 return None
@@ -4564,7 +3938,7 @@ class ReviewWindow(QMainWindow):
             return
         jobs = []
         total_boxes = 0
-        for idx in range(len(self.rrd_index)):
+        for idx in range(len(self.frame_index)):
             img_id = self.coco._img_id_by_idx.get(idx)
             if img_id is None:
                 continue  # never visited → no annotations possible
@@ -4603,7 +3977,7 @@ class ReviewWindow(QMainWindow):
         # Canvas stays enabled: masks apply by ann_id, so the user can
         # keep navigating/drawing on other frames while SAM3 runs.
         self._sam3_batch_worker = SAM3BatchWorker(
-            self.rrd_index, jobs, tmp_dir,
+            self.frame_index, jobs, tmp_dir,
             model_path=self.sam3_model,
             device=self.sam3_device,
             conf=self.sam3_conf,
@@ -4828,95 +4202,24 @@ class ReviewWindow(QMainWindow):
                 w.wait(1000)
 
 
-# ---------------------------------------------------------------------------
-# Web viewer host: spawn `rerun --serve-web --web-viewer-port <port>` so the
-# embedded QWebEngineView has something to point at. We don't use
-# `rr.serve_web_viewer()` from the SDK here because that needs an active
-# RecordingStream; we want to point at the *existing* .rrd file.
-# ---------------------------------------------------------------------------
-
-def _spawn_rerun_web_viewer(rrd_path: str, web_port: int,
-                            grpc_port: int) -> "subprocess.Popen":
-    import subprocess
-    cmd = [
-        "rerun",
-        "--port", str(grpc_port),
-        "--web-viewer-port", str(web_port),
-        "--web-viewer",
-        "--serve-web",
-        "--bind", "127.0.0.1",
-        str(rrd_path),
-    ]
-    print(f"Starting rerun web viewer: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-    # Wait briefly for the HTTP server to come up.
-    import urllib.request
-    url = f"http://127.0.0.1:{web_port}/"
-    for _ in range(40):
-        try:
-            urllib.request.urlopen(url, timeout=0.5)
-            print(f"Rerun web viewer ready at {url}")
-            return proc
-        except Exception:
-            time.sleep(0.25)
-    print(f"⚠️ Rerun web viewer not responding at {url} after 10s — "
-          f"the embedded view may stay blank. You can still label via "
-          f"the slider/canvas.")
-    return proc
-
 
 # ---------------------------------------------------------------------------
 # Category bootstrapping
 # ---------------------------------------------------------------------------
 
-def _seed_categories(rrd_index: RrdFrameIndex,
-                     seed_json: Optional[str]) -> List[Dict[str, Any]]:
-    """Build the category list. Priority:
+def _seed_categories(seed_json: Optional[str]) -> List[Dict[str, Any]]:
+    """Build the initial category list.
 
-    1. If --json is given, use its categories (and merge any labels found
-       in the .rrd as new categories).
-    2. Otherwise start empty — categories are created as needed: from the
-       side panel's Add field, from a resumed labels file, or on the fly
-       from .rrd box labels (see CocoState._resolve_cat_id).
-
-    For .rrd sources the recording's Boxes2D:labels are still merged in so
-    seeded boxes get proper category names instead of bare ids.
+    If --json is given, use its categories. Otherwise start empty —
+    categories are created from the side panel's Add field, and a resumed
+    labels file brings its own (merged by load_existing).
     """
     cats: List[Dict[str, Any]] = []
-    seen: Dict[str, int] = {}
-
     if seed_json and os.path.exists(seed_json):
         with open(seed_json, "r", encoding="utf-8") as f:
             data = json.load(f)
         for c in data.get("categories", []):
             cats.append({"id": c["id"], "name": c["name"]})
-            seen[c["name"]] = c["id"]
-
-    # Scan labels in the .rrd.
-    label_set: set = set()
-    for frame in rrd_index.frames:
-        for (_, _, _, _, lbl) in frame["existing_boxes"]:
-            if lbl:
-                label_set.add(lbl)
-    # Decide whether labels are category names or instance ids.
-    name_labels = [l for l in label_set if not l.isdigit()]
-    if name_labels and not cats:
-        for i, n in enumerate(sorted(name_labels)):
-            cats.append({"id": i, "name": n})
-            seen[n] = i
-    elif name_labels:
-        # Merge new names into the seed categories.
-        next_id = max((c["id"] for c in cats), default=-1) + 1
-        for n in sorted(name_labels):
-            if n not in seen:
-                cats.append({"id": next_id, "name": n})
-                seen[n] = next_id
-                next_id += 1
-
-    # No seed file and no .rrd labels → start with an empty category list;
-    # the user adds categories from the side panel (or a resumed labels
-    # file brings its own).
     return cats
 
 
@@ -4926,31 +4229,24 @@ def _seed_categories(rrd_index: RrdFrameIndex,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Interactive 2D bbox reviewer for a .rrd recording "
-                    "or a folder of images.",
+        description="Interactive 2D bbox reviewer for image files/folders.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--rrd", help="Path to the .rrd recording "
-                        "(mutually exclusive with --images).")
     parser.add_argument("--images", nargs="+", metavar="PATH",
-                        help="Image files and/or folders to review instead of "
-                             "an .rrd (folders are scanned for "
-                             "jpg/jpeg/png/bmp/webp/tif, sorted by name).")
+                        help="Image files and/or folders to review (folders "
+                             "are scanned for jpg/jpeg/png/bmp/webp/tif, "
+                             "sorted by name). Omit to start idle and pick "
+                             "a source from the File menu.")
     parser.add_argument("--output_json",
                         help="Output COCO JSON path (progress file is "
                              "auto-saved). Default: <source>/labels_coco.json "
-                             "for --images, <rrd>_labels.json for --rrd, "
-                             "./untitled_labels_coco.json in idle mode.")
+                             "for --images, ./untitled_labels_coco.json in "
+                             "idle mode.")
     parser.add_argument("--json", help="Seed COCO JSON for categories / existing labels.")
     parser.add_argument("--db", help="Deprecated/unused: categories are no longer read "
                         "from a SQLite DB. Kept so old commands still parse.")
-    parser.add_argument("--image-entity", help="Override the image entity path (auto-detect by default).")
-    parser.add_argument("--bboxes-entity", help="Override the Boxes2D entity path (auto-detect).")
-    parser.add_argument("--timeline", help="Timeline to use (auto-detect; prefers ros_time).")
     parser.add_argument("--output-yolo-dir", help="Also export YOLO dataset on exit.")
     parser.add_argument("--data-yaml", help="Reference data.yaml for YOLO class order.")
-    parser.add_argument("--grpc-port", type=int, default=9876)
-    parser.add_argument("--web-port", type=int, default=9090)
     # SAM3 options
     parser.add_argument("--sam3-model", default=None,
                         help="Path to SAM3 weights (default: "
@@ -4961,9 +4257,6 @@ def main():
                         help="SAM3 confidence threshold (default: 0.25).")
     parser.add_argument("--auto-segment", action="store_true",
                         help="Automatically run SAM3 after each new bbox is drawn.")
-    parser.add_argument("--no-seed", action="store_true",
-                        help="Do not seed boxes from the .rrd's existing "
-                             "Boxes2D track (start with a blank canvas).")
     # Interpolation options (I key / Interpolate button)
     parser.add_argument("--interp-flow-method",
                         choices=["dis", "klt", "farneback"], default="dis",
@@ -4982,10 +4275,8 @@ def main():
                              "label_review.example.json.")
     args = parser.parse_args()
 
-    if args.rrd and args.images:
-        parser.error("--rrd and --images are mutually exclusive")
-    # Neither source given → start idle; the user picks a source from the
-    # File menu (Open image file(s) / Open folder / Load from rrd).
+    # No source given → start idle; the user picks a source from the
+    # File menu (Open image file(s) / Open folder).
 
     # Optional JSON config; its values override the corresponding CLI flags.
     cfg: Dict[str, Any] = {}
@@ -5019,52 +4310,30 @@ def main():
         sam3_device = args.sam3_device
 
     # ---------- 1. Index the frame source ----------
-    rrd_path = None
     if args.images:
         print(f"🖼️  Loading images from: {args.images}")
-        rrd_index = ImageFolderIndex(args.images)
-        print(f"✅ Indexed {len(rrd_index)} images")
-        if rrd_index.timestamps_real:
+        frame_index = ImageFolderIndex(args.images)
+        print(f"✅ Indexed {len(frame_index)} images")
+        if frame_index.timestamps_real:
             print("🕒 Filenames look like timestamps — "
                   "slider/info will show them.")
         if not args.output_json:
             base = (args.images[0] if os.path.isdir(args.images[0])
                     else os.path.dirname(os.path.abspath(args.images[0])))
             args.output_json = os.path.join(base, "labels_coco.json")
-    elif args.rrd:
-        rrd_path = os.path.abspath(args.rrd)
-        if not os.path.exists(rrd_path):
-            print(f"❌ .rrd not found: {rrd_path}")
-            sys.exit(1)
-        print(f"🔍 Scanning {rrd_path} (this can take a minute for big recordings)…")
-        rrd_index = RrdFrameIndex(
-            rrd_path,
-            image_entity=args.image_entity,
-            bboxes_entity=args.bboxes_entity,
-            timeline=args.timeline,
-            progress_cb=lambda n_chunks, n_imgs: print(
-                f"  scanned {n_chunks} chunks, {n_imgs} unique image timestamps",
-                end="\r"),
-        )
-        print(f"\n✅ Indexed {len(rrd_index)} frames "
-              f"(image entity: {rrd_index.image_entity}, "
-              f"bboxes entity: {rrd_index.bboxes_entity}, "
-              f"timeline: {rrd_index.timeline})")
-        if not args.output_json:
-            args.output_json = os.path.splitext(rrd_path)[0] + "_labels.json"
     else:
         # Idle start — no source; pick one from the File menu.
-        rrd_index = EmptyIndex()
+        frame_index = EmptyIndex()
         if not args.output_json:
             args.output_json = os.path.abspath("untitled_labels_coco.json")
         print("💤 No source given — idle mode. Use File → Open image "
-              "file(s) / Open folder / Load from rrd to begin.")
-    if len(rrd_index) == 0 and (args.rrd or args.images):
+              "file(s) / Open folder to begin.")
+    if len(frame_index) == 0 and args.images:
         print("❌ No image frames found.")
         sys.exit(1)
 
     # ---------- 2. Categories / COCO state ----------
-    categories = _seed_categories(rrd_index, args.json)
+    categories = _seed_categories(args.json)
     print(f"🏷️  Categories: {[c['name'] for c in categories]}")
     coco = CocoState(args.output_json, categories)
     # Default: fresh auto-increment track ids; sticky inheritance is opt-in.
@@ -5072,38 +4341,20 @@ def main():
     coco.min_polygon_area = max(
         0.0, float(sam3_cfg.get("min_polygon_area", 100)))
     coco.load_existing()
-    coco.current_idx = coco.load_progress(len(rrd_index))
+    coco.current_idx = coco.load_progress(len(frame_index))
 
-    # ---------- 3. Spawn the Rerun web viewer (rrd mode only) ----------
-    proc = None
-    if args.rrd:
-        proc = _spawn_rerun_web_viewer(rrd_path, args.web_port, args.grpc_port)
-
-    # ---------- 4. Qt app ----------
+    # ---------- 3. Qt app ----------
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Computer Vision Label Review Tool")
 
-    # Clean up the spawned rerun process on exit.
-    def _shutdown():
-        try:
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-        except Exception:
-            pass
-    app.aboutToQuit.connect(_shutdown)
     signal.signal(signal.SIGINT, lambda *a: app.quit())
 
-    win = ReviewWindow(rrd_index, coco,
-                       grpc_uri=(f"rerun+http://127.0.0.1:{args.grpc_port}/proxy"
-                                 if args.rrd else ""),
-                       web_port=args.web_port,
+    win = ReviewWindow(frame_index, coco,
                        sam3_model=args.sam3_model,
                        sam3_device=sam3_device,
                        sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),
                        auto_segment=bool(sam3_cfg.get("auto_segment",
                                                       args.auto_segment)),
-                        seed_from_rrd=not args.no_seed and bool(args.rrd),
-                        has_viewer=bool(args.rrd),
                         interp_flow_method=flow_method,
                         interp_camera_model=camera_model,
                         interp_match_frac=float(interp_cfg.get(
@@ -5116,12 +4367,11 @@ def main():
                         # the Config dialog can toggle them at runtime.
                         ui_hide=ui_cfg.get("hide",
                                            ["interpolate", "keyframe"]),
-                        mask_opacity=ui_cfg.get("mask_opacity"),
-                        grpc_port=args.grpc_port)
+                        mask_opacity=ui_cfg.get("mask_opacity"))
     win.show()
     exit_code = app.exec()
 
-    # ---------- 5. Optional YOLO export ----------
+    # ---------- 4. Optional YOLO export ----------
     if args.output_yolo_dir:
         print(f"\nExporting YOLO dataset to {args.output_yolo_dir}")
         # Reuse helpers from 08_click_review_coco.py if importable.
@@ -5141,17 +4391,12 @@ def main():
                     ],
                     "categories": coco.categories,
                 }
-                # Write images to a temp dir: from the .rrd blobs, or copy
-                # the source files directly in --images mode.
+                # Write images to a temp dir: copy the source files directly.
                 tmp_img_dir = Path(args.output_yolo_dir) / "_src_images"
                 tmp_img_dir.mkdir(parents=True, exist_ok=True)
                 for img in coco.images:
-                    frame = rrd_index.frame_at(img["frame_idx"])
-                    blob = frame["image_blob"]
-                    if blob:
-                        with open(tmp_img_dir / img["file_name"], "wb") as f:
-                            f.write(blob)
-                    elif frame.get("file_path"):
+                    frame = frame_index.frame_at(img["frame_idx"])
+                    if frame.get("file_path"):
                         with open(frame["file_path"], "rb") as src, \
                                 open(tmp_img_dir / img["file_name"], "wb") as dst:
                             dst.write(src.read())

@@ -41,8 +41,8 @@ class SAM3Worker(QThread):
     """Asynchronous SAM3 inference thread.
 
     Inputs:
-      image_path : str — path to a temp image file on disk (run_sam3 needs a
-                   path; we dump the .rrd blob there).
+      image_path : str — path to the frame's image file on disk (run_sam3
+                   needs a path).
       bboxes_xyxy: list of [x1,y1,x2,y2] pixel coords (one per region).
       concepts   : list of class names (one per bbox, used for labelling).
       model_path, device, conf : forwarded to run_sam3.
@@ -245,7 +245,7 @@ class SAM3BatchWorker(QThread):
 
     jobs: list of dicts, one per frame:
         {frame_idx: int, bboxes_xyxy: [...], concepts: [...], ann_ids: [...]}
-    Frames are decoded from the rrd index inside this thread (decode_image
+    Frames are decoded from the frame index inside this thread (decode_image
     is pure in-memory PIL decoding, so this is thread-safe) and written as
     tmp PNGs under tmp_dir.
 
@@ -260,11 +260,11 @@ class SAM3BatchWorker(QThread):
     failed_signal = pyqtSignal(str)
     cancelled_signal = pyqtSignal()
 
-    def __init__(self, rrd_index, jobs: List[Dict[str, Any]], tmp_dir: str,
+    def __init__(self, frame_index, jobs: List[Dict[str, Any]], tmp_dir: str,
                  model_path: Optional[str], device: str, conf: float,
                  parent=None):
         super().__init__(parent)
-        self.rrd_index = rrd_index
+        self.frame_index = frame_index
         self.jobs = jobs
         self.tmp_dir = tmp_dir
         self.model_path = model_path
@@ -291,7 +291,7 @@ class SAM3BatchWorker(QThread):
             if self._cancel_requested:
                 self.cancelled_signal.emit()
                 return
-            arr = self.rrd_index.decode_image(job["frame_idx"])
+            arr = self.frame_index.decode_image(job["frame_idx"])
             img_path = os.path.join(self.tmp_dir,
                                     f"batch_{job['frame_idx']:06d}.png")
             Image.fromarray(arr).save(img_path)
@@ -345,7 +345,7 @@ class InterpBatchWorker(QThread):
     where a < b are frame_idxs and box_a/box_b are 13-style box dicts
     (ann_id, category_id, track_id, xywh, xyxy, center).
 
-    For each job the span's rrd image blobs are materialized into a fresh
+    For each job the span's images are materialized into a fresh
     per-run tmp dir and 13's interpolate_span is called as-is (flow_method /
     camera_model passed through). Results for all jobs are collected and
     emitted together via finished_signal(list of (job, {p: result})) so the
@@ -358,11 +358,11 @@ class InterpBatchWorker(QThread):
     failed_signal = pyqtSignal(str)
     cancelled_signal = pyqtSignal()
 
-    def __init__(self, rrd_index, jobs: List[Dict[str, Any]],
+    def __init__(self, frame_index, jobs: List[Dict[str, Any]],
                  base_tmp_dir: str, flow_method: str, camera_model: str,
                  parent=None):
         super().__init__(parent)
-        self.rrd_index = rrd_index
+        self.frame_index = frame_index
         self.jobs = jobs
         self.base_tmp_dir = base_tmp_dir
         self.flow_method = flow_method
@@ -385,21 +385,18 @@ class InterpBatchWorker(QThread):
         return ".jpg"
 
     def _write_span(self, run_dir: str, a: int, b: int) -> List[Optional[str]]:
-        """Write the span's image blobs; return per-frame file names
-        (length b+1, None before a). Raises RuntimeError on a missing blob."""
+        """Copy the span's source images into run_dir; return per-frame file
+        names (length b+1, None before a). Raises RuntimeError on a frame
+        with no backing file."""
         frames: List[Optional[str]] = [None] * (b + 1)
         for p in range(a, b + 1):
-            frame = self.rrd_index.frame_at(p)
+            frame = self.frame_index.frame_at(p)
             name = f"frame_{p:06d}{self._frame_ext(frame)}"
             frames[p] = name
             dst = os.path.join(run_dir, name)
-            blob = frame.get("image_blob")
-            if blob:
-                with open(dst, "wb") as f:
-                    f.write(blob)
-            elif frame.get("file_path"):
-                # --images mode: no blob, copy the source file (cv2.imread
-                # sniffs the format, so the .jpg name is fine for any type).
+            if frame.get("file_path"):
+                # cv2.imread sniffs the format, so the .jpg name is fine for
+                # any source type.
                 shutil.copyfile(frame["file_path"], dst)
             else:
                 raise RuntimeError(f"frame {p + 1}: no image data in source")
