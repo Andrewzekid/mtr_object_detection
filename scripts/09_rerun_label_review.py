@@ -4040,6 +4040,15 @@ class ReviewWindow(QMainWindow):
         new_ann_id = self.coco.add_box(image_id, x, y, w, h, cat_id)
         self._last_cat_id = cat_id
         self._refresh_boxes()
+        # Auto-select the new box so R / Re-seg sel / C / T act on it
+        # immediately after drawing (refresh resets the selection).
+        for i, b in enumerate(self.canvas._boxes):
+            if b["id"] == new_ann_id:
+                self.canvas._selected_idx = i
+                self.canvas._multi_selected = {i}
+                self.side.highlight_box_row(i)
+                self.canvas.update()
+                break
         ann = self.coco.get_box(new_ann_id)
         tid = ann.get("track_id") if ann else None
         tid_txt = f" T{tid}" if tid is not None else ""
@@ -4650,6 +4659,8 @@ class ReviewWindow(QMainWindow):
             return
         sel = self.canvas._selected_idx
         if sel < 0 or sel >= len(self.canvas._boxes):
+            self.statusBar().showMessage(
+                "No box selected — click a box first, then re-seg", 3000)
             print("ℹ️ No box selected — press R after clicking a box.")
             return
         box = self.canvas._boxes[sel]
