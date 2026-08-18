@@ -4584,7 +4584,8 @@ class ReviewWindow(QMainWindow):
         self._batch_frames_done = 0
         self._set_sam3_status(f"all: 0/{len(jobs)} frames…")
         self.side.set_sam3_running(True)
-        self.canvas.setEnabled(False)
+        # Canvas stays enabled: masks apply by ann_id, so the user can
+        # keep navigating/drawing on other frames while SAM3 runs.
         self._sam3_batch_worker = SAM3BatchWorker(
             self.rrd_index, jobs, tmp_dir,
             model_path=self.sam3_model,
@@ -4620,7 +4621,6 @@ class ReviewWindow(QMainWindow):
         self._set_sam3_status(f"all: {done}/{total} frames…")
 
     def _on_batch_finished(self, n_ok: int, n_fail: int) -> None:
-        self.canvas.setEnabled(True)
         self.side.set_sam3_running(False)
         self._set_sam3_status(
             f"all: done — {n_ok} mask(s), {n_fail} failed")
@@ -4631,7 +4631,6 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_batch_cancelled(self) -> None:
-        self.canvas.setEnabled(True)
         self.side.set_sam3_running(False)
         self._set_sam3_status("all: cancelled")
         self.coco.save(is_final=False)
@@ -4681,7 +4680,8 @@ class ReviewWindow(QMainWindow):
             return
         self._set_sam3_status(f"running on {len(bboxes_xyxy)} box(es)…")
         self.side.set_sam3_running(True)
-        self.canvas.setEnabled(False)
+        # Canvas stays enabled: masks apply by ann_id, so the user can
+        # keep navigating/drawing on other frames while SAM3 runs.
         self._sam3_worker = SAM3Worker(
             image_path=img_path,
             bboxes_xyxy=bboxes_xyxy,
@@ -4720,14 +4720,12 @@ class ReviewWindow(QMainWindow):
             self.side.btn_cancel_sam3.setEnabled(False)
 
     def _on_sam3_cancelled(self) -> None:
-        self.canvas.setEnabled(True)
         self.side.set_sam3_running(False)
         self._set_sam3_status("cancelled — no masks applied")
         self.statusBar().showMessage("SAM3 cancelled", 2500)
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_sam3_finished(self, results: list) -> None:
-        self.canvas.setEnabled(True)
         self.side.set_sam3_running(False)
         n_ok = sum(1 for r in results if r.get("success"))
         n_fail = len(results) - n_ok
@@ -4758,7 +4756,6 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_sam3_failed(self, msg: str) -> None:
-        self.canvas.setEnabled(True)
         self.side.set_sam3_running(False)
         self._sam3_queue.clear()  # hard failure — don't keep retrying queued jobs
         self._set_sam3_status(f"failed — {msg}")
