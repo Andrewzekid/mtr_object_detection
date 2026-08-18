@@ -183,7 +183,11 @@ config override the corresponding CLI flags. Example:
       "sam3": {
         "device": "cpu",              // cpu | cuda
         "conf": 0.25,
-        "auto_segment": false
+        "auto_segment": false,
+        "min_polygon_area": 100       // drop saved mask contours smaller
+                                      // than this (px²); filters the speck
+                                      // polygons SAM3 occasionally spawns.
+                                      // 0 keeps every contour.
       },
       "ui": {
         "hide": ["sam3_all_frames"],  // button groups to hide; known groups:
@@ -365,10 +369,14 @@ def _decode_mask_png(blob: bytes) -> Optional[np.ndarray]:
         return None
 
 
-def _mask_to_polygons(mask: np.ndarray) -> List[List[int]]:
+def _mask_to_polygons(mask: np.ndarray,
+                      min_area: float = 100.0) -> List[List[int]]:
     """Convert a boolean HxW mask to COCO polygon segmentation format —
     a list of flat [x1, y1, x2, y2, ...] outer contours in int pixels
     (same shape as the ``segmentation`` field in scripts/results.json).
+
+    Contours whose area is below ``min_area`` (px²) are dropped — SAM3
+    masks occasionally spawn scattered speck polygons far from the object.
     Returns [] when the mask is empty or no contour has ≥3 points."""
     import cv2  # lazy: heavy import, only needed when masks are saved
     if mask is None or mask.size == 0 or not mask.any():
@@ -379,7 +387,7 @@ def _mask_to_polygons(mask: np.ndarray) -> List[List[int]]:
     polys = []
     for c in contours:
         flat = c.reshape(-1).tolist()
-        if len(flat) >= 6:  # a polygon needs at least 3 points
+        if len(flat) >= 6 and cv2.contourArea(c) >= min_area:
             polys.append([int(v) for v in flat])
     return polys
 
@@ -887,6 +895,10 @@ class CocoState:
         # pairing expects. Deleted ids are never recycled either way.
         self.sticky_track_ids: bool = False
         self._track_next: int = 1
+        # Minimum contour area (px²) for a SAM3 mask contour to be saved as
+        # a COCO polygon — drops the scattered speck polygons SAM3
+        # occasionally produces. Config: "sam3": {"min_polygon_area": ...}.
+        self.min_polygon_area: float = 100.0
         self._img_id_by_ts: Dict[int, int] = {}
         self._img_id_by_idx: Dict[int, int] = {}
         self._ann_id_next = 1
@@ -988,7 +1000,7 @@ class CocoState:
             out.pop("mask", None)
             mask = ann.get("_mask")
             if mask is not None and isinstance(mask, np.ndarray) and mask.size:
-                polys = _mask_to_polygons(mask)
+                polys = _mask_to_polygons(mask, self.min_polygon_area)
                 if polys:
                     out["segmentation"] = polys
             final_anns.append(out)
@@ -2700,6 +2712,14 @@ class ConfigDialog(QtWidgets.QDialog):
         sam3_form.addRow("Confidence", self.spin_sam3_conf)
         self.check_auto_segment = QCheckBox("Auto-segment on box add")
         sam3_form.addRow(self.check_auto_segment)
+        self.spin_min_poly_area = QtWidgets.QSpinBox()
+        self.spin_min_poly_area.setRange(0, 1000000)
+        self.spin_min_poly_area.setSuffix(" px²")
+        self.spin_min_poly_area.setToolTip(
+            "Mask contours smaller than this area are dropped when saving\n"
+            "polygons — filters the scattered specks SAM3 occasionally\n"
+            "produces. 0 keeps every contour.")
+        sam3_form.addRow("Min polygon area", self.spin_min_poly_area)
         root.addWidget(sam3_box)
 
         # --- Mask opacity --------------------------------------------------
@@ -2768,6 +2788,7 @@ class ConfigDialog(QtWidgets.QDialog):
         self.combo_device.setCurrentText(win.sam3_device)
         self.spin_sam3_conf.setValue(win.sam3_conf)
         self.check_auto_segment.setChecked(win.auto_segment)
+        self.spin_min_poly_area.setValue(int(win.coco.min_polygon_area))
         self.spin_opacity.setValue(win.side.opacity_slider.value())
         self.check_sticky_ids.setChecked(win.coco.sticky_track_ids)
 
@@ -2790,6 +2811,9 @@ class ConfigDialog(QtWidgets.QDialog):
             self.spin_sam3_conf.setValue(float(sam3["conf"]))
         if "auto_segment" in sam3:
             self.check_auto_segment.setChecked(bool(sam3["auto_segment"]))
+        if "min_polygon_area" in sam3:
+            self.spin_min_poly_area.setValue(
+                max(0, int(sam3["min_polygon_area"])))
         ui = cfg.get("ui", {})
         if "hide" in ui:
             hidden = set(ui["hide"] or [])
@@ -2816,6 +2840,7 @@ class ConfigDialog(QtWidgets.QDialog):
                 "device": self.combo_device.currentText(),
                 "conf": self.spin_sam3_conf.value(),
                 "auto_segment": self.check_auto_segment.isChecked(),
+                "min_polygon_area": self.spin_min_poly_area.value(),
             },
             "ui": {
                 "hide": [k for k, cb in self.hide_checks.items()
@@ -3331,9 +3356,12 @@ class ReviewWindow(QMainWindow):
         self._stop_playback()
         self.side.set_playing(False)
         self.rrd_index = new_index
-        sticky = self.coco.sticky_track_ids  # setting survives the switch
+        # Settings survive the source switch.
+        sticky = self.coco.sticky_track_ids
+        min_poly = self.coco.min_polygon_area
         self.coco = CocoState(out_json, self.coco.categories)
         self.coco.sticky_track_ids = sticky
+        self.coco.min_polygon_area = min_poly
         self.coco.load_existing()
         self._update_source_label()
         self.side.coco = self.coco  # side panel keeps its own reference
@@ -3381,6 +3409,9 @@ class ReviewWindow(QMainWindow):
             self.sam3_conf = float(sam3_cfg["conf"])
         if "auto_segment" in sam3_cfg:
             self.auto_segment = bool(sam3_cfg["auto_segment"])
+        if "min_polygon_area" in sam3_cfg:
+            self.coco.min_polygon_area = max(
+                0.0, float(sam3_cfg["min_polygon_area"]))
         ui_cfg = cfg.get("ui", {})
         if "hide" in ui_cfg:
             groups = ui_cfg["hide"] or []
@@ -5007,6 +5038,8 @@ def main():
     coco = CocoState(args.output_json, categories)
     # Default: fresh auto-increment track ids; sticky inheritance is opt-in.
     coco.sticky_track_ids = bool(tracking_cfg.get("sticky_ids", False))
+    coco.min_polygon_area = max(
+        0.0, float(sam3_cfg.get("min_polygon_area", 100)))
     coco.load_existing()
     coco.current_idx = coco.load_progress(len(rrd_index))
 
