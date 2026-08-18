@@ -1800,6 +1800,7 @@ class SidePanel(QWidget):
 
     cat_clicked = pyqtSignal(int)  # cat_id
     slider_moved = pyqtSignal(int)  # frame_idx
+    slider_released = pyqtSignal()  # drag ended (mouse released)
     nav_delta = pyqtSignal(int)     # -10 / -5 / +5 / +10 frame jump buttons
     run_sam3_clicked = pyqtSignal()      # "Run SAM3 (all)" button
     toggle_masks_clicked = pyqtSignal()  # "Masks: on/off" button
@@ -2040,6 +2041,7 @@ class SidePanel(QWidget):
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(0)
         self.frame_slider.valueChanged.connect(self.slider_moved.emit)
+        self.frame_slider.sliderReleased.connect(self.slider_released.emit)
         layout.addWidget(self.frame_slider)
 
         self.info_label = QLabel("Frame: -\nTimestamp: -")
@@ -2763,6 +2765,7 @@ class ReviewWindow(QMainWindow):
         self.canvas.next_unlabeled.connect(self._on_next_unlabeled)
         self.side.cat_clicked.connect(self._on_side_cat_clicked)
         self.side.slider_moved.connect(self._on_slider_moved)
+        self.side.slider_released.connect(self._on_slider_released)
         self.side.nav_delta.connect(self._on_frame_nav)
         self.side.run_sam3_clicked.connect(self._on_run_sam3_all)
         self.side.toggle_masks_clicked.connect(self._on_toggle_masks)
@@ -3151,6 +3154,7 @@ class ReviewWindow(QMainWindow):
         # frame navigation (it would write the JSON every tick during
         # playback). Progress is saved:
         #   - on explicit N/B/X keystrokes (see _on_frame_nav / _on_discard_all)
+        #   - on slider release (see _on_slider_released)
         #   - on quit (closeEvent, _on_save_quit, _on_quit)
         self.coco.current_idx = idx
         self._sync_keyframe_button()
@@ -3173,6 +3177,14 @@ class ReviewWindow(QMainWindow):
         if 0 <= idx < len(self.frame_index) and idx != self._current_idx:
             self._current_idx = idx
             self._load_current()
+            # No save here: valueChanged fires on every drag tick and
+            # save() rewrites the whole COCO json + re-polygonizes every
+            # mask — that per-tick cost is what made scrubbing laggy.
+            # Progress is saved once per drag on sliderReleased instead.
+
+    def _on_slider_released(self) -> None:
+        """Save progress once at the end of a slider drag."""
+        if 0 <= self._current_idx < len(self.frame_index):
             self.coco.save(is_final=False)
 
     def _on_box_deleted(self, ann_id: int) -> None:
