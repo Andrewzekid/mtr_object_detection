@@ -68,8 +68,9 @@ SAM3 segmentation
 * ``M`` toggles mask overlay visibility.
 * ``Run SAM3 (all)`` button (or ``Shift+M``) runs Ultralytics SAM3 on every
   bbox on the current frame and overlays the resulting masks. Masks are
-  stored per-annotation in the COCO output (PNG-encoded in the ``mask`` field)
-  so they round-trip with the json file.
+  stored per-annotation in the COCO output as polygon ``segmentation``
+  (same shape as ``scripts/results.json``; the legacy base64-PNG ``mask``
+  field is still read on load) so they round-trip with the json file.
 * ``R`` re-segments the *selected* bbox only — useful after you've redrawn a
   bbox to fix a bad SAM3 mask: delete the old box, draw a new one, then press
   R while it's selected to regenerate the mask.
@@ -348,6 +349,40 @@ def _decode_mask_png(blob: bytes) -> Optional[np.ndarray]:
         return arr > 0
     except Exception:
         return None
+
+
+def _mask_to_polygons(mask: np.ndarray) -> List[List[int]]:
+    """Convert a boolean HxW mask to COCO polygon segmentation format —
+    a list of flat [x1, y1, x2, y2, ...] outer contours in int pixels
+    (same shape as the ``segmentation`` field in scripts/results.json).
+    Returns [] when the mask is empty or no contour has ≥3 points."""
+    import cv2  # lazy: heavy import, only needed when masks are saved
+    if mask is None or mask.size == 0 or not mask.any():
+        return []
+    arr = mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(arr, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    polys = []
+    for c in contours:
+        flat = c.reshape(-1).tolist()
+        if len(flat) >= 6:  # a polygon needs at least 3 points
+            polys.append([int(v) for v in flat])
+    return polys
+
+
+def _polygons_to_mask(polys: List[List[float]], height: int,
+                      width: int) -> Optional[np.ndarray]:
+    """Rasterize COCO polygon segmentation back to a boolean HxW mask."""
+    import cv2  # lazy
+    if not polys or height <= 0 or width <= 0:
+        return None
+    pts = [np.array(p, np.int32).reshape(-1, 2) for p in polys
+           if len(p) >= 6]
+    if not pts:
+        return None
+    arr = np.zeros((height, width), np.uint8)
+    cv2.fillPoly(arr, pts, 1)
+    return arr.astype(bool)
 
 
 
@@ -877,6 +912,8 @@ class CocoState:
                 self.categories = merged
             self.cat_map = {c["id"]: c["name"] for c in self.categories}
             self.cat_name_to_id = {c["name"]: c["id"] for c in self.categories}
+            img_dims = {i["id"]: (i.get("height", 0), i.get("width", 0))
+                        for i in self.images}
             for ann in self.annotations:
                 self._ann_id_next = max(self._ann_id_next, ann["id"] + 1)
                 # Rebuild the global track-id counter so new boxes continue
@@ -884,16 +921,21 @@ class CocoState:
                 tid = ann.get("track_id")
                 if isinstance(tid, int) and not isinstance(tid, bool):
                     self._track_next = max(self._track_next, tid + 1)
-                # Decode any persisted mask (base64-encoded PNG).
+                # Restore the in-memory mask: COCO polygon "segmentation"
+                # (current format) or legacy base64 PNG ("mask").
                 mask_b64 = ann.get("mask")
                 if isinstance(mask_b64, str) and mask_b64:
                     try:
                         import base64
+                        # None on decode failure; no `or None` — ndarray
+                        # truthiness is ambiguous and raises.
                         ann["_mask"] = _decode_mask_png(
-                            base64.b64decode(mask_b64)
-                        ) or None
+                            base64.b64decode(mask_b64))
                     except Exception:
                         ann["_mask"] = None
+                elif ann.get("segmentation"):
+                    h, w = img_dims.get(ann["image_id"], (0, 0))
+                    ann["_mask"] = _polygons_to_mask(ann["segmentation"], h, w)
                 else:
                     ann["_mask"] = ann.get("_mask")  # may be None or ndarray
             for img in self.images:
@@ -920,18 +962,19 @@ class CocoState:
         return 0
 
     def save(self, is_final: bool) -> None:
-        import base64
         final_anns = []
         for ann in self.annotations:
             if ann["id"] in self.removed_ids:
                 continue
             out = {k: v for k, v in ann.items() if not k.startswith("_")}
-            # Persist mask as base64-encoded PNG so it survives json round-trip.
+            # Legacy base64-PNG "mask" field is superseded by COCO polygon
+            # "segmentation" (same shape as scripts/results.json).
+            out.pop("mask", None)
             mask = ann.get("_mask")
             if mask is not None and isinstance(mask, np.ndarray) and mask.size:
-                png = _encode_mask_png(mask)
-                if png:
-                    out["mask"] = base64.b64encode(png).decode("ascii")
+                polys = _mask_to_polygons(mask)
+                if polys:
+                    out["segmentation"] = polys
             final_anns.append(out)
         data = {
             "images": self.images,
