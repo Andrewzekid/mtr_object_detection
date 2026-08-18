@@ -190,6 +190,14 @@ config override the corresponding CLI flags. Example:
                                       // Default (no config): ["interpolate",
                                       // "keyframe"]; set [] to show all.
         "mask_opacity": 47            // initial mask overlay opacity (0-100)
+      },
+      "tracking": {
+        "sticky_ids": false           // false (default): every new box gets
+                                      // a fresh auto-increment track id;
+                                      // true: the k-th box on a frame
+                                      // inherits the k-th track id from the
+                                      // nearest earlier annotated frame
+                                      // (what interpolation pairing expects)
       }
     }
 
@@ -868,11 +876,13 @@ class CocoState:
         # Frames the user marked as interpolation keyframes (K key / button).
         # Persisted in the .progress sidecar like `reviewed`.
         self.keyframes: set = set()
-        # Global auto-increment fallback for track ids. Normally a drawn box
-        # inherits the track id of the same-order box on the nearest earlier
-        # annotated frame (see _next_track_id); this counter covers the
-        # first frame, extra boxes, and seeds. Deleted ids are never
-        # recycled.
+        # Track id assignment for newly drawn boxes. Default (False): every
+        # new box gets a fresh id from the global auto-increment counter.
+        # When True (config "tracking": {"sticky_ids": true}), the k-th box
+        # drawn on a frame inherits the k-th track id from the nearest
+        # earlier annotated frame (see _next_track_id) — what interpolation
+        # pairing expects. Deleted ids are never recycled either way.
+        self.sticky_track_ids: bool = False
         self._track_next: int = 1
         self._img_id_by_ts: Dict[int, int] = {}
         self._img_id_by_idx: Dict[int, int] = {}
@@ -1066,7 +1076,9 @@ class CocoState:
             "bbox": [float(x), float(y), float(w), float(h)],
             "area": float(w * h),
             "iscrowd": 0,
-            "track_id": self._next_track_id(image_id, cat_id),
+            "track_id": (self._next_track_id(image_id, cat_id)
+                         if self.sticky_track_ids
+                         else self._fresh_track_id()),
         }
         self.annotations.append(ann)
         self._ann_id_next += 1
@@ -2601,7 +2613,7 @@ class ConfigDialog(QtWidgets.QDialog):
     """Settings editor opened from the ⚙ Config button (File → Config…).
 
     Contains checkboxes for hiding UI groups plus interpolation / SAM3 /
-    mask-opacity fields. Buttons:
+    mask-opacity / tracking fields. Buttons:
       - Load from file… — read a JSON config, fill the widgets, apply it.
       - Apply — apply the current widget state without saving.
       - Save… — apply, then write the widget state to a JSON file.
@@ -2681,6 +2693,19 @@ class ConfigDialog(QtWidgets.QDialog):
         mask_form.addRow("Mask opacity", self.spin_opacity)
         root.addWidget(mask_box)
 
+        # --- Tracking ------------------------------------------------------
+        track_box = QtWidgets.QGroupBox("Tracking")
+        track_form = QtWidgets.QFormLayout(track_box)
+        self.check_sticky_ids = QCheckBox(
+            "Sticky track ids (inherit from previous frame)")
+        self.check_sticky_ids.setToolTip(
+            "Unchecked (default): every new box gets a fresh auto-increment "
+            "track id.\nChecked: the k-th box drawn on a frame inherits the "
+            "k-th track id\nfrom the nearest earlier annotated frame (what "
+            "interpolation expects).")
+        track_form.addRow(self.check_sticky_ids)
+        root.addWidget(track_box)
+
         # --- Buttons -------------------------------------------------------
         btn_row = QHBoxLayout()
         self.btn_load = QPushButton("Load from file…")
@@ -2726,6 +2751,7 @@ class ConfigDialog(QtWidgets.QDialog):
         self.spin_sam3_conf.setValue(win.sam3_conf)
         self.check_auto_segment.setChecked(win.auto_segment)
         self.spin_opacity.setValue(win.side.opacity_slider.value())
+        self.check_sticky_ids.setChecked(win.coco.sticky_track_ids)
 
     def _prefill_from_config(self, cfg: Dict[str, Any]) -> None:
         """Fill the widgets from a config dict (same schema as _collect)."""
@@ -2754,6 +2780,9 @@ class ConfigDialog(QtWidgets.QDialog):
         if "mask_opacity" in ui:
             self.spin_opacity.setValue(
                 max(0, min(100, int(ui["mask_opacity"]))))
+        tracking = cfg.get("tracking", {})
+        if "sticky_ids" in tracking:
+            self.check_sticky_ids.setChecked(bool(tracking["sticky_ids"]))
 
     def _collect(self) -> Dict[str, Any]:
         """Widget state as a config dict (same schema as the example JSON)."""
@@ -2774,6 +2803,9 @@ class ConfigDialog(QtWidgets.QDialog):
                 "hide": [k for k, cb in self.hide_checks.items()
                          if cb.isChecked()],
                 "mask_opacity": self.spin_opacity.value(),
+            },
+            "tracking": {
+                "sticky_ids": self.check_sticky_ids.isChecked(),
             },
         }
 
@@ -3245,7 +3277,9 @@ class ReviewWindow(QMainWindow):
         self._stop_playback()
         self.side.set_playing(False)
         self.rrd_index = new_index
+        sticky = self.coco.sticky_track_ids  # setting survives the switch
         self.coco = CocoState(out_json, self.coco.categories)
+        self.coco.sticky_track_ids = sticky
         self.coco.load_existing()
         self.side.coco = self.coco  # side panel keeps its own reference
         self._current_idx = self.coco.load_progress(len(self.rrd_index))
@@ -3301,6 +3335,9 @@ class ReviewWindow(QMainWindow):
             pct = max(0, min(100, int(ui_cfg["mask_opacity"])))
             # Signals are connected by now, so this also updates the canvas.
             self.side.opacity_slider.setValue(pct)
+        tracking_cfg = cfg.get("tracking", {})
+        if "sticky_ids" in tracking_cfg:
+            self.coco.sticky_track_ids = bool(tracking_cfg["sticky_ids"])
 
     def _load_rrd_dialog(self) -> None:
         """File → Load from rrd: index a recording, spawn its web viewer,
@@ -4805,6 +4842,7 @@ def main():
     interp_cfg = cfg.get("interpolation", {})
     sam3_cfg = cfg.get("sam3", {})
     ui_cfg = cfg.get("ui", {})
+    tracking_cfg = cfg.get("tracking", {})
 
     flow_method = interp_cfg.get("flow_method", args.interp_flow_method)
     if flow_method not in ("dis", "klt", "farneback"):
@@ -4871,6 +4909,8 @@ def main():
     categories = _seed_categories(rrd_index, args.json)
     print(f"🏷️  Categories: {[c['name'] for c in categories]}")
     coco = CocoState(args.output_json, categories)
+    # Default: fresh auto-increment track ids; sticky inheritance is opt-in.
+    coco.sticky_track_ids = bool(tracking_cfg.get("sticky_ids", False))
     coco.load_existing()
     coco.current_idx = coco.load_progress(len(rrd_index))
 

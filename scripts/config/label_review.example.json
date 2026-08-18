@@ -13,5 +13,8 @@
   "ui": {
     "hide": [],
     "mask_opacity": 47
+  },
+  "tracking": {
+    "sticky_ids": false
   }
 }
