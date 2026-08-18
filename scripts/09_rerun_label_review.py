@@ -173,7 +173,9 @@ config override the corresponding CLI flags. Example:
         "hide": ["sam3_all_frames"],  // button groups to hide; known groups:
                                       // keyframe, interpolate, jump,
                                       // sam3_run, sam3_all_frames, masks,
-                                      // play, rerun_toggle
+                                      // play, rerun_toggle.
+                                      // Default (no config): ["interpolate",
+                                      // "keyframe"]; set [] to show all.
         "mask_opacity": 47            // initial mask overlay opacity (0-100)
       }
     }
@@ -5157,7 +5159,12 @@ def main():
                             "match_max_dist_frac", 0.2)),
                         interp_confirm_mismatch=bool(interp_cfg.get(
                             "confirm_mismatch", True)),
-                        ui_hide=ui_cfg.get("hide") or None,
+                        # Interpolation + keyframe controls are hidden by
+                        # default; an explicit "ui": {"hide": [...]} config
+                        # overrides this (set [] to show everything), and
+                        # the Config dialog can toggle them at runtime.
+                        ui_hide=ui_cfg.get("hide",
+                                           ["interpolate", "keyframe"]),
                         mask_opacity=ui_cfg.get("mask_opacity"),
                         grpc_port=args.grpc_port)
     win.show()
