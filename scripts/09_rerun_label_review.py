@@ -1266,10 +1266,14 @@ class CocoState:
             self.images = data.get("images", [])
             self.annotations = data.get("annotations", [])
             # Merge categories instead of replacing: the saved file may
-            # predate categories added later to the db/seed (e.g. a new
-            # class inserted into inspection_v2.db between sessions).
+            # predate categories added later via the side panel or --json
+            # seed, so union by id and name rather than clobbering.
             saved_cats = data.get("categories", [])
-            if saved_cats:
+            # Only inherit categories from a session that actually has
+            # content. A totally empty previous session (0 imgs, 0 anns —
+            # e.g. an idle window opened and closed) has nothing worth
+            # preserving, and merging would resurrect stale defaults.
+            if saved_cats and (self.images or self.annotations):
                 have_ids = {c["id"] for c in saved_cats}
                 have_names = {c["name"] for c in saved_cats}
                 merged = list(saved_cats)
