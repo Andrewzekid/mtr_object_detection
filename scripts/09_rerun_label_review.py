@@ -4655,28 +4655,37 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_resegment_selected(self) -> None:
-        """Re-run SAM3 on just the selected bbox (R key / button)."""
+        """Re-run SAM3 on the selected bbox(es) (R key / button).
+
+        With a shift-click multi-selection, every selected box is
+        re-segmented (single worker job, queued as one when busy)."""
         if not _SAM3_AVAILABLE:
             QMessageBox.warning(self, "SAM3 unavailable",
                                  "core.models_inference.run_sam3 not importable.")
             return
-        sel = self.canvas._selected_idx
-        if sel < 0 or sel >= len(self.canvas._boxes):
+        sel = [i for i in sorted(self.canvas._multi_selected)
+               if 0 <= i < len(self.canvas._boxes)]
+        if not sel and 0 <= self.canvas._selected_idx < len(self.canvas._boxes):
+            sel = [self.canvas._selected_idx]
+        if not sel:
             self.statusBar().showMessage(
                 "No box selected — click a box first, then re-seg", 3000)
             print("ℹ️ No box selected — press R after clicking a box.")
             return
-        box = self.canvas._boxes[sel]
-        ann_id = box["id"]
-        x, y, w, h = box["bbox"]
         img_path = self._write_tmp_image()
         if img_path is None:
             return
-        bboxes_xyxy = [[x, y, x + w, y + h]]
-        concepts = [self.coco.cat_map.get(box.get("cat_id", 0), "object")]
-        ann_ids = [ann_id]
-        print(f"🔬 Re-segmenting ann_id={ann_id} "
-              f"bbox={bboxes_xyxy[0]} cat={concepts[0]}")
+        bboxes_xyxy = []
+        concepts = []
+        ann_ids = []
+        for i in sel:
+            box = self.canvas._boxes[i]
+            x, y, w, h = box["bbox"]
+            bboxes_xyxy.append([x, y, x + w, y + h])
+            concepts.append(
+                self.coco.cat_map.get(box.get("cat_id", 0), "object"))
+            ann_ids.append(box["id"])
+        print(f"🔬 Re-segmenting ann_ids={ann_ids}")
         self._start_sam3_worker(img_path, bboxes_xyxy, concepts, ann_ids)
 
     def _start_sam3_worker(self, img_path: str, bboxes_xyxy: list,
