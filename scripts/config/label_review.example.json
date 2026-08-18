@@ -12,6 +12,7 @@
     "min_polygon_area": 100
   },
   "ui": {
+    "advanced": false,
     "hide": [],
     "mask_opacity": 47
   },

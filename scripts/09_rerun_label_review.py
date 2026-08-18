@@ -159,12 +159,18 @@ config override the corresponding CLI flags. Example:
                                       // 0 keeps every contour.
       },
       "ui": {
+        "advanced": false,            // false (default): the interpolation
+                                      // and tracking settings are hidden in
+                                      // the Config dialog, and the
+                                      // keyframe/interpolate button groups
+                                      // stay hidden in the side panel.
+                                      // true: those sections appear and
+                                      // "hide" fully controls them.
         "hide": ["sam3_all_frames"],  // button groups to hide; known groups:
                                       // keyframe, interpolate, jump,
                                       // sam3_run, sam3_all_frames, masks,
-                                      // play.
-                                      // Default (no config): ["interpolate",
-                                      // "keyframe"]; set [] to show all.
+                                      // play. Without "advanced", keyframe
+                                      // and interpolate are always hidden.
         "mask_opacity": 47            // initial mask overlay opacity (0-100)
       },
       "tracking": {
@@ -179,7 +185,8 @@ config override the corresponding CLI flags. Example:
 
 The same settings can be edited at runtime from the ⚙ Config button in the
 menu bar (or File → Config settings…, Ctrl+G): a dialog with checkboxes for
-the UI groups plus interpolation / SAM3 / opacity fields, with buttons to
+the UI groups plus SAM3 / opacity fields (the interpolation and tracking
+sections appear once "Advanced settings" is checked), with buttons to
 Load from file…, Apply, Save… (writes the JSON above), and Close.
 """
 
@@ -2271,8 +2278,10 @@ class SidePanel(QWidget):
 class ConfigDialog(QtWidgets.QDialog):
     """Settings editor opened from the ⚙ Config button (File → Config…).
 
-    Contains checkboxes for hiding UI groups plus interpolation / SAM3 /
-    mask-opacity / tracking fields. Buttons:
+    Contains an "Advanced settings" checkbox (off by default) that gates the
+    interpolation/tracking sections and the keyframe/interpolate hide
+    checkboxes, plus checkboxes for hiding UI groups and SAM3 /
+    mask-opacity fields. Buttons:
       - Load from file… — read a JSON config, fill the widgets, apply it.
       - Apply — apply the current widget state without saving.
       - Save… — apply, then write the widget state to a JSON file.
@@ -2298,6 +2307,16 @@ class ConfigDialog(QtWidgets.QDialog):
         self.setModal(True)
         root = QVBoxLayout(self)
 
+        # --- Advanced toggle -------------------------------------------------
+        self.check_advanced = QCheckBox(
+            "Advanced settings (interpolation, tracking, keyframe/interpolate "
+            "controls)")
+        self.check_advanced.setToolTip(
+            "Unchecked (default): the interpolation and tracking sections\n"
+            "below are hidden, and the keyframe/interpolate buttons stay\n"
+            "hidden in the side panel.")
+        root.addWidget(self.check_advanced)
+
         # --- UI visibility -------------------------------------------------
         ui_box = QtWidgets.QGroupBox("Hide UI elements")
         ui_form = QVBoxLayout(ui_box)
@@ -2310,8 +2329,8 @@ class ConfigDialog(QtWidgets.QDialog):
         root.addWidget(ui_box)
 
         # --- Interpolation -------------------------------------------------
-        interp_box = QtWidgets.QGroupBox("Interpolation")
-        interp_form = QtWidgets.QFormLayout(interp_box)
+        self.interp_box = QtWidgets.QGroupBox("Interpolation")
+        interp_form = QtWidgets.QFormLayout(self.interp_box)
         self.combo_flow = QtWidgets.QComboBox()
         self.combo_flow.addItems(["dis", "klt", "farneback"])
         interp_form.addRow("Flow method", self.combo_flow)
@@ -2325,7 +2344,7 @@ class ConfigDialog(QtWidgets.QDialog):
         interp_form.addRow("Match max dist frac", self.spin_match_frac)
         self.check_confirm_mismatch = QCheckBox("Confirm on mismatch")
         interp_form.addRow(self.check_confirm_mismatch)
-        root.addWidget(interp_box)
+        root.addWidget(self.interp_box)
 
         # --- SAM3 ----------------------------------------------------------
         sam3_box = QtWidgets.QGroupBox("SAM3")
@@ -2360,8 +2379,8 @@ class ConfigDialog(QtWidgets.QDialog):
         root.addWidget(mask_box)
 
         # --- Tracking ------------------------------------------------------
-        track_box = QtWidgets.QGroupBox("Tracking")
-        track_form = QtWidgets.QFormLayout(track_box)
+        self.track_box = QtWidgets.QGroupBox("Tracking")
+        track_form = QtWidgets.QFormLayout(self.track_box)
         self.check_sticky_ids = QCheckBox(
             "Sticky track ids (inherit from previous frame)")
         self.check_sticky_ids.setToolTip(
@@ -2370,7 +2389,7 @@ class ConfigDialog(QtWidgets.QDialog):
             "k-th track id\nfrom the nearest earlier annotated frame (what "
             "interpolation expects).")
         track_form.addRow(self.check_sticky_ids)
-        root.addWidget(track_box)
+        root.addWidget(self.track_box)
 
         # --- Buttons -------------------------------------------------------
         btn_row = QHBoxLayout()
@@ -2395,8 +2414,20 @@ class ConfigDialog(QtWidgets.QDialog):
         self.btn_apply.clicked.connect(self._on_apply)
         self.btn_save.clicked.connect(self._on_save)
         self.btn_close.clicked.connect(self.accept)
+        self.check_advanced.toggled.connect(self._update_advanced_visibility)
 
         self._prefill_from_window()
+        self._update_advanced_visibility()
+
+    def _update_advanced_visibility(self) -> None:
+        """Show the interpolation/tracking sections and the keyframe +
+        interpolate hide checkboxes only in advanced mode."""
+        adv = self.check_advanced.isChecked()
+        self.interp_box.setVisible(adv)
+        self.track_box.setVisible(adv)
+        self.hide_checks["interpolate"].setVisible(adv)
+        self.hide_checks["keyframe"].setVisible(adv)
+        self.adjustSize()
 
     # -- prefill / collect ---------------------------------------------------
 
@@ -2412,6 +2443,7 @@ class ConfigDialog(QtWidgets.QDialog):
     def _prefill_from_window(self) -> None:
         """Fill the widgets from the live window state."""
         win = self.win
+        self.check_advanced.setChecked(win.advanced_ui)
         for key, cb in self.hide_checks.items():
             cb.setChecked(self._is_group_hidden(key))
         self.combo_flow.setCurrentText(win.interp_flow_method)
@@ -2448,6 +2480,9 @@ class ConfigDialog(QtWidgets.QDialog):
             self.spin_min_poly_area.setValue(
                 max(0, int(sam3["min_polygon_area"])))
         ui = cfg.get("ui", {})
+        if "advanced" in ui:
+            self.check_advanced.setChecked(bool(ui["advanced"]))
+            self._update_advanced_visibility()
         if "hide" in ui:
             hidden = set(ui["hide"] or [])
             for key, cb in self.hide_checks.items():
@@ -2461,6 +2496,12 @@ class ConfigDialog(QtWidgets.QDialog):
 
     def _collect(self) -> Dict[str, Any]:
         """Widget state as a config dict (same schema as the example JSON)."""
+        advanced = self.check_advanced.isChecked()
+        hidden = [k for k, cb in self.hide_checks.items() if cb.isChecked()]
+        if not advanced:
+            # Keyframe/interpolate checkboxes are hidden in basic mode; the
+            # groups stay hidden in the side panel regardless.
+            hidden = sorted(set(hidden) | {"interpolate", "keyframe"})
         return {
             "interpolation": {
                 "flow_method": self.combo_flow.currentText(),
@@ -2476,8 +2517,8 @@ class ConfigDialog(QtWidgets.QDialog):
                 "min_polygon_area": self.spin_min_poly_area.value(),
             },
             "ui": {
-                "hide": [k for k, cb in self.hide_checks.items()
-                         if cb.isChecked()],
+                "advanced": advanced,
+                "hide": hidden,
                 "mask_opacity": self.spin_opacity.value(),
             },
             "tracking": {
@@ -2542,6 +2583,7 @@ class ReviewWindow(QMainWindow):
                   interp_confirm_mismatch: bool = True,
                   ui_hide: Optional[List[str]] = None,
                   mask_opacity: Optional[int] = None,
+                  advanced_ui: bool = False,
                   parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -2555,6 +2597,10 @@ class ReviewWindow(QMainWindow):
         # Fraction of min(frame w, h) used as the max pairing distance when
         # matching anchor boxes for interpolation.
         self.interp_match_frac = interp_match_frac
+        # Whether the advanced controls (interpolation + tracking settings,
+        # keyframe/interpolate buttons) are exposed. Off by default; toggled
+        # from the Config dialog's "Advanced settings" checkbox.
+        self.advanced_ui: bool = advanced_ui
         # Whether to show the track-id mismatch confirmation dialog before
         # interpolating.
         self.interp_confirm_mismatch = interp_confirm_mismatch
@@ -2610,8 +2656,13 @@ class ReviewWindow(QMainWindow):
         self._build_menu()
 
         # Config-driven UI tweaks: hide button groups, preset mask opacity.
-        if ui_hide:
-            self.side.set_hidden_groups(ui_hide)
+        # Without advanced mode the keyframe/interpolate groups are always
+        # hidden, regardless of the ui_hide list.
+        hide_groups = list(ui_hide or [])
+        if not self.advanced_ui:
+            hide_groups = sorted(set(hide_groups) | {"interpolate", "keyframe"})
+        if hide_groups:
+            self.side.set_hidden_groups(hide_groups)
         if mask_opacity is not None:
             pct = max(0, min(100, int(mask_opacity)))
             self.side.opacity_slider.setValue(pct)
@@ -2908,8 +2959,12 @@ class ReviewWindow(QMainWindow):
             self.coco.min_polygon_area = max(
                 0.0, float(sam3_cfg["min_polygon_area"]))
         ui_cfg = cfg.get("ui", {})
-        if "hide" in ui_cfg:
-            groups = ui_cfg["hide"] or []
+        if "advanced" in ui_cfg:
+            self.advanced_ui = bool(ui_cfg["advanced"])
+        if "hide" in ui_cfg or "advanced" in ui_cfg:
+            groups = list(ui_cfg.get("hide") or [])
+            if not self.advanced_ui:
+                groups = sorted(set(groups) | {"interpolate", "keyframe"})
             self.side.set_hidden_groups(groups)
         if "mask_opacity" in ui_cfg:
             pct = max(0, min(100, int(ui_cfg["mask_opacity"])))
@@ -4361,13 +4416,13 @@ def main():
                             "match_max_dist_frac", 0.2)),
                         interp_confirm_mismatch=bool(interp_cfg.get(
                             "confirm_mismatch", True)),
-                        # Interpolation + keyframe controls are hidden by
-                        # default; an explicit "ui": {"hide": [...]} config
-                        # overrides this (set [] to show everything), and
-                        # the Config dialog can toggle them at runtime.
-                        ui_hide=ui_cfg.get("hide",
-                                           ["interpolate", "keyframe"]),
-                        mask_opacity=ui_cfg.get("mask_opacity"))
+                        # Interpolation + keyframe controls are hidden unless
+                        # "ui": {"advanced": true} (the Config dialog exposes
+                        # the same toggle); "ui": {"hide": [...]} hides
+                        # additional groups on top.
+                        ui_hide=ui_cfg.get("hide", []),
+                        mask_opacity=ui_cfg.get("mask_opacity"),
+                        advanced_ui=bool(ui_cfg.get("advanced", False)))
     win.show()
     exit_code = app.exec()
 
