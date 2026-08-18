@@ -77,6 +77,19 @@ SAM3 segmentation
   mask on every frame; the progress bar above the frame slider shows how
   many frames have at least one box.
 
+SAM3 autolabel (text prompts)
+-----------------------------
+The "Autolabel frame" / "Autolabel (sel cat)" / "Autolabel ALL frames"
+buttons run SAM3's open-vocabulary detection (``SAM3SemanticPredictor``)
+using the category *names* as text prompts — no boxes needed first.
+Detections become regular, editable bboxes with masks attached (duplicates
+of an existing same-category box, IoU > 0.7, are skipped, and the whole
+batch is one undo step). "Autolabel (sel cat)" prompts with the
+preselected category only; the others prompt with every category. Single-
+frame autolabels join the same FIFO queue as box segmentation; the
+all-frames variant is a background batch with progress in the status line
+and checkpoint saves every 10 frames.
+
 Categories start empty; they are created from the side panel's Add
 field, come back with a resumed labels file, or are seeded from a COCO
 json via ``--json``.
@@ -176,9 +189,10 @@ config override the corresponding CLI flags. Example:
                                       // "hide" fully controls them.
         "hide": ["sam3_all_frames"],  // button groups to hide; known groups:
                                       // keyframe, interpolate, jump,
-                                      // sam3_run, sam3_all_frames, masks,
-                                      // play. Without "advanced", keyframe
-                                      // and interpolate are always hidden.
+                                      // sam3_run, sam3_all_frames, autolabel,
+                                      // masks, play. Without "advanced",
+                                      // keyframe and interpolate are always
+                                      // hidden.
         "mask_opacity": 47            // initial mask overlay opacity (0-100)
       },
       "tracking": {
@@ -306,7 +320,8 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 from label_review_workers import (  # noqa: E402
     SAM3Worker, SAM3BatchWorker, InterpBatchWorker,
-    _get_interp13, _SAM3_AVAILABLE, run_sam3,
+    SAM3AutolabelWorker, SAM3AutolabelBatchWorker,
+    _get_interp13, _SAM3_AVAILABLE, run_sam3, _iou_xyxy,
 )
 
 
@@ -1912,6 +1927,9 @@ class SidePanel(QWidget):
     cancel_sam3_clicked = pyqtSignal()   # "Cancel SAM3" button
     recat_selected = pyqtSignal(int)     # new cat_id for the selected box
     sam3_all_frames_clicked = pyqtSignal()  # "SAM3 ALL frames" button
+    autolabel_frame_clicked = pyqtSignal()     # "Autolabel frame" (all cats)
+    autolabel_cat_clicked = pyqtSignal()       # "Autolabel (sel cat)"
+    autolabel_all_clicked = pyqtSignal()       # "Autolabel ALL frames"
     toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
     interpolate_clicked = pyqtSignal()       # "Interpolate" button (I)
     cancel_interp_clicked = pyqtSignal()     # "Stop" button (running interp)
@@ -2100,6 +2118,29 @@ class SidePanel(QWidget):
         self.btn_sam3_all_frames.clicked.connect(self.sam3_all_frames_clicked.emit)
         layout.addWidget(self.btn_sam3_all_frames)
 
+        # Text-prompt autolabel: SAM3 finds objects by category name, no
+        # drawn boxes needed; detections become editable boxes with masks.
+        auto_row = QHBoxLayout()
+        self.btn_autolabel_frame = QPushButton("Autolabel frame")
+        self.btn_autolabel_frame.setToolTip(
+            "SAM3 text-prompt detection on this frame for EVERY category; "
+            "detections are added as editable boxes with masks.")
+        self.btn_autolabel_frame.clicked.connect(
+            self.autolabel_frame_clicked.emit)
+        auto_row.addWidget(self.btn_autolabel_frame)
+        self.btn_autolabel_cat = QPushButton("Autolabel (sel cat)")
+        self.btn_autolabel_cat.setToolTip(
+            "Same, but only for the category preselected in the list above.")
+        self.btn_autolabel_cat.clicked.connect(self.autolabel_cat_clicked.emit)
+        auto_row.addWidget(self.btn_autolabel_cat)
+        layout.addLayout(auto_row)
+        self.btn_autolabel_all = QPushButton("Autolabel ALL frames")
+        self.btn_autolabel_all.setToolTip(
+            "Background text-prompt autolabel on every frame for every "
+            "category. Cancel anytime.")
+        self.btn_autolabel_all.clicked.connect(self.autolabel_all_clicked.emit)
+        layout.addWidget(self.btn_autolabel_all)
+
         self.btn_masks = QPushButton("Masks: ON")
         self.btn_masks.setCheckable(True)
         self.btn_masks.setChecked(True)
@@ -2241,7 +2282,10 @@ class SidePanel(QWidget):
         all-frames batch refuses to start while something is running."""
         self.btn_run_sam3.setEnabled(True)
         self.btn_reseg.setEnabled(True)
+        self.btn_autolabel_frame.setEnabled(True)
+        self.btn_autolabel_cat.setEnabled(True)
         self.btn_sam3_all_frames.setEnabled(not running)
+        self.btn_autolabel_all.setEnabled(not running)
         self.btn_cancel_sam3.setEnabled(running)
 
     def set_interp_status(self, text: str) -> None:
@@ -2353,6 +2397,8 @@ class SidePanel(QWidget):
         "jump": ["jump_buttons"],
         "sam3_run": ["btn_run_sam3", "btn_reseg", "btn_cancel_sam3"],
         "sam3_all_frames": ["btn_sam3_all_frames"],
+        "autolabel": ["btn_autolabel_frame", "btn_autolabel_cat",
+                      "btn_autolabel_all"],
         "masks": ["btn_masks", "opacity_slider", "opacity_value_label"],
         "play": ["btn_play", "combo_speed"],
     }
@@ -2427,6 +2473,7 @@ class ConfigDialog(QtWidgets.QDialog):
         "jump": "Jump buttons (−10/−5/+5/+10)",
         "sam3_run": "SAM3 run buttons",
         "sam3_all_frames": "SAM3 all-frames button",
+        "autolabel": "Autolabel buttons",
         "masks": "Mask toggle + opacity slider",
         "play": "Play controls",
     }
@@ -2774,6 +2821,8 @@ class ReviewWindow(QMainWindow):
         self._last_cat_id: Optional[int] = None
         self._sam3_worker: Optional[SAM3Worker] = None
         self._sam3_batch_worker: Optional[SAM3BatchWorker] = None
+        self._sam3_autolabel_worker: Optional[SAM3AutolabelWorker] = None
+        self._sam3_autolabel_batch_worker: Optional[SAM3AutolabelBatchWorker] = None
         # FIFO of pending single-frame SAM3 jobs (img_path, bboxes_xyxy,
         # concepts, ann_ids). Filled when a run is requested while another
         # is in flight; drained when the current worker finishes/cancels.
@@ -2879,6 +2928,9 @@ class ReviewWindow(QMainWindow):
         self.side.cancel_sam3_clicked.connect(self._on_cancel_sam3)
         self.side.recat_selected.connect(self._on_recat_selected)
         self.side.sam3_all_frames_clicked.connect(self._on_sam3_all_frames)
+        self.side.autolabel_frame_clicked.connect(self._on_autolabel_frame)
+        self.side.autolabel_cat_clicked.connect(self._on_autolabel_cat)
+        self.side.autolabel_all_clicked.connect(self._on_autolabel_all)
         self.side.toggle_keyframe_clicked.connect(self._on_toggle_keyframe)
         self.side.interpolate_clicked.connect(self._on_interpolate)
         self.side.cancel_interp_clicked.connect(self._on_cancel_interp)
@@ -4121,14 +4173,17 @@ class ReviewWindow(QMainWindow):
         """Pop the next queued single-frame SAM3 job, if nothing is running."""
         if not self._sam3_queue:
             return
-        if (self._sam3_worker is not None
-                and self._sam3_worker.isRunning()) or \
-           (self._sam3_batch_worker is not None
-                and self._sam3_batch_worker.isRunning()):
+        if self._sam3_busy():
+            # Previous worker may still be tearing down — retry shortly.
+            QTimer.singleShot(200, self._start_next_queued_sam3)
             return
         job = self._sam3_queue.pop(0)
-        self._start_sam3_worker(job["img_path"], job["bboxes_xyxy"],
-                                job["concepts"], job["ann_ids"])
+        if job.get("kind") == "autolabel":
+            self._start_autolabel_worker(job["img_path"], job["concepts"],
+                                         job["cat_ids"], job["image_id"])
+        else:
+            self._start_sam3_worker(job["img_path"], job["bboxes_xyxy"],
+                                    job["concepts"], job["ann_ids"])
 
     def _write_tmp_image(self) -> Optional[str]:
         """Write the current frame's image to a tmp file (for run_sam3).
@@ -4215,9 +4270,7 @@ class ReviewWindow(QMainWindow):
             QMessageBox.warning(self, "SAM3 unavailable",
                                  "core.models_inference.run_sam3 not importable.")
             return
-        if (self._sam3_worker is not None and self._sam3_worker.isRunning()) or \
-           (self._sam3_batch_worker is not None
-                and self._sam3_batch_worker.isRunning()):
+        if self._sam3_busy():
             self.statusBar().showMessage("SAM3 already running", 2500)
             return
         jobs = []
@@ -4312,6 +4365,226 @@ class ReviewWindow(QMainWindow):
         self.statusBar().showMessage("Auto-annotate cancelled", 3000)
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
+    # ------------------- SAM3 autolabel (text prompts) ------------------- #
+
+    def _sam3_busy(self) -> bool:
+        """Any SAM3 worker (box segmentation or autolabel) running?"""
+        for w in (self._sam3_worker, self._sam3_batch_worker,
+                  self._sam3_autolabel_worker,
+                  self._sam3_autolabel_batch_worker):
+            if w is not None and w.isRunning():
+                return True
+        return False
+
+    def _autolabel_concepts(self, selected_only: bool):
+        """(concepts, cat_ids) for an autolabel run; None (+ a status
+        message) when there is nothing to prompt with."""
+        if selected_only:
+            cat_id = self.side.get_preselected_cat_id()
+            if cat_id is None or cat_id not in self.coco.cat_map:
+                self.statusBar().showMessage(
+                    "Preselect a category in the list first", 3000)
+                return None
+            return [self.coco.cat_map[cat_id]], [cat_id]
+        if not self.coco.categories:
+            self.statusBar().showMessage(
+                "No categories yet — add one in the side panel first", 3000)
+            return None
+        cats = sorted(self.coco.categories, key=lambda c: c["id"])
+        return [c["name"] for c in cats], [c["id"] for c in cats]
+
+    def _on_autolabel_frame(self) -> None:
+        """Autolabel the current frame with every category as a text prompt."""
+        self._autolabel_current_frame(selected_only=False)
+
+    def _on_autolabel_cat(self) -> None:
+        """Autolabel the current frame, preselected category only."""
+        self._autolabel_current_frame(selected_only=True)
+
+    def _autolabel_current_frame(self, selected_only: bool) -> None:
+        if not _SAM3_AVAILABLE:
+            QMessageBox.warning(self, "SAM3 unavailable",
+                                "SAM3 (ultralytics) is not importable.")
+            return
+        if self._current_image_id is None:
+            return
+        pair = self._autolabel_concepts(selected_only)
+        if pair is None:
+            return
+        concepts, cat_ids = pair
+        img_path = self._write_tmp_image()
+        if img_path is None:
+            self._set_sam3_status("autolabel failed — no image for frame")
+            return
+        self._start_autolabel_worker(img_path, concepts, cat_ids,
+                                     self._current_image_id)
+
+    def _start_autolabel_worker(self, img_path: str, concepts: list,
+                                cat_ids: list, image_id: int) -> None:
+        if self._sam3_busy():
+            # Busy — queue the job; it starts when the current run ends.
+            self._sam3_queue.append({
+                "kind": "autolabel",
+                "img_path": img_path,
+                "concepts": concepts,
+                "cat_ids": cat_ids,
+                "image_id": image_id,
+            })
+            self._refresh_sam3_status()
+            self.statusBar().showMessage(
+                f"SAM3 busy — autolabel queued "
+                f"({len(self._sam3_queue)} in queue)", 2500)
+            return
+        self._set_sam3_status(
+            f"autolabel: detecting {len(concepts)} categor"
+            f"{'y' if len(concepts) == 1 else 'ies'}…")
+        self.side.set_sam3_running(True)
+        # Canvas stays enabled: results apply by image_id, so the user can
+        # keep working on other frames while SAM3 runs.
+        self._sam3_autolabel_worker = SAM3AutolabelWorker(
+            image_path=img_path,
+            concepts=concepts,
+            cat_ids=cat_ids,
+            image_id=image_id,
+            model_path=self.sam3_model,
+            device=self.sam3_device,
+            conf=self.sam3_conf,
+            parent=self,
+        )
+        self._sam3_autolabel_worker.finished_signal.connect(
+            self._on_autolabel_finished)
+        self._sam3_autolabel_worker.failed_signal.connect(self._on_sam3_failed)
+        self._sam3_autolabel_worker.start()
+
+    def _apply_autolabel_dets(self, image_id: int,
+                              dets: list) -> Tuple[int, int]:
+        """Turn detections into annotations (boxes + masks, one undo group).
+        Detections duplicating an existing same-category box (IoU > 0.7)
+        are skipped. Returns (added, skipped)."""
+        existing = list(self.coco.anns_for_image(image_id))
+        added = skipped = 0
+        with self.coco.undo_stack.group("autolabel"):
+            for d in dets:
+                cat_id = d.get("cat_id")
+                if cat_id is None:
+                    skipped += 1
+                    continue
+                x1, y1, x2, y2 = d["bbox_xyxy"]
+                w, h = x2 - x1, y2 - y1
+                if w < 2 or h < 2:
+                    skipped += 1
+                    continue
+                dup = any(
+                    a["category_id"] == cat_id and _iou_xyxy(
+                        [x1, y1, x2, y2],
+                        [a["bbox"][0], a["bbox"][1],
+                         a["bbox"][0] + a["bbox"][2],
+                         a["bbox"][1] + a["bbox"][3]]) > 0.7
+                    for a in existing)
+                if dup:
+                    skipped += 1
+                    continue
+                ann_id = self.coco.add_box(image_id, x1, y1, w, h, cat_id)
+                if d.get("mask") is not None:
+                    self.coco.set_mask(ann_id, d["mask"])
+                existing.append(self.coco.get_box(ann_id))
+                added += 1
+        return added, skipped
+
+    def _on_autolabel_finished(self, image_id: int, dets: list) -> None:
+        self.side.set_sam3_running(False)
+        added, skipped = self._apply_autolabel_dets(image_id, dets)
+        self._set_sam3_status(
+            f"autolabel: +{added} box(es)"
+            + (f", {skipped} skipped" if skipped else ""))
+        if image_id == self._current_image_id:
+            self._refresh_boxes()
+        self.coco.save(is_final=False)
+        QTimer.singleShot(0, self._start_next_queued_sam3)
+
+    def _on_autolabel_all(self) -> None:
+        """Background text-prompt autolabel over every frame."""
+        if not _SAM3_AVAILABLE:
+            QMessageBox.warning(self, "SAM3 unavailable",
+                                "SAM3 (ultralytics) is not importable.")
+            return
+        n = len(self.frame_index)
+        if n == 0:
+            return
+        if self._sam3_busy():
+            self.statusBar().showMessage("SAM3 already running", 2500)
+            return
+        pair = self._autolabel_concepts(False)
+        if pair is None:
+            return
+        concepts, cat_ids = pair
+        ret = QMessageBox.question(
+            self, "Autolabel all frames with SAM3?",
+            f"Run text-prompt detection on all {n} frame(s) for "
+            f"{len(concepts)} categor{'y' if len(concepts) == 1 else 'ies'} "
+            f"({', '.join(concepts[:5])}{'…' if len(concepts) > 5 else ''})?\n"
+            f"Runs in the background (device: {self.sam3_device}, CPU "
+            f"fallback on CUDA OOM). Detections become editable boxes with "
+            f"masks; duplicates of existing boxes are skipped. "
+            f"You can cancel anytime.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        tmp_dir = str(Path(self.coco.output_json).parent / "_tmp_sam3_imgs")
+        self._batch_frames_done = 0
+        self._set_sam3_status(f"autolabel all: 0/{n} frames…")
+        self.side.set_sam3_running(True)
+        self._sam3_autolabel_batch_worker = SAM3AutolabelBatchWorker(
+            self.frame_index, list(range(n)), concepts, cat_ids, tmp_dir,
+            model_path=self.sam3_model,
+            device=self.sam3_device,
+            conf=self.sam3_conf,
+            parent=self,
+        )
+        self._sam3_autolabel_batch_worker.frame_done_signal.connect(
+            self._on_autolabel_batch_frame_done)
+        self._sam3_autolabel_batch_worker.progress_signal.connect(
+            lambda d, t: self._set_sam3_status(
+                f"autolabel all: {d}/{t} frames…"))
+        self._sam3_autolabel_batch_worker.finished_signal.connect(
+            self._on_autolabel_batch_finished)
+        self._sam3_autolabel_batch_worker.failed_signal.connect(
+            self._on_sam3_failed)
+        self._sam3_autolabel_batch_worker.cancelled_signal.connect(
+            self._on_batch_cancelled)
+        self._sam3_autolabel_batch_worker.start()
+
+    def _on_autolabel_batch_frame_done(self, frame_idx: int,
+                                       dets: list) -> None:
+        """Add one frame's autolabel detections as boxes+masks."""
+        if dets:
+            frame = self.frame_index.frame_at(frame_idx)
+            mask0 = next((d["mask"] for d in dets
+                          if d.get("mask") is not None), None)
+            if mask0 is not None:
+                h, w = mask0.shape
+            else:
+                arr = self.frame_index.decode_image(frame_idx)
+                h, w = arr.shape[:2]
+            image_id = self.coco.ensure_image(frame, w, h)
+            self._apply_autolabel_dets(image_id, dets)
+            if frame_idx == self._current_idx:
+                self._refresh_boxes()
+        self._batch_frames_done += 1
+        # Checkpoint every 10 frames so boxes survive a crash.
+        if self._batch_frames_done % 10 == 0:
+            self.coco.save(is_final=False)
+
+    def _on_autolabel_batch_finished(self, total_dets: int) -> None:
+        self.side.set_sam3_running(False)
+        self._set_sam3_status(f"autolabel all: done — {total_dets} box(es)")
+        self.coco.save(is_final=False)
+        self._refresh_boxes()
+        self.statusBar().showMessage(
+            f"Autolabel finished: {total_dets} boxes added", 4000)
+        QTimer.singleShot(0, self._start_next_queued_sam3)
+
     def _on_resegment_selected(self) -> None:
         """Re-run SAM3 on the selected bbox(es) (R key / button).
 
@@ -4348,9 +4621,7 @@ class ReviewWindow(QMainWindow):
 
     def _start_sam3_worker(self, img_path: str, bboxes_xyxy: list,
                            concepts: list, ann_ids: list) -> None:
-        if (self._sam3_worker is not None and self._sam3_worker.isRunning()) or \
-           (self._sam3_batch_worker is not None
-                and self._sam3_batch_worker.isRunning()):
+        if self._sam3_busy():
             # Busy — queue the job; it starts when the current run ends.
             self._sam3_queue.append({
                 "img_path": img_path,
@@ -4399,6 +4670,10 @@ class ReviewWindow(QMainWindow):
         if (self._sam3_batch_worker is not None
                 and self._sam3_batch_worker.isRunning()):
             self._sam3_batch_worker.cancel()
+            cancelled_any = True
+        if (self._sam3_autolabel_batch_worker is not None
+                and self._sam3_autolabel_batch_worker.isRunning()):
+            self._sam3_autolabel_batch_worker.cancel()
             cancelled_any = True
         if cancelled_any:
             self._set_sam3_status("cancelling…")

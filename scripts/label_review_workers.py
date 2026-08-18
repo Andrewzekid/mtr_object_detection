@@ -312,6 +312,193 @@ class SAM3BatchWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# SAM3 autolabel: text-prompt detection (no user-drawn boxes needed).
+# Uses SAM3SemanticPredictor directly — the high-level ultralytics SAM API
+# loads sam3.pt as the *interactive* (bbox-exemplar-only) model and drops
+# text prompts, so we drive the semantic predictor ourselves.
+# ---------------------------------------------------------------------------
+
+def _default_sam3_weights() -> str:
+    return str(Path(__file__).resolve().parent.parent
+               / "core" / "sam3" / "models" / "sam3-model" / "sam3.pt")
+
+
+def _load_sam3_semantic(model_path: Optional[str], device: str,
+                        conf: float):
+    """Build a SAM3SemanticPredictor ready for text-prompt detection."""
+    from ultralytics.models.sam.predict import SAM3SemanticPredictor
+    pred = SAM3SemanticPredictor(overrides=dict(
+        model=model_path or _default_sam3_weights(),
+        conf=conf, device=device, task="segment", mode="predict",
+        save=False, verbose=False))
+    pred.setup_model(model=None, verbose=False)
+    return pred
+
+
+def _autolabel_frame(pred, image_path: str,
+                     concepts: List[str]) -> List[Dict[str, Any]]:
+    """Run one text-prompt SAM3 detection on `image_path`.
+
+    concepts: category names, one text prompt each (a single predict call
+    covers all of them). Returns a list of detections:
+        {label, bbox_xyxy, mask (HxW bool at original resolution), confidence}
+    """
+    import numpy as np
+    pred.set_prompts({"text": list(concepts)})
+    results = pred(source=str(image_path))
+    r = results[0] if isinstance(results, list) else results
+    dets: List[Dict[str, Any]] = []
+    boxes = getattr(r, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return dets
+    xyxy = boxes.xyxy.cpu().numpy()
+    cls = (boxes.cls.cpu().numpy().astype(int)
+           if hasattr(boxes, "cls") else np.zeros(len(xyxy), int))
+    confs = (boxes.conf.cpu().numpy()
+             if hasattr(boxes, "conf") else np.ones(len(xyxy)))
+    masks = getattr(r, "masks", None)
+    mask_data = masks.data.cpu().numpy() if masks is not None else None
+    for i in range(len(xyxy)):
+        mask = None
+        if mask_data is not None and i < len(mask_data):
+            mask = mask_data[i].astype(bool)  # already at orig_shape
+        label = concepts[int(cls[i])] if int(cls[i]) < len(concepts) \
+            else "object"
+        dets.append({
+            "label": label,
+            "bbox_xyxy": [float(v) for v in xyxy[i]],
+            "mask": mask,
+            "confidence": float(confs[i]),
+        })
+    return dets
+
+
+def _autolabel_with_fallback(image_path: str, concepts: List[str],
+                             model_path: Optional[str], device: str,
+                             conf: float
+                             ) -> Tuple[List[Dict[str, Any]], str]:
+    """_autolabel_frame with model load + CUDA-OOM→CPU retry.
+    Returns (detections, device_in_use)."""
+    pred = _load_sam3_semantic(model_path, device, conf)
+    try:
+        return _autolabel_frame(pred, image_path, concepts), device
+    except Exception as e:
+        if device != "cpu" and "out of memory" in str(e).lower():
+            print("⚠️ SAM3 CUDA OOM — retrying autolabel on CPU")
+            pred = _load_sam3_semantic(model_path, "cpu", conf)
+            return _autolabel_frame(pred, image_path, concepts), "cpu"
+        raise
+
+
+class SAM3AutolabelWorker(QThread):
+    """Single-frame text-prompt autolabel ("Autolabel frame" buttons).
+
+    Emits finished_signal(image_id, detections) — the image_id travels with
+    the job so results apply to the right frame even if the user navigated
+    while SAM3 ran. No cooperative cancel: one predict call per run.
+    """
+
+    finished_signal = pyqtSignal(int, list)  # image_id, detections
+    failed_signal = pyqtSignal(str)
+
+    def __init__(self, image_path: str, concepts: List[str],
+                 cat_ids: List[int], image_id: int,
+                 model_path: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.concepts = concepts
+        self.cat_ids = cat_ids
+        self.image_id = image_id
+        self.model_path = model_path
+        self.device = device
+        self.conf = conf
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _SAM3_AVAILABLE:
+            self.failed_signal.emit("SAM3 is not installed.")
+            return
+        try:
+            dets, _dev = _autolabel_with_fallback(
+                self.image_path, self.concepts, self.model_path,
+                self.device, self.conf)
+        except Exception as e:
+            self.failed_signal.emit(str(e))
+            return
+        cat_by_name = dict(zip(self.concepts, self.cat_ids))
+        for d in dets:
+            d["cat_id"] = cat_by_name.get(d["label"])
+        self.finished_signal.emit(self.image_id, dets)
+
+
+class SAM3AutolabelBatchWorker(QThread):
+    """Text-prompt autolabel over many frames ("Autolabel ALL frames").
+
+    The predictor is loaded once and reused across frames. Emits
+    frame_done_signal(frame_idx, detections) after each frame so the UI can
+    add boxes incrementally. Cancel is cooperative (checked between frames).
+    """
+
+    frame_done_signal = pyqtSignal(int, list)  # frame_idx, detections
+    progress_signal = pyqtSignal(int, int)     # frames done, total frames
+    finished_signal = pyqtSignal(int)          # total detections
+    failed_signal = pyqtSignal(str)
+    cancelled_signal = pyqtSignal()
+
+    def __init__(self, frame_index, frame_idxs: List[int],
+                 concepts: List[str], cat_ids: List[int], tmp_dir: str,
+                 model_path: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.frame_index = frame_index
+        self.frame_idxs = frame_idxs
+        self.concepts = concepts
+        self.cat_ids = cat_ids
+        self.tmp_dir = tmp_dir
+        self.model_path = model_path
+        self.device = device
+        self.conf = conf
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Ask the worker to stop after the current frame."""
+        self._cancel_requested = True
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _SAM3_AVAILABLE:
+            self.failed_signal.emit("SAM3 is not installed.")
+            return
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        cat_by_name = dict(zip(self.concepts, self.cat_ids))
+        device = self.device
+        total_dets = 0
+        for n, frame_idx in enumerate(self.frame_idxs):
+            if self._cancel_requested:
+                self.cancelled_signal.emit()
+                return
+            frame = self.frame_index.frame_at(frame_idx)
+            img_path = frame.get("file_path")
+            if not img_path or not os.path.exists(img_path):
+                arr = self.frame_index.decode_image(frame_idx)
+                img_path = os.path.join(self.tmp_dir,
+                                        f"autolabel_{frame_idx:06d}.png")
+                Image.fromarray(arr).save(img_path)
+            try:
+                dets, device = _autolabel_with_fallback(
+                    img_path, self.concepts, self.model_path, device,
+                    self.conf)
+            except Exception as e:
+                self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
+                return
+            for d in dets:
+                d["cat_id"] = cat_by_name.get(d["label"])
+            total_dets += len(dets)
+            self.frame_done_signal.emit(frame_idx, dets)
+            self.progress_signal.emit(n + 1, len(self.frame_idxs))
+        self.finished_signal.emit(total_dets)
+
+
+# ---------------------------------------------------------------------------
 # 13_interpolate_tracks.py engine loader + interpolation worker
 # ---------------------------------------------------------------------------
 
