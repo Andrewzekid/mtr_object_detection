@@ -499,6 +499,139 @@ class SAM3AutolabelBatchWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# SAM3 track propagation: seed with one box, re-detect frame-by-frame.
+# ---------------------------------------------------------------------------
+
+def _propagate_step(image_path: str, prev_bbox_xyxy: List[float],
+                    concept: str, model_path: Optional[str], device: str,
+                    conf: float) -> Tuple[Optional[Dict[str, Any]], str]:
+    """One propagation step: re-detect the tracked object on a new frame.
+
+    Prompts SAM3 with the previous frame's box as the exemplar and picks
+    the detection with the highest IoU to it (the exemplar segments *all*
+    similar objects, so the nearest one is the tracked instance).
+
+    Returns (det, device_in_use):
+      det = {"bbox_xyxy", "mask", "confidence"} or None when nothing was
+      found (object lost — the caller stops the chain). On CUDA OOM the
+      call is retried on CPU and "cpu" is returned.
+    """
+    def _run(dev: str):
+        return run_sam3(image_path=image_path,
+                        bboxes=[list(prev_bbox_xyxy)],
+                        concepts=[concept],
+                        model_path=model_path, device=dev, conf=conf)
+
+    try:
+        res = _run(device)
+    except Exception as e:
+        if device != "cpu" and "out of memory" in str(e).lower():
+            print("⚠️ SAM3 CUDA OOM — retrying propagation on CPU")
+            device = "cpu"
+            res = _run(device)
+        else:
+            raise
+    if not res.get("success"):
+        raise RuntimeError(res.get("error", "SAM3 failed"))
+    dets = res.get("detections", []) or []
+    masks = res.get("masks", []) or []
+    if not dets:
+        return None, device
+    best_i, best_iou = -1, -1.0
+    for i, d in enumerate(dets):
+        iou = _iou_xyxy(prev_bbox_xyxy, d.get("bbox", [0, 0, 0, 0]))
+        if iou > best_iou:
+            best_iou, best_i = iou, i
+    d = dets[best_i]
+    return {
+        "bbox_xyxy": d["bbox"],
+        "mask": masks[best_i] if best_i < len(masks) else None,
+        "confidence": float(d.get("confidence", 1.0)),
+    }, device
+
+
+class SAM3PropagateWorker(QThread):
+    """Propagate one seeded box forward across frames ("Propagate →").
+
+    Starts from `seed_bbox_xyxy` on `start_frame_idx`; for each following
+    frame the previous frame's detected box is the SAM3 exemplar prompt.
+    Emits frame_done_signal(frame_idx, det_or_None) per frame — the det is
+    emitted even when the UI will skip the frame (e.g. the track id already
+    exists there), because the chain needs it. Stops early when a frame
+    yields no detection (object lost). Cancel is cooperative, checked
+    between frames.
+    """
+
+    frame_done_signal = pyqtSignal(int, object)  # frame_idx, det or None
+    progress_signal = pyqtSignal(int, int)       # frames done, total frames
+    finished_signal = pyqtSignal(int, int)       # boxes found, lost-at idx
+                                                 # (-1 = ran to the end)
+    failed_signal = pyqtSignal(str)
+    cancelled_signal = pyqtSignal()
+
+    def __init__(self, frame_index, start_frame_idx: int,
+                 seed_bbox_xyxy: List[float], concept: str, tmp_dir: str,
+                 model_path: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.frame_index = frame_index
+        self.start_frame_idx = start_frame_idx
+        self.seed_bbox_xyxy = seed_bbox_xyxy
+        self.concept = concept
+        self.tmp_dir = tmp_dir
+        self.model_path = model_path
+        self.device = device
+        self.conf = conf
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Ask the worker to stop after the current frame."""
+        self._cancel_requested = True
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _SAM3_AVAILABLE:
+            self.failed_signal.emit("SAM3 is not installed.")
+            return
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        n_frames = len(self.frame_index)
+        total = n_frames - self.start_frame_idx - 1
+        if total <= 0:
+            self.finished_signal.emit(0, -1)
+            return
+        prev = list(self.seed_bbox_xyxy)
+        device = self.device
+        n_found = 0
+        for step, frame_idx in enumerate(
+                range(self.start_frame_idx + 1, n_frames)):
+            if self._cancel_requested:
+                self.cancelled_signal.emit()
+                return
+            frame = self.frame_index.frame_at(frame_idx)
+            img_path = frame.get("file_path")
+            if not img_path or not os.path.exists(img_path):
+                arr = self.frame_index.decode_image(frame_idx)
+                img_path = os.path.join(self.tmp_dir,
+                                        f"propagate_{frame_idx:06d}.png")
+                Image.fromarray(arr).save(img_path)
+            try:
+                det, device = _propagate_step(
+                    img_path, prev, self.concept, self.model_path, device,
+                    self.conf)
+            except Exception as e:
+                self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
+                return
+            self.frame_done_signal.emit(frame_idx, det)
+            self.progress_signal.emit(step + 1, total)
+            if det is None:
+                # Object lost — stop the chain here.
+                self.finished_signal.emit(n_found, frame_idx)
+                return
+            prev = det["bbox_xyxy"]
+            n_found += 1
+        self.finished_signal.emit(n_found, -1)
+
+
+# ---------------------------------------------------------------------------
 # 13_interpolate_tracks.py engine loader + interpolation worker
 # ---------------------------------------------------------------------------
 

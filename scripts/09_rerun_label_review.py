@@ -90,6 +90,19 @@ frame autolabels join the same FIFO queue as box segmentation; the
 all-frames variant is a background batch with progress in the status line
 and checkpoint saves every 10 frames.
 
+SAM3 track propagation
+----------------------
+With exactly one box selected, "Propagate →" re-detects that object on
+every following frame: each frame's SAM3 exemplar prompt is the previous
+frame's detected box (chained), so the object keeps the seed's track id
+and category. The chain stops automatically at the first frame where SAM3
+finds nothing (object lost); frames that already have a box with that
+track id are skipped. Propagated boxes are ordinary editable boxes with
+masks plus ``propagated: true`` / ``confidence`` provenance fields; the
+whole run is one Ctrl+Z step, and edits you make while it runs stay
+separate undo entries. Propagation shares the SAM3 queue and the Cancel
+button.
+
 Categories start empty; they are created from the side panel's Add
 field, come back with a resumed labels file, or are seeded from a COCO
 json via ``--json``.
@@ -320,7 +333,7 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 from label_review_workers import (  # noqa: E402
     SAM3Worker, SAM3BatchWorker, InterpBatchWorker,
-    SAM3AutolabelWorker, SAM3AutolabelBatchWorker,
+    SAM3AutolabelWorker, SAM3AutolabelBatchWorker, SAM3PropagateWorker,
     _get_interp13, _SAM3_AVAILABLE, run_sam3, _iou_xyxy,
 )
 
@@ -546,9 +559,14 @@ class UndoStack:
         # When not None, push() collects entries here instead of pushing
         # them directly; group() flushes the batch as one composite entry.
         self._batch: Optional[List[Tuple[str, Any, Any]]] = None
+        # While > 0, push() drops entries (see mute()).
+        self._muted: int = 0
 
     def push(self, description: str, undo: Any, redo: Any) -> None:
         """Push an (undo, redo) pair. Clears the redo stack."""
+        if self._muted:
+            self._redo.clear()
+            return
         if self._batch is not None:
             self._batch.append((description, undo, redo))
             self._redo.clear()
@@ -557,6 +575,19 @@ class UndoStack:
         if len(self._undo) > self.MAX_DEPTH:
             self._undo.pop(0)
         self._redo.clear()
+
+    @contextmanager
+    def mute(self):
+        """Drop pushes inside the block — for mutations whose undo entries
+        the caller will re-push itself as one composite (e.g. a background
+        propagation run whose per-frame pushes must not swallow unrelated
+        user edits into an open batch). Redo is still cleared: a mutation
+        happened."""
+        self._muted += 1
+        try:
+            yield
+        finally:
+            self._muted -= 1
 
     @contextmanager
     def group(self, description: str):
@@ -1930,6 +1961,7 @@ class SidePanel(QWidget):
     autolabel_frame_clicked = pyqtSignal()     # "Autolabel frame" (all cats)
     autolabel_cat_clicked = pyqtSignal()       # "Autolabel (sel cat)"
     autolabel_all_clicked = pyqtSignal()       # "Autolabel ALL frames"
+    propagate_clicked = pyqtSignal()           # "Propagate →" button
     toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
     interpolate_clicked = pyqtSignal()       # "Interpolate" button (I)
     cancel_interp_clicked = pyqtSignal()     # "Stop" button (running interp)
@@ -2064,6 +2096,8 @@ class SidePanel(QWidget):
         jump_row.addStretch(1)
         layout.addLayout(jump_row)
 
+        layout.addSpacing(12)
+
         # Interpolation controls.
         interp_row = QHBoxLayout()
         self.btn_keyframe = QPushButton("★ Keyframe")
@@ -2094,6 +2128,11 @@ class SidePanel(QWidget):
         layout.addWidget(self.interp_status)
 
         # SAM3 controls
+        self.sam3_header = QLabel("SAM3 segmentation:")
+        f = self.sam3_header.font()
+        f.setBold(True)
+        self.sam3_header.setFont(f)
+        layout.addWidget(self.sam3_header)
         sam_layout = QHBoxLayout()
         self.btn_run_sam3 = QPushButton("Run SAM3 (all)")
         self.btn_run_sam3.setToolTip("Run SAM3 segmentation on every bbox on the current frame.")
@@ -2117,6 +2156,24 @@ class SidePanel(QWidget):
             "mask yet, across ALL frames. Cancel anytime.")
         self.btn_sam3_all_frames.clicked.connect(self.sam3_all_frames_clicked.emit)
         layout.addWidget(self.btn_sam3_all_frames)
+
+        self.btn_propagate = QPushButton("Propagate →")
+        self.btn_propagate.setToolTip(
+            "Propagate the selected box's track forward: SAM3 re-detects "
+            "the object on each following frame (chained from the previous "
+            "frame's box), keeping the same track id. Stops when the "
+            "object is lost. Select exactly one box first.")
+        self.btn_propagate.setEnabled(False)  # needs a single selected box
+        self.btn_propagate.clicked.connect(self.propagate_clicked.emit)
+        layout.addWidget(self.btn_propagate)
+
+        layout.addSpacing(8)
+
+        self.autolabel_header = QLabel("SAM3 Autolabel:")
+        f = self.autolabel_header.font()
+        f.setBold(True)
+        self.autolabel_header.setFont(f)
+        layout.addWidget(self.autolabel_header)
 
         # Text-prompt autolabel: SAM3 finds objects by category name, no
         # drawn boxes needed; detections become editable boxes with masks.
@@ -2395,10 +2452,11 @@ class SidePanel(QWidget):
         "interpolate": ["btn_interpolate", "btn_cancel_interp",
                         "interp_status"],
         "jump": ["jump_buttons"],
-        "sam3_run": ["btn_run_sam3", "btn_reseg", "btn_cancel_sam3"],
+        "sam3_run": ["sam3_header", "btn_run_sam3", "btn_reseg",
+                     "btn_cancel_sam3", "btn_propagate"],
         "sam3_all_frames": ["btn_sam3_all_frames"],
-        "autolabel": ["btn_autolabel_frame", "btn_autolabel_cat",
-                      "btn_autolabel_all"],
+        "autolabel": ["autolabel_header", "btn_autolabel_frame",
+                      "btn_autolabel_cat", "btn_autolabel_all"],
         "masks": ["btn_masks", "opacity_slider", "opacity_value_label"],
         "play": ["btn_play", "combo_speed"],
     }
@@ -2823,6 +2881,11 @@ class ReviewWindow(QMainWindow):
         self._sam3_batch_worker: Optional[SAM3BatchWorker] = None
         self._sam3_autolabel_worker: Optional[SAM3AutolabelWorker] = None
         self._sam3_autolabel_batch_worker: Optional[SAM3AutolabelBatchWorker] = None
+        self._sam3_propagate_worker: Optional[SAM3PropagateWorker] = None
+        # Meta for the running propagate job (track id, category, count).
+        self._propagate_meta: Dict[str, Any] = {
+            "track_id": -1, "cat_id": 0, "added": 0, "ann_ids": [],
+            "anns": []}
         # FIFO of pending single-frame SAM3 jobs (img_path, bboxes_xyxy,
         # concepts, ann_ids). Filled when a run is requested while another
         # is in flight; drained when the current worker finishes/cancels.
@@ -2911,6 +2974,8 @@ class ReviewWindow(QMainWindow):
         self.canvas.fit_view.connect(lambda: self.canvas._fit_to_view())
         self.canvas.selection_changed.connect(self.side.highlight_box_row)
         self.canvas.selection_changed.connect(lambda _i: self._prefill_recat())
+        self.canvas.selection_changed.connect(
+            lambda _i: self._update_propagate_button())
         self.canvas.zoom_to_selected.connect(self._on_zoom_to_selected)
         self.canvas.next_unlabeled.connect(self._on_next_unlabeled)
         self.side.cat_clicked.connect(self._on_side_cat_clicked)
@@ -2931,6 +2996,7 @@ class ReviewWindow(QMainWindow):
         self.side.autolabel_frame_clicked.connect(self._on_autolabel_frame)
         self.side.autolabel_cat_clicked.connect(self._on_autolabel_cat)
         self.side.autolabel_all_clicked.connect(self._on_autolabel_all)
+        self.side.propagate_clicked.connect(self._on_propagate_track)
         self.side.toggle_keyframe_clicked.connect(self._on_toggle_keyframe)
         self.side.interpolate_clicked.connect(self._on_interpolate)
         self.side.cancel_interp_clicked.connect(self._on_cancel_interp)
@@ -3957,6 +4023,7 @@ class ReviewWindow(QMainWindow):
         self.canvas.set_boxes(boxes)
         self.side.set_boxes(boxes)
         self.side.highlight_box_row(self.canvas._selected_idx)
+        self._update_propagate_button()
         self.side.set_info(self._current_idx, len(self.frame_index),
                            self.frame_index.frame_at(self._current_idx)["timestamp_ns"],
                            len(boxes))
@@ -4181,6 +4248,10 @@ class ReviewWindow(QMainWindow):
         if job.get("kind") == "autolabel":
             self._start_autolabel_worker(job["img_path"], job["concepts"],
                                          job["cat_ids"], job["image_id"])
+        elif job.get("kind") == "propagate":
+            self._start_propagate_worker(
+                job["start_frame_idx"], job["seed_bbox_xyxy"],
+                job["concept"], job["track_id"], job["cat_id"])
         else:
             self._start_sam3_worker(job["img_path"], job["bboxes_xyxy"],
                                     job["concepts"], job["ann_ids"])
@@ -4368,10 +4439,12 @@ class ReviewWindow(QMainWindow):
     # ------------------- SAM3 autolabel (text prompts) ------------------- #
 
     def _sam3_busy(self) -> bool:
-        """Any SAM3 worker (box segmentation or autolabel) running?"""
+        """Any SAM3 worker (box segmentation, autolabel, propagate)
+        running?"""
         for w in (self._sam3_worker, self._sam3_batch_worker,
                   self._sam3_autolabel_worker,
-                  self._sam3_autolabel_batch_worker):
+                  self._sam3_autolabel_batch_worker,
+                  self._sam3_propagate_worker):
             if w is not None and w.isRunning():
                 return True
         return False
@@ -4585,6 +4658,196 @@ class ReviewWindow(QMainWindow):
             f"Autolabel finished: {total_dets} boxes added", 4000)
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
+    # ------------------- SAM3 track propagation ------------------------- #
+
+    def _selected_single_box(self) -> Optional[Dict[str, Any]]:
+        """The canvas box dict when exactly one box is selected, else None."""
+        sel = {i for i in self.canvas._multi_selected
+               if 0 <= i < len(self.canvas._boxes)}
+        if not sel and 0 <= self.canvas._selected_idx < len(self.canvas._boxes):
+            sel = {self.canvas._selected_idx}
+        if len(sel) != 1:
+            return None
+        return self.canvas._boxes[next(iter(sel))]
+
+    def _update_propagate_button(self) -> None:
+        """Propagate needs exactly one selected box on a non-last frame."""
+        ok = (self._selected_single_box() is not None
+              and self._current_idx < len(self.frame_index) - 1)
+        self.side.btn_propagate.setEnabled(ok)
+
+    def _on_propagate_track(self) -> None:
+        """Seed SAM3 propagation from the selected box (Propagate →)."""
+        if not _SAM3_AVAILABLE:
+            QMessageBox.warning(self, "SAM3 unavailable",
+                                "SAM3 (ultralytics) is not importable.")
+            return
+        box = self._selected_single_box()
+        if box is None:
+            self.statusBar().showMessage(
+                "Select exactly one box first, then Propagate →", 3000)
+            return
+        n = len(self.frame_index)
+        if self._current_idx >= n - 1:
+            self.statusBar().showMessage(
+                "Seed is on the last frame — nothing to propagate to", 3000)
+            return
+        ann_id = box["id"]
+        tid = box.get("track_id")
+        if tid is None:
+            # Seed without a track id: assign a fresh one first (undoable).
+            tid = self.coco._fresh_track_id()
+            self.coco.set_track_id(ann_id, tid)
+            box["track_id"] = tid
+        cat_id = box.get("cat_id", 0)
+        concept = self.coco.cat_map.get(cat_id, "object")
+        x, y, w, h = box["bbox"]
+        ret = QMessageBox.question(
+            self, "Propagate track forward?",
+            f"Propagate T{tid} ({concept}) from frame "
+            f"{self._current_idx + 1} to the end ({n - self._current_idx - 1} "
+            f"frame(s))?\n\nSAM3 re-detects the object frame-by-frame, "
+            f"chained from the previous frame's box. It stops automatically "
+            f"when the object is lost. Frames that already have a T{tid} "
+            f"box are skipped. Runs in the background (device: "
+            f"{self.sam3_device}); Cancel anytime. One Ctrl+Z undoes the "
+            f"whole run.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self._start_propagate_worker(
+            self._current_idx, [x, y, x + w, y + h], concept, tid, cat_id)
+
+    def _start_propagate_worker(self, start_frame_idx: int,
+                                seed_bbox_xyxy: list, concept: str,
+                                track_id: int, cat_id: int) -> None:
+        if self._sam3_busy():
+            self._sam3_queue.append({
+                "kind": "propagate",
+                "start_frame_idx": start_frame_idx,
+                "seed_bbox_xyxy": seed_bbox_xyxy,
+                "concept": concept,
+                "track_id": track_id,
+                "cat_id": cat_id,
+            })
+            self._refresh_sam3_status()
+            self.statusBar().showMessage(
+                f"SAM3 busy — propagate queued "
+                f"({len(self._sam3_queue)} in queue)", 2500)
+            return
+        total = len(self.frame_index) - start_frame_idx - 1
+        self._set_sam3_status(f"propagate T{track_id}: 0/{total} frames…")
+        self.side.set_sam3_running(True)
+        self._propagate_meta = {"track_id": track_id, "cat_id": cat_id,
+                                "added": 0, "ann_ids": [], "anns": []}
+        tmp_dir = str(Path(self.coco.output_json).parent / "_tmp_sam3_imgs")
+        self._sam3_propagate_worker = SAM3PropagateWorker(
+            self.frame_index, start_frame_idx, seed_bbox_xyxy, concept,
+            tmp_dir,
+            model_path=self.sam3_model,
+            device=self.sam3_device,
+            conf=self.sam3_conf,
+            parent=self,
+        )
+        self._sam3_propagate_worker.frame_done_signal.connect(
+            self._on_propagate_frame_done)
+        self._sam3_propagate_worker.progress_signal.connect(
+            lambda d, t: self._set_sam3_status(
+                f"propagate T{track_id}: {d}/{t} frames…"))
+        self._sam3_propagate_worker.finished_signal.connect(
+            self._on_propagate_finished)
+        self._sam3_propagate_worker.failed_signal.connect(
+            self._on_propagate_failed)
+        self._sam3_propagate_worker.cancelled_signal.connect(
+            self._on_propagate_cancelled)
+        self._sam3_propagate_worker.start()
+
+    def _on_propagate_frame_done(self, frame_idx: int, det) -> None:
+        """Add one propagated box (same track id as the seed), or skip."""
+        meta = self._propagate_meta
+        if det is not None:
+            frame = self.frame_index.frame_at(frame_idx)
+            mask = det.get("mask")
+            if mask is not None:
+                h, w = mask.shape
+            else:
+                arr = self.frame_index.decode_image(frame_idx)
+                h, w = arr.shape[:2]
+            image_id = self.coco.ensure_image(frame, w, h)
+            # Never overwrite a frame that already has this track id.
+            have = any(a.get("track_id") == meta["track_id"]
+                       for a in self.coco.anns_for_image(image_id))
+            if not have:
+                x1, y1, x2, y2 = det["bbox_xyxy"]
+                if x2 - x1 >= 2 and y2 - y1 >= 2:
+                    # Muted: per-frame pushes are dropped; _end_propagate
+                    # re-pushes the whole run as ONE undo entry, so user
+                    # edits made while the run is in flight stay separate.
+                    with self.coco.undo_stack.mute():
+                        ann_id = self.coco.add_box(image_id, x1, y1,
+                                                   x2 - x1, y2 - y1,
+                                                   meta["cat_id"])
+                        self.coco.set_track_id(ann_id, meta["track_id"])
+                        ann = self.coco.get_box(ann_id)
+                        if ann is not None:
+                            ann["propagated"] = True
+                            ann["confidence"] = float(
+                                det.get("confidence", 1.0))
+                        if mask is not None:
+                            self.coco.set_mask(ann_id, mask)
+                    meta["ann_ids"].append(ann_id)
+                    meta["anns"].append(dict(self.coco.get_box(ann_id)))
+                    meta["added"] += 1
+            if frame_idx == self._current_idx:
+                self._refresh_boxes()
+        # Checkpoint every 10 frames so propagated boxes survive a crash.
+        if (frame_idx + 1) % 10 == 0:
+            self.coco.save(is_final=False)
+
+    def _end_propagate(self, status: str, message: Optional[str]) -> None:
+        """Shared teardown for finished / failed / cancelled."""
+        meta = self._propagate_meta
+        ids = list(meta["ann_ids"])
+        anns = list(meta["anns"])
+        if ids:
+            # One composite undo entry for the whole run (the per-frame
+            # pushes were muted).
+            coco = self.coco
+            coco.undo_stack.push(
+                f"propagate track T{meta['track_id']} ({len(ids)} box(es))",
+                undo=lambda: [coco._undo_remove(i) for i in reversed(ids)],
+                redo=lambda: [coco._redo_add(a) for a in anns])
+        self.side.set_sam3_running(False)
+        self._set_sam3_status(status)
+        self.coco.save(is_final=False)
+        self._refresh_boxes()
+        if message:
+            self.statusBar().showMessage(message, 4000)
+        QTimer.singleShot(0, self._start_next_queued_sam3)
+
+    def _on_propagate_finished(self, n_found: int, lost_at: int) -> None:
+        tid = self._propagate_meta["track_id"]
+        if lost_at >= 0:
+            status = f"propagate T{tid}: lost at frame {lost_at + 1} " \
+                     f"({n_found} box(es) added)"
+        else:
+            status = f"propagate T{tid}: done — {n_found} box(es) added"
+        self._end_propagate(status, status.replace("propagate", "Propagate"))
+
+    def _on_propagate_failed(self, err: str) -> None:
+        tid = self._propagate_meta["track_id"]
+        print(f"❌ SAM3 propagate failed: {err}")
+        self._end_propagate(f"propagate T{tid}: failed — {err}",
+                            f"SAM3 propagate failed: {err}")
+
+    def _on_propagate_cancelled(self) -> None:
+        tid = self._propagate_meta["track_id"]
+        added = self._propagate_meta["added"]
+        self._end_propagate(
+            f"propagate T{tid}: cancelled ({added} box(es) kept)",
+            "Propagate cancelled — boxes already added were kept")
+
     def _on_resegment_selected(self) -> None:
         """Re-run SAM3 on the selected bbox(es) (R key / button).
 
@@ -4674,6 +4937,10 @@ class ReviewWindow(QMainWindow):
         if (self._sam3_autolabel_batch_worker is not None
                 and self._sam3_autolabel_batch_worker.isRunning()):
             self._sam3_autolabel_batch_worker.cancel()
+            cancelled_any = True
+        if (self._sam3_propagate_worker is not None
+                and self._sam3_propagate_worker.isRunning()):
+            self._sam3_propagate_worker.cancel()
             cancelled_any = True
         if cancelled_any:
             self._set_sam3_status("cancelling…")
