@@ -48,7 +48,8 @@ What this does
   format that ``08_click_review_coco.py`` produces, so downstream scripts
   (08b, 13_interpolate_tracks.py, ...) keep working unchanged.
 * Navigate frames with N/B keys, the arrow keys, or the slider; a play
-  button auto-advances at 0.25x–10x speed.
+  button auto-advances at 0.25x–10x speed (1x = 30 fps, index-based —
+  one frame per tick, independent of any timestamps).
 
 SAM3 segmentation
 -----------------
@@ -1923,9 +1924,10 @@ class SidePanel(QWidget):
         play_row.addWidget(self.btn_play)
         play_row.addWidget(QLabel("speed:"))
         self.combo_speed = QtWidgets.QComboBox()
-        # Speeds are ms-per-frame; 1x = 100 ms/frame (what used to be 10x).
-        for label, ms in [("0.25x", 400), ("0.5x", 200), ("1x", 100),
-                          ("2x", 50), ("5x", 20), ("10x", 10)]:
+        # Frame rate is index-based (one frame per tick), not timestamp-
+        # based. 1x = 30 fps (33 ms/frame); the rest scale from there.
+        for label, ms in [("0.25x", 133), ("0.5x", 67), ("1x", 33),
+                          ("2x", 17), ("5x", 7), ("10x", 3)]:
             self.combo_speed.addItem(label, ms)
         self.combo_speed.setCurrentIndex(2)  # 1x default
         self.combo_speed.currentIndexChanged.connect(self._on_speed_changed)
@@ -2692,7 +2694,7 @@ class ReviewWindow(QMainWindow):
         self._play_timer = QTimer(self)
         self._play_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._play_timer.timeout.connect(self._on_play_tick)
-        self._play_interval_ms: int = 100  # 1x default (matches combo_speed)
+        self._play_interval_ms: int = 33  # 1x = 30 fps (matches combo_speed)
         self._playing: bool = False
         # Session-only opt-out from the X discard-all confirmation dialog.
         self._skip_discard_confirm: bool = False
@@ -3093,7 +3095,8 @@ class ReviewWindow(QMainWindow):
         self._playing = True
         self._play_timer.start(self._play_interval_ms)
         self.statusBar().showMessage(
-            f"Playing at {self._play_interval_ms} ms/frame", 2000
+            f"Playing at ~{1000 / self._play_interval_ms:.0f} fps "
+            f"({self._play_interval_ms} ms/frame)", 2000
         )
 
     def _stop_playback(self) -> None:
@@ -3101,6 +3104,9 @@ class ReviewWindow(QMainWindow):
             return
         self._playing = False
         self._play_timer.stop()
+        # Persist progress once per play run instead of per tick.
+        if 0 <= self._current_idx < len(self.frame_index):
+            self.coco.save(is_final=False)
         self.statusBar().showMessage("Paused", 1500)
 
     def _on_play_tick(self) -> None:
@@ -3110,7 +3116,7 @@ class ReviewWindow(QMainWindow):
             self.side.set_playing(False)
             self.statusBar().showMessage("Reached last frame", 3000)
             return
-        self._on_frame_nav(+1)
+        self._on_frame_nav(+1, save=False)
 
     # ----------------------- frame loading ----------------------------- #
 
@@ -3162,7 +3168,7 @@ class ReviewWindow(QMainWindow):
 
     # ----------------------- event handlers ---------------------------- #
 
-    def _on_frame_nav(self, delta: int) -> None:
+    def _on_frame_nav(self, delta: int, save: bool = True) -> None:
         # Forward nav (N) means "this frame is reviewed" — record it.
         if delta > 0:
             self.coco.mark_reviewed(self._current_idx)
@@ -3170,8 +3176,11 @@ class ReviewWindow(QMainWindow):
         if 0 <= new_idx < len(self.frame_index):
             self._current_idx = new_idx
             self._load_current()
-            # Save progress (tmp) on explicit nav — not on autoplay ticks.
-            self.coco.save(is_final=False)
+            if save:
+                # Save progress (tmp) on explicit nav — not on autoplay
+                # ticks (a full-json save per tick capped playback at a
+                # few fps regardless of the speed setting).
+                self.coco.save(is_final=False)
 
     def _on_slider_moved(self, idx: int) -> None:
         if 0 <= idx < len(self.frame_index) and idx != self._current_idx:
