@@ -79,16 +79,20 @@ SAM3 segmentation
 
 SAM3 autolabel (text prompts)
 -----------------------------
-The "Autolabel frame" / "Autolabel (sel cat)" / "Autolabel ALL frames"
-buttons run SAM3's open-vocabulary detection (``SAM3SemanticPredictor``)
-using the category *names* as text prompts — no boxes needed first.
-Detections become regular, editable bboxes with masks attached (duplicates
-of an existing same-category box, IoU > 0.7, are skipped, and the whole
-batch is one undo step). "Autolabel (sel cat)" prompts with the
-preselected category only; the others prompt with every category. Single-
-frame autolabels join the same FIFO queue as box segmentation; the
-all-frames variant is a background batch with progress in the status line
-and checkpoint saves every 10 frames.
+The "Autolabel frame" / "Autolabel ALL frames" buttons (hidden by
+default — unhide via the Config dialog's "Autolabel buttons" checkbox or
+``ui.hide``) run SAM3's open-vocabulary detection
+(``SAM3SemanticPredictor``) using the category *names* as text prompts —
+no boxes needed first. Highlighting categories in the side list
+(Ctrl/Shift multi-select) restricts the run to those categories; with no
+highlight every category is prompted. Detections become regular, editable
+bboxes with masks attached: class-aware NMS (``sam3.autolabel_nms_iou``,
+default 0.7) deduplicates the overlapping masks SAM3 tends to return for
+one object, duplicates of an existing same-category box (IoU > 0.7) are
+skipped, and the whole batch is one undo step. Single-frame autolabels
+join the same FIFO queue as box segmentation; the all-frames variant is a
+background batch with progress in the status line and checkpoint saves
+every 10 frames.
 
 SAM3 track propagation
 ----------------------
@@ -183,14 +187,19 @@ config override the corresponding CLI flags. Example:
                                       // dialog (mismatches are logged)
       },
       "sam3": {
-        "device": "cpu",              // cpu | cuda
+        "device": "auto",             // auto (default): cuda when torch
+                                      // reports CUDA available, else cpu.
+                                      // Or force "cuda" / "cpu".
         "conf": 0.25,
         "auto_segment": false,
-        "min_polygon_area": 100       // drop saved mask contours smaller
+        "min_polygon_area": 100,      // drop saved mask contours smaller
                                       // than this (px²); filters the speck
                                       // polygons SAM3 occasionally spawns.
                                       // The largest contour is always kept.
                                       // 0 keeps every contour.
+        "autolabel_nms_iou": 0.7      // class-aware NMS on autolabel
+                                      // detections (dedup overlapping masks
+                                      // of the same category). 1.0 disables.
       },
       "ui": {
         "advanced": false,            // false (default): the interpolation
@@ -205,7 +214,10 @@ config override the corresponding CLI flags. Example:
                                       // sam3_run, sam3_all_frames, autolabel,
                                       // masks, play. Without "advanced",
                                       // keyframe and interpolate are always
-                                      // hidden.
+                                      // hidden. When no config is given,
+                                      // "autolabel" is hidden by default;
+                                      // a config "hide" list is authoritative
+                                      // (omit "autolabel" to show it).
         "mask_opacity": 47            // initial mask overlay opacity (0-100)
       },
       "tracking": {
@@ -317,7 +329,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QSlider,
     QSplitter, QFrame, QSizePolicy, QMessageBox, QCheckBox,
-    QLineEdit, QProgressBar, QFileDialog,
+    QLineEdit, QProgressBar, QFileDialog, QAbstractItemView,
 )
 # QSizePolicy scoped enum alias
 QSizePolicy.Expanding = QSizePolicy.Policy.Expanding  # type: ignore[attr-defined]
@@ -1959,7 +1971,6 @@ class SidePanel(QWidget):
     recat_selected = pyqtSignal(int)     # new cat_id for the selected box
     sam3_all_frames_clicked = pyqtSignal()  # "SAM3 ALL frames" button
     autolabel_frame_clicked = pyqtSignal()     # "Autolabel frame" (all cats)
-    autolabel_cat_clicked = pyqtSignal()       # "Autolabel (sel cat)"
     autolabel_all_clicked = pyqtSignal()       # "Autolabel ALL frames"
     propagate_clicked = pyqtSignal()           # "Propagate →" button
     toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
@@ -1985,6 +1996,11 @@ class SidePanel(QWidget):
         layout.addWidget(self.cat_label)
 
         self.cat_list = QListWidget()
+        # Multi-select (Ctrl/Shift+click) picks the categories an autolabel
+        # run is restricted to; a plain click still preselects the category
+        # for the next drawn box.
+        self.cat_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         layout.addWidget(self.cat_list, 1)
         self.cat_list.itemClicked.connect(self._on_cat_clicked)
         self._rebuild_cat_list()
@@ -2177,24 +2193,22 @@ class SidePanel(QWidget):
 
         # Text-prompt autolabel: SAM3 finds objects by category name, no
         # drawn boxes needed; detections become editable boxes with masks.
-        auto_row = QHBoxLayout()
+        # When categories are highlighted in the list above (Ctrl/Shift),
+        # only those are detected — otherwise every category.
         self.btn_autolabel_frame = QPushButton("Autolabel frame")
         self.btn_autolabel_frame.setToolTip(
-            "SAM3 text-prompt detection on this frame for EVERY category; "
-            "detections are added as editable boxes with masks.")
+            "SAM3 text-prompt detection on this frame; detections are "
+            "added as editable boxes with masks (NMS-deduplicated). "
+            "Prompts with the categories highlighted in the list above, or "
+            "ALL categories when none are highlighted.")
         self.btn_autolabel_frame.clicked.connect(
             self.autolabel_frame_clicked.emit)
-        auto_row.addWidget(self.btn_autolabel_frame)
-        self.btn_autolabel_cat = QPushButton("Autolabel (sel cat)")
-        self.btn_autolabel_cat.setToolTip(
-            "Same, but only for the category preselected in the list above.")
-        self.btn_autolabel_cat.clicked.connect(self.autolabel_cat_clicked.emit)
-        auto_row.addWidget(self.btn_autolabel_cat)
-        layout.addLayout(auto_row)
+        layout.addWidget(self.btn_autolabel_frame)
         self.btn_autolabel_all = QPushButton("Autolabel ALL frames")
         self.btn_autolabel_all.setToolTip(
-            "Background text-prompt autolabel on every frame for every "
-            "category. Cancel anytime.")
+            "Background text-prompt autolabel on every frame, for the "
+            "categories highlighted in the list above (or ALL categories "
+            "when none are highlighted). Cancel anytime.")
         self.btn_autolabel_all.clicked.connect(self.autolabel_all_clicked.emit)
         layout.addWidget(self.btn_autolabel_all)
 
@@ -2340,7 +2354,6 @@ class SidePanel(QWidget):
         self.btn_run_sam3.setEnabled(True)
         self.btn_reseg.setEnabled(True)
         self.btn_autolabel_frame.setEnabled(True)
-        self.btn_autolabel_cat.setEnabled(True)
         self.btn_sam3_all_frames.setEnabled(not running)
         self.btn_autolabel_all.setEnabled(not running)
         self.btn_cancel_sam3.setEnabled(running)
@@ -2436,6 +2449,15 @@ class SidePanel(QWidget):
     def get_preselected_cat_id(self) -> Optional[int]:
         return self._preselected_cat_id
 
+    def get_selected_cat_ids(self) -> List[int]:
+        """All highlighted categories (Ctrl/Shift multi-select), sorted."""
+        ids = []
+        for item in self.cat_list.selectedItems():
+            cid = item.data(Qt.UserRole)
+            if cid is not None:
+                ids.append(int(cid))
+        return sorted(set(ids))
+
     def _rebuild_cat_list(self) -> None:
         self.cat_list.clear()
         for cat in sorted(self.coco.categories, key=lambda c: c["id"]):
@@ -2456,7 +2478,7 @@ class SidePanel(QWidget):
                      "btn_cancel_sam3", "btn_propagate"],
         "sam3_all_frames": ["btn_sam3_all_frames"],
         "autolabel": ["autolabel_header", "btn_autolabel_frame",
-                      "btn_autolabel_cat", "btn_autolabel_all"],
+                      "btn_autolabel_all"],
         "masks": ["btn_masks", "opacity_slider", "opacity_value_label"],
         "play": ["btn_play", "combo_speed"],
     }
@@ -2611,6 +2633,16 @@ class ConfigDialog(QtWidgets.QDialog):
             "produces. The largest contour is always kept;\n"
             "0 keeps every contour.")
         sam3_form.addRow("Min polygon area", self.spin_min_poly_area)
+        self.spin_nms_iou = QtWidgets.QDoubleSpinBox()
+        self.spin_nms_iou.setRange(0.0, 1.0)
+        self.spin_nms_iou.setSingleStep(0.05)
+        self.spin_nms_iou.setDecimals(2)
+        self.spin_nms_iou.setToolTip(
+            "Autolabel NMS: after a text-prompt run, overlapping detections\n"
+            "of the SAME category with IoU above this are deduplicated\n"
+            "(highest confidence kept). SAM3 often returns several masks\n"
+            "for one object. 1.0 disables dedup.")
+        sam3_form.addRow("Autolabel NMS IoU", self.spin_nms_iou)
         body.addWidget(sam3_box)
 
         # --- Mask opacity --------------------------------------------------
@@ -2709,6 +2741,7 @@ class ConfigDialog(QtWidgets.QDialog):
         self.spin_sam3_conf.setValue(win.sam3_conf)
         self.check_auto_segment.setChecked(win.auto_segment)
         self.spin_min_poly_area.setValue(int(win.coco.min_polygon_area))
+        self.spin_nms_iou.setValue(win.sam3_nms_iou)
         self.spin_opacity.setValue(win.side.opacity_slider.value())
         self.check_sticky_ids.setChecked(win.coco.sticky_track_ids)
 
@@ -2734,6 +2767,9 @@ class ConfigDialog(QtWidgets.QDialog):
         if "min_polygon_area" in sam3:
             self.spin_min_poly_area.setValue(
                 max(0, int(sam3["min_polygon_area"])))
+        if "autolabel_nms_iou" in sam3:
+            self.spin_nms_iou.setValue(
+                max(0.0, min(1.0, float(sam3["autolabel_nms_iou"]))))
         ui = cfg.get("ui", {})
         if "advanced" in ui:
             self.check_advanced.setChecked(bool(ui["advanced"]))
@@ -2772,6 +2808,7 @@ class ConfigDialog(QtWidgets.QDialog):
                 "conf": self.spin_sam3_conf.value(),
                 "auto_segment": self.check_auto_segment.isChecked(),
                 "min_polygon_area": self.spin_min_poly_area.value(),
+                "autolabel_nms_iou": self.spin_nms_iou.value(),
             },
             "ui": {
                 "advanced": advanced,
@@ -2850,6 +2887,9 @@ class ReviewWindow(QMainWindow):
         self.sam3_model = sam3_model
         self.sam3_device = sam3_device
         self.sam3_conf = sam3_conf
+        # IoU threshold for class-aware NMS on autolabel detections
+        # (config: sam3.autolabel_nms_iou; 1.0 disables dedup).
+        self.sam3_nms_iou: float = 0.7
         self.auto_segment = auto_segment
         self.interp_flow_method = interp_flow_method
         self.interp_camera_model = interp_camera_model
@@ -2886,6 +2926,11 @@ class ReviewWindow(QMainWindow):
         self._propagate_meta: Dict[str, Any] = {
             "track_id": -1, "cat_id": 0, "added": 0, "ann_ids": [],
             "anns": []}
+        # Bumped on every source switch. Workers capture the value at start
+        # (`_lr_session`); result handlers drop signals from stale sessions
+        # so a job started on the old source can't write masks/boxes into
+        # the new CocoState (whose ids are renumbered from 1).
+        self._session_seq: int = 0
         # FIFO of pending single-frame SAM3 jobs (img_path, bboxes_xyxy,
         # concepts, ann_ids). Filled when a run is requested while another
         # is in flight; drained when the current worker finishes/cancels.
@@ -2994,7 +3039,6 @@ class ReviewWindow(QMainWindow):
         self.side.recat_selected.connect(self._on_recat_selected)
         self.side.sam3_all_frames_clicked.connect(self._on_sam3_all_frames)
         self.side.autolabel_frame_clicked.connect(self._on_autolabel_frame)
-        self.side.autolabel_cat_clicked.connect(self._on_autolabel_cat)
         self.side.autolabel_all_clicked.connect(self._on_autolabel_all)
         self.side.propagate_clicked.connect(self._on_propagate_track)
         self.side.toggle_keyframe_clicked.connect(self._on_toggle_keyframe)
@@ -3179,6 +3223,18 @@ class ReviewWindow(QMainWindow):
         """Shared source-switch: save the current session, swap the frame
         index, and start a fresh COCO session at `out_json`, keeping the
         current category list."""
+        # Invalidate the old session's background work: queued jobs carry
+        # the old CocoState's ann/image ids, which the new state renumbers
+        # from 1 — letting them drain would write masks onto the wrong
+        # boxes. Cancel what's cancellable; anything still running finishes
+        # into the void because the session guard drops its results.
+        self._session_seq += 1
+        self._sam3_queue.clear()
+        for w in (self._sam3_worker, self._sam3_batch_worker,
+                  self._sam3_autolabel_batch_worker,
+                  self._sam3_propagate_worker, self._interp_worker):
+            if w is not None and w.isRunning():
+                w.cancel()
         # Save the current session before switching away from it.
         try:
             self.coco.save(is_final=False)
@@ -3279,6 +3335,9 @@ class ReviewWindow(QMainWindow):
         if "min_polygon_area" in sam3_cfg:
             self.coco.min_polygon_area = max(
                 0.0, float(sam3_cfg["min_polygon_area"]))
+        if "autolabel_nms_iou" in sam3_cfg:
+            self.sam3_nms_iou = max(
+                0.0, min(1.0, float(sam3_cfg["autolabel_nms_iou"])))
         ui_cfg = cfg.get("ui", {})
         if "advanced" in ui_cfg:
             self.advanced_ui = bool(ui_cfg["advanced"])
@@ -4400,10 +4459,13 @@ class ReviewWindow(QMainWindow):
         self._sam3_batch_worker.failed_signal.connect(self._on_sam3_failed)
         self._sam3_batch_worker.cancelled_signal.connect(
             self._on_batch_cancelled)
+        self._sam3_batch_worker._lr_session = self._session_seq
         self._sam3_batch_worker.start()
 
     def _on_batch_frame_done(self, frame_idx: int, results: list) -> None:
         """Apply one frame's masks (grouped as a single undo entry)."""
+        if self._stale_sender():
+            return
         with self.coco.undo_stack.group(f"SAM3 masks on frame {frame_idx + 1}"):
             for r in results:
                 if r.get("ann_id") is not None and r.get("mask") is not None:
@@ -4419,6 +4481,8 @@ class ReviewWindow(QMainWindow):
         self._set_sam3_status(f"all: {done}/{total} frames…")
 
     def _on_batch_finished(self, n_ok: int, n_fail: int) -> None:
+        if self._stale_sender():
+            return
         self.side.set_sam3_running(False)
         self._set_sam3_status(
             f"all: done — {n_ok} mask(s), {n_fail} failed")
@@ -4429,6 +4493,8 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_batch_cancelled(self) -> None:
+        if self._stale_sender():
+            return
         self.side.set_sam3_running(False)
         self._set_sam3_status("all: cancelled")
         self.coco.save(is_final=False)
@@ -4437,6 +4503,16 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     # ------------------- SAM3 autolabel (text prompts) ------------------- #
+
+    def _stale_sender(self) -> bool:
+        """True when the signal's sender worker was started before the last
+        source switch (its ids belong to the old CocoState — drop them).
+        Direct (non-signal) calls have no sender and are never stale, which
+        keeps the offscreen tests calling handlers directly valid."""
+        s = self.sender()
+        return (s is not None
+                and getattr(s, "_lr_session", self._session_seq)
+                != self._session_seq)
 
     def _sam3_busy(self) -> bool:
         """Any SAM3 worker (box segmentation, autolabel, propagate)
@@ -4449,16 +4525,18 @@ class ReviewWindow(QMainWindow):
                 return True
         return False
 
-    def _autolabel_concepts(self, selected_only: bool):
+    def _autolabel_concepts(self):
         """(concepts, cat_ids) for an autolabel run; None (+ a status
-        message) when there is nothing to prompt with."""
-        if selected_only:
-            cat_id = self.side.get_preselected_cat_id()
-            if cat_id is None or cat_id not in self.coco.cat_map:
-                self.statusBar().showMessage(
-                    "Preselect a category in the list first", 3000)
-                return None
-            return [self.coco.cat_map[cat_id]], [cat_id]
+        message) when there is nothing to prompt with.
+
+        Categories highlighted in the side list (Ctrl/Shift multi-select)
+        restrict the run to those; with no highlight every category is
+        prompted."""
+        selected = [cid for cid in self.side.get_selected_cat_ids()
+                    if cid in self.coco.cat_map]
+        if selected:
+            return ([self.coco.cat_map[cid] for cid in selected],
+                    list(selected))
         if not self.coco.categories:
             self.statusBar().showMessage(
                 "No categories yet — add one in the side panel first", 3000)
@@ -4467,21 +4545,14 @@ class ReviewWindow(QMainWindow):
         return [c["name"] for c in cats], [c["id"] for c in cats]
 
     def _on_autolabel_frame(self) -> None:
-        """Autolabel the current frame with every category as a text prompt."""
-        self._autolabel_current_frame(selected_only=False)
-
-    def _on_autolabel_cat(self) -> None:
-        """Autolabel the current frame, preselected category only."""
-        self._autolabel_current_frame(selected_only=True)
-
-    def _autolabel_current_frame(self, selected_only: bool) -> None:
+        """Autolabel the current frame (highlighted categories, or all)."""
         if not _SAM3_AVAILABLE:
             QMessageBox.warning(self, "SAM3 unavailable",
                                 "SAM3 (ultralytics) is not importable.")
             return
         if self._current_image_id is None:
             return
-        pair = self._autolabel_concepts(selected_only)
+        pair = self._autolabel_concepts()
         if pair is None:
             return
         concepts, cat_ids = pair
@@ -4527,21 +4598,38 @@ class ReviewWindow(QMainWindow):
         self._sam3_autolabel_worker.finished_signal.connect(
             self._on_autolabel_finished)
         self._sam3_autolabel_worker.failed_signal.connect(self._on_sam3_failed)
+        self._sam3_autolabel_worker._lr_session = self._session_seq
         self._sam3_autolabel_worker.start()
 
     def _apply_autolabel_dets(self, image_id: int,
                               dets: list) -> Tuple[int, int]:
         """Turn detections into annotations (boxes + masks, one undo group).
-        Detections duplicating an existing same-category box (IoU > 0.7)
-        are skipped. Returns (added, skipped)."""
+
+        Runs class-aware NMS first (SAM3 often returns several overlapping
+        masks for one object — highest confidence wins within a category,
+        IoU > sam3.autolabel_nms_iou). Detections duplicating an existing
+        same-category box (IoU > 0.7) are skipped. Returns (added, skipped).
+        """
+        # Class-aware NMS over the incoming detections.
+        ordered = sorted(
+            (d for d in dets if d.get("cat_id") is not None),
+            key=lambda d: -d.get("confidence", 0.0))
+        kept: list = []
+        for d in ordered:
+            if any(d["cat_id"] == k["cat_id"]
+                   and _iou_xyxy(d["bbox_xyxy"], k["bbox_xyxy"])
+                   > self.sam3_nms_iou
+                   for k in kept):
+                continue
+            kept.append(d)
+        nms_dropped = len(ordered) - len(kept)
+        n_unknown = len(dets) - len(ordered)  # no cat_id — undetectable
         existing = list(self.coco.anns_for_image(image_id))
-        added = skipped = 0
+        added = 0
+        skipped = nms_dropped + n_unknown
         with self.coco.undo_stack.group("autolabel"):
-            for d in dets:
-                cat_id = d.get("cat_id")
-                if cat_id is None:
-                    skipped += 1
-                    continue
+            for d in kept:
+                cat_id = d["cat_id"]
                 x1, y1, x2, y2 = d["bbox_xyxy"]
                 w, h = x2 - x1, y2 - y1
                 if w < 2 or h < 2:
@@ -4565,6 +4653,8 @@ class ReviewWindow(QMainWindow):
         return added, skipped
 
     def _on_autolabel_finished(self, image_id: int, dets: list) -> None:
+        if self._stale_sender():
+            return
         self.side.set_sam3_running(False)
         added, skipped = self._apply_autolabel_dets(image_id, dets)
         self._set_sam3_status(
@@ -4587,15 +4677,19 @@ class ReviewWindow(QMainWindow):
         if self._sam3_busy():
             self.statusBar().showMessage("SAM3 already running", 2500)
             return
-        pair = self._autolabel_concepts(False)
+        pair = self._autolabel_concepts()
         if pair is None:
             return
         concepts, cat_ids = pair
+        selected_note = (f" — restricted to the {len(concepts)} highlighted "
+                         f"categor{'y' if len(concepts) == 1 else 'ies'}"
+                         if self.side.get_selected_cat_ids() else "")
         ret = QMessageBox.question(
             self, "Autolabel all frames with SAM3?",
             f"Run text-prompt detection on all {n} frame(s) for "
             f"{len(concepts)} categor{'y' if len(concepts) == 1 else 'ies'} "
-            f"({', '.join(concepts[:5])}{'…' if len(concepts) > 5 else ''})?\n"
+            f"({', '.join(concepts[:5])}{'…' if len(concepts) > 5 else ''})"
+            f"{selected_note}?\n"
             f"Runs in the background (device: {self.sam3_device}, CPU "
             f"fallback on CUDA OOM). Detections become editable boxes with "
             f"masks; duplicates of existing boxes are skipped. "
@@ -4625,12 +4719,25 @@ class ReviewWindow(QMainWindow):
         self._sam3_autolabel_batch_worker.failed_signal.connect(
             self._on_sam3_failed)
         self._sam3_autolabel_batch_worker.cancelled_signal.connect(
-            self._on_batch_cancelled)
+            self._on_autolabel_batch_cancelled)
+        self._sam3_autolabel_batch_worker._lr_session = self._session_seq
         self._sam3_autolabel_batch_worker.start()
+
+    def _on_autolabel_batch_cancelled(self) -> None:
+        if self._stale_sender():
+            return
+        self.side.set_sam3_running(False)
+        self._set_sam3_status("autolabel all: cancelled")
+        self.coco.save(is_final=False)
+        self._refresh_boxes()
+        self.statusBar().showMessage("Autolabel-all cancelled", 3000)
+        QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_autolabel_batch_frame_done(self, frame_idx: int,
                                        dets: list) -> None:
         """Add one frame's autolabel detections as boxes+masks."""
+        if self._stale_sender():
+            return
         if dets:
             frame = self.frame_index.frame_at(frame_idx)
             mask0 = next((d["mask"] for d in dets
@@ -4650,6 +4757,8 @@ class ReviewWindow(QMainWindow):
             self.coco.save(is_final=False)
 
     def _on_autolabel_batch_finished(self, total_dets: int) -> None:
+        if self._stale_sender():
+            return
         self.side.set_sam3_running(False)
         self._set_sam3_status(f"autolabel all: done — {total_dets} box(es)")
         self.coco.save(is_final=False)
@@ -4761,10 +4870,13 @@ class ReviewWindow(QMainWindow):
             self._on_propagate_failed)
         self._sam3_propagate_worker.cancelled_signal.connect(
             self._on_propagate_cancelled)
+        self._sam3_propagate_worker._lr_session = self._session_seq
         self._sam3_propagate_worker.start()
 
     def _on_propagate_frame_done(self, frame_idx: int, det) -> None:
         """Add one propagated box (same track id as the seed), or skip."""
+        if self._stale_sender():
+            return
         meta = self._propagate_meta
         if det is not None:
             frame = self.frame_index.frame_at(frame_idx)
@@ -4827,6 +4939,8 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_propagate_finished(self, n_found: int, lost_at: int) -> None:
+        if self._stale_sender():
+            return
         tid = self._propagate_meta["track_id"]
         if lost_at >= 0:
             status = f"propagate T{tid}: lost at frame {lost_at + 1} " \
@@ -4836,12 +4950,16 @@ class ReviewWindow(QMainWindow):
         self._end_propagate(status, status.replace("propagate", "Propagate"))
 
     def _on_propagate_failed(self, err: str) -> None:
+        if self._stale_sender():
+            return
         tid = self._propagate_meta["track_id"]
         print(f"❌ SAM3 propagate failed: {err}")
         self._end_propagate(f"propagate T{tid}: failed — {err}",
                             f"SAM3 propagate failed: {err}")
 
     def _on_propagate_cancelled(self) -> None:
+        if self._stale_sender():
+            return
         tid = self._propagate_meta["track_id"]
         added = self._propagate_meta["added"]
         self._end_propagate(
@@ -4915,6 +5033,7 @@ class ReviewWindow(QMainWindow):
         self._sam3_worker.failed_signal.connect(self._on_sam3_failed)
         self._sam3_worker.progress_signal.connect(self._on_sam3_progress)
         self._sam3_worker.cancelled_signal.connect(self._on_sam3_cancelled)
+        self._sam3_worker._lr_session = self._session_seq
         self._sam3_worker.start()
 
     def _on_sam3_progress(self, done: int, total: int, concept: str) -> None:
@@ -4924,35 +5043,55 @@ class ReviewWindow(QMainWindow):
 
     def _on_cancel_sam3(self) -> None:
         cancelled_any = False
+        cleared_queue = 0
+        # Capture "was running" BEFORE cancel() — a worker may leave
+        # isRunning() quickly, and the status text depends on it.
+        running_cancelled = False
         if self._sam3_queue:
+            cleared_queue = len(self._sam3_queue)
             self._sam3_queue.clear()  # cancel drops queued jobs too
             cancelled_any = True
-        if self._sam3_worker is not None and self._sam3_worker.isRunning():
-            self._sam3_worker.cancel()
-            cancelled_any = True
-        if (self._sam3_batch_worker is not None
-                and self._sam3_batch_worker.isRunning()):
-            self._sam3_batch_worker.cancel()
-            cancelled_any = True
-        if (self._sam3_autolabel_batch_worker is not None
-                and self._sam3_autolabel_batch_worker.isRunning()):
-            self._sam3_autolabel_batch_worker.cancel()
-            cancelled_any = True
-        if (self._sam3_propagate_worker is not None
-                and self._sam3_propagate_worker.isRunning()):
-            self._sam3_propagate_worker.cancel()
-            cancelled_any = True
+        for w in (self._sam3_worker, self._sam3_batch_worker,
+                  self._sam3_autolabel_batch_worker,
+                  self._sam3_propagate_worker):
+            if w is not None and w.isRunning():
+                w.cancel()
+                cancelled_any = True
+                running_cancelled = True
+        # The single-frame autolabel worker is one predict call with no
+        # cooperative cancel — say so instead of pretending to stop it.
+        autolabel_running = (
+            self._sam3_autolabel_worker is not None
+            and self._sam3_autolabel_worker.isRunning())
         if cancelled_any:
-            self._set_sam3_status("cancelling…")
-            self.side.btn_cancel_sam3.setEnabled(False)
+            if running_cancelled:
+                self._set_sam3_status("cancelling…")
+            else:
+                # Only queued jobs were dropped — nothing was running.
+                self._set_sam3_status(
+                    f"cancelled — {cleared_queue} queued job(s) dropped")
+                if not autolabel_running:
+                    self.side.set_sam3_running(False)
+            if autolabel_running:
+                self.statusBar().showMessage(
+                    "Single-frame autolabel can't be cancelled — it "
+                    "finishes on its own", 3500)
+        elif autolabel_running:
+            self.statusBar().showMessage(
+                "Single-frame autolabel can't be cancelled — it finishes "
+                "on its own", 3500)
 
     def _on_sam3_cancelled(self) -> None:
+        if self._stale_sender():
+            return
         self.side.set_sam3_running(False)
         self._set_sam3_status("cancelled — no masks applied")
         self.statusBar().showMessage("SAM3 cancelled", 2500)
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_sam3_finished(self, results: list) -> None:
+        if self._stale_sender():
+            return
         self.side.set_sam3_running(False)
         n_ok = sum(1 for r in results if r.get("success"))
         n_fail = len(results) - n_ok
@@ -4968,14 +5107,18 @@ class ReviewWindow(QMainWindow):
         self._set_sam3_status(
             f"done — {n_ok} mask(s), {n_fail} failed{err_txt}"
         )
-        for r in results:
-            ann_id = r.get("ann_id")
-            mask = r.get("mask")
-            if ann_id is None:
-                continue
-            self.coco.set_mask(ann_id, mask)
-            if not r.get("success"):
-                print(f"  ⚠️ ann_id={ann_id}: {r.get('error', 'no mask')}")
+        with self.coco.undo_stack.group("SAM3 masks"):
+            for r in results:
+                ann_id = r.get("ann_id")
+                mask = r.get("mask")
+                if ann_id is None:
+                    continue
+                # Never clear an existing mask on failure — a failed concept
+                # returns mask=None and the box may already have a good one.
+                if mask is not None:
+                    self.coco.set_mask(ann_id, mask)
+                if not r.get("success"):
+                    print(f"  ⚠️ ann_id={ann_id}: {r.get('error', 'no mask')}")
         self._refresh_boxes()
         # Save progress so masks survive a crash.
         self.coco.save(is_final=False)
@@ -4983,6 +5126,10 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_sam3_failed(self, msg: str) -> None:
+        if self._stale_sender():
+            print(f"⚠️ Dropping stale SAM3 failure from previous "
+                  f"source: {msg}")
+            return
         self.side.set_sam3_running(False)
         self._sam3_queue.clear()  # hard failure — don't keep retrying queued jobs
         self._set_sam3_status(f"failed — {msg}")
@@ -5012,15 +5159,21 @@ class ReviewWindow(QMainWindow):
         super().closeEvent(ev)
 
     def _shutdown_workers(self) -> None:
-        """Cancel and reap the background workers (SAM3 single/all-frames,
-        interpolation) so no QThread is destroyed mid-run at exit — Qt
-        aborts the process when that happens."""
+        """Cancel and reap the background workers (SAM3 single/all-frames/
+        autolabel/propagate, interpolation) so no QThread is destroyed
+        mid-run at exit — Qt aborts the process when that happens."""
         self._sam3_queue.clear()
         for w in (self._sam3_worker, self._sam3_batch_worker,
+                  self._sam3_autolabel_worker,
+                  self._sam3_autolabel_batch_worker,
+                  self._sam3_propagate_worker,
                   self._interp_worker):
             if w is None or not w.isRunning():
                 continue
-            w.cancel()
+            # The single-frame autolabel worker is one predict call and has
+            # no cooperative cancel — it just gets the wait below.
+            if hasattr(w, "cancel"):
+                w.cancel()
             if not w.wait(2000):
                 # A run_sam3 / interpolate call is still in flight —
                 # last resort before exit.
@@ -5053,6 +5206,18 @@ def _seed_categories(seed_json: Optional[str]) -> List[Dict[str, Any]]:
 # Main
 # ---------------------------------------------------------------------------
 
+def _resolve_device(name: str) -> str:
+    """Resolve 'auto' → 'cuda' when torch reports CUDA available, else
+    'cpu'. Explicit 'cuda'/'cpu' pass through unchanged."""
+    if name != "auto":
+        return name
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Interactive 2D bbox reviewer for image files/folders.",
@@ -5077,8 +5242,11 @@ def main():
     parser.add_argument("--sam3-model", default=None,
                         help="Path to SAM3 weights (default: "
                              "core/sam3/models/sam3-model/sam3.pt).")
-    parser.add_argument("--sam3-device", default="cuda", choices=["cuda", "cpu"],
-                        help="Device for SAM3 inference (default: cuda).")
+    parser.add_argument("--sam3-device", default="auto",
+                        choices=["auto", "cuda", "cpu"],
+                        help="Device for SAM3 inference (default: auto — "
+                             "cuda when torch reports CUDA available, else "
+                             "cpu).")
     parser.add_argument("--sam3-conf", type=float, default=0.25,
                         help="SAM3 confidence threshold (default: 0.25).")
     parser.add_argument("--auto-segment", action="store_true",
@@ -5130,10 +5298,12 @@ def main():
               "invalid; using 'none'")
         camera_model = "none"
     sam3_device = sam3_cfg.get("device", args.sam3_device)
-    if sam3_device not in ("cuda", "cpu"):
+    if sam3_device not in ("auto", "cuda", "cpu"):
         print(f"⚠️ config sam3.device {sam3_device!r} invalid; "
               f"using '{args.sam3_device}'")
         sam3_device = args.sam3_device
+    sam3_device = _resolve_device(sam3_device)
+    print(f"🖥️  SAM3 device: {sam3_device}")
 
     # ---------- 1. Index the frame source ----------
     if args.images:
@@ -5191,7 +5361,9 @@ def main():
                         # "ui": {"advanced": true} (the Config dialog exposes
                         # the same toggle); "ui": {"hide": [...]} hides
                         # additional groups on top.
-                        ui_hide=ui_cfg.get("hide", []),
+                        # Autolabel buttons are hidden by default; a config
+                        # "hide" list fully controls them.
+                        ui_hide=ui_cfg.get("hide", ["autolabel"]),
                         mask_opacity=ui_cfg.get("mask_opacity"),
                         advanced_ui=bool(ui_cfg.get("advanced", False)),
                         show_track_ids=bool(tracking_cfg.get("show_ids",

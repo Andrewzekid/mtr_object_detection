@@ -6,10 +6,11 @@
     "confirm_mismatch": true
   },
   "sam3": {
-    "device": "cpu",
+    "device": "auto",
     "conf": 0.25,
     "auto_segment": false,
-    "min_polygon_area": 100
+    "min_polygon_area": 100,
+    "autolabel_nms_iou": 0.7
   },
   "ui": {
     "advanced": false,
