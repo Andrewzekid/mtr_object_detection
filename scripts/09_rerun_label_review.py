@@ -2750,6 +2750,13 @@ class ConfigDialog(QtWidgets.QDialog):
         self.btn_apply = QPushButton("Apply")
         self.btn_save = QPushButton("Save…")
         self.btn_close = QPushButton("Close")
+        # QPushButton auto-defaults inside a QDialog: without this, pressing
+        # Enter in any field (e.g. the SAM3 confidence spinbox) fires the
+        # first button — opening the Load file dialog unexpectedly.
+        for b in (self.btn_load, self.btn_apply, self.btn_save,
+                  self.btn_close):
+            b.setAutoDefault(False)
+            b.setDefault(False)
         btn_row.addWidget(self.btn_load)
         btn_row.addStretch(1)
         btn_row.addWidget(self.btn_apply)
