@@ -74,6 +74,9 @@ SAM3 segmentation
   stored per-annotation in the COCO output as polygon ``segmentation``
   (same shape as ``scripts/results.json``; the legacy base64-PNG ``mask``
   field is still read on load) so they round-trip with the json file.
+  Requesting another run while one is in flight queues it (FIFO); the
+  status line shows the pending count, e.g. ``SAM3 (1 in queue): done —
+  4 mask(s), 0 failed``. Cancel drops the running job and the queue.
 * ``R`` re-segments the *selected* bbox only — useful after you've redrawn a
   bbox to fix a bad SAM3 mask: delete the old box, draw a new one, then press
   R while it's selected to regenerate the mask.
@@ -2083,6 +2086,11 @@ class SidePanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
 
+        self.source_label = QLabel("Source: —")
+        self.source_label.setToolTip(
+            "Current frame source (image folder / rrd recording).")
+        layout.addWidget(self.source_label)
+
         self.cat_label = QLabel("Categories (click to preselect for next draw, or press 0-9 when drawing):")
         layout.addWidget(self.cat_label)
 
@@ -2369,10 +2377,20 @@ class SidePanel(QWidget):
     def set_sam3_status(self, text: str) -> None:
         self.sam3_status.setText(text)
 
+    def set_source(self, path: str) -> None:
+        """Show the current frame-source path (elided; full path in tooltip)."""
+        disp = path or "—"
+        self.source_label.setToolTip(path or "No source loaded")
+        metrics = self.source_label.fontMetrics()
+        self.source_label.setText(metrics.elidedText(
+            f"Source: {disp}", Qt.TextElideMode.ElideMiddle, 320))
+
     def set_sam3_running(self, running: bool) -> None:
-        """Enable Cancel and disable the run buttons while SAM3 is busy."""
-        self.btn_run_sam3.setEnabled(not running)
-        self.btn_reseg.setEnabled(not running)
+        """Enable Cancel while SAM3 is busy. The per-frame run buttons stay
+        enabled — presses while busy are queued by the window. Only the
+        all-frames batch refuses to start while something is running."""
+        self.btn_run_sam3.setEnabled(True)
+        self.btn_reseg.setEnabled(True)
         self.btn_sam3_all_frames.setEnabled(not running)
         self.btn_cancel_sam3.setEnabled(running)
 
@@ -2904,6 +2922,13 @@ class ReviewWindow(QMainWindow):
         self._last_cat_id: Optional[int] = None
         self._sam3_worker: Optional[SAM3Worker] = None
         self._sam3_batch_worker: Optional[SAM3BatchWorker] = None
+        # FIFO of pending single-frame SAM3 jobs (img_path, bboxes_xyxy,
+        # concepts, ann_ids). Filled when a run is requested while another
+        # is in flight; drained when the current worker finishes/cancels.
+        self._sam3_queue: List[Dict[str, Any]] = []
+        # Last SAM3 status body (without the "(N in queue)" prefix), so the
+        # queue count can be re-rendered without losing the message.
+        self._sam3_status_body: str = "idle"
         self._batch_frames_done: int = 0
         self._interp_worker: Optional[InterpBatchWorker] = None
         # Tmp file path for the current frame's image (run_sam3 needs a path).
@@ -3097,6 +3122,35 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(50, self._load_current)
         QTimer.singleShot(150, self._load_ui_state)
 
+        # Clicking anywhere outside a focused line edit (e.g. the "new
+        # category name" box) defocuses it, so hotkeys work again without
+        # having to press Enter/Escape first.
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        self._update_source_label()
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress:
+            fw = QApplication.focusWidget()
+            if isinstance(fw, QLineEdit) and fw is not obj:
+                fw.clearFocus()
+        return super().eventFilter(obj, event)
+
+    def _update_source_label(self) -> None:
+        """Show the current frame source in the side panel: the image
+        folder for file sources, the .rrd path for recordings."""
+        idx = self.rrd_index
+        files = getattr(idx, "files", None)
+        if files:
+            dirs = sorted({os.path.dirname(os.path.abspath(f))
+                           for f in files})
+            path = (dirs[0] if len(dirs) == 1
+                    else f"{len(files)} files from {len(dirs)} folders")
+        else:
+            path = getattr(idx, "rrd_path", "") or ""
+        self.side.set_source(path)
+
     # ----------------------- web bridge setup -------------------------- #
 
     def _setup_web_bridge(self) -> None:
@@ -3281,6 +3335,7 @@ class ReviewWindow(QMainWindow):
         self.coco = CocoState(out_json, self.coco.categories)
         self.coco.sticky_track_ids = sticky
         self.coco.load_existing()
+        self._update_source_label()
         self.side.coco = self.coco  # side panel keeps its own reference
         self._current_idx = self.coco.load_progress(len(self.rrd_index))
         self._current_image_id = None
@@ -4337,6 +4392,31 @@ class ReviewWindow(QMainWindow):
 
     # ----------------------- SAM3 segmentation ------------------------- #
 
+    def _set_sam3_status(self, body: str) -> None:
+        """SAM3 status line with the pending-queue count, e.g.
+        'SAM3 (1 in queue): done — 4 mask(s), 0 failed'."""
+        self._sam3_status_body = body
+        n = len(self._sam3_queue)
+        prefix = f"SAM3 ({n} in queue)" if n else "SAM3"
+        self.side.set_sam3_status(f"{prefix}: {body}")
+
+    def _refresh_sam3_status(self) -> None:
+        """Re-render the status line (queue count changed, body didn't)."""
+        self._set_sam3_status(self._sam3_status_body)
+
+    def _start_next_queued_sam3(self) -> None:
+        """Pop the next queued single-frame SAM3 job, if nothing is running."""
+        if not self._sam3_queue:
+            return
+        if (self._sam3_worker is not None
+                and self._sam3_worker.isRunning()) or \
+           (self._sam3_batch_worker is not None
+                and self._sam3_batch_worker.isRunning()):
+            return
+        job = self._sam3_queue.pop(0)
+        self._start_sam3_worker(job["img_path"], job["bboxes_xyxy"],
+                                job["concepts"], job["ann_ids"])
+
     def _write_tmp_image(self) -> Optional[str]:
         """Write the current frame's image to a tmp file (for run_sam3).
 
@@ -4403,7 +4483,7 @@ class ReviewWindow(QMainWindow):
             return
         img_path = self._write_tmp_image()
         if img_path is None:
-            self.side.set_sam3_status("SAM3: failed — no image for this frame")
+            self._set_sam3_status("failed — no image for this frame")
             self.statusBar().showMessage(
                 "⚠️ Could not prepare the frame image for SAM3", 4000)
             return
@@ -4464,7 +4544,7 @@ class ReviewWindow(QMainWindow):
             return
         tmp_dir = str(Path(self.coco.output_json).parent / "_tmp_sam3_imgs")
         self._batch_frames_done = 0
-        self.side.set_sam3_status(f"SAM3 all: 0/{len(jobs)} frames…")
+        self._set_sam3_status(f"all: 0/{len(jobs)} frames…")
         self.side.set_sam3_running(True)
         self.canvas.setEnabled(False)
         self._sam3_batch_worker = SAM3BatchWorker(
@@ -4499,25 +4579,27 @@ class ReviewWindow(QMainWindow):
             self.coco.save(is_final=False)
 
     def _on_batch_progress(self, done: int, total: int) -> None:
-        self.side.set_sam3_status(f"SAM3 all: {done}/{total} frames…")
+        self._set_sam3_status(f"all: {done}/{total} frames…")
 
     def _on_batch_finished(self, n_ok: int, n_fail: int) -> None:
         self.canvas.setEnabled(True)
         self.side.set_sam3_running(False)
-        self.side.set_sam3_status(
-            f"SAM3 all: done — {n_ok} mask(s), {n_fail} failed")
+        self._set_sam3_status(
+            f"all: done — {n_ok} mask(s), {n_fail} failed")
         self.coco.save(is_final=False)
         self._refresh_boxes()
         self.statusBar().showMessage(
             f"Auto-annotate finished: {n_ok} masks", 4000)
+        QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_batch_cancelled(self) -> None:
         self.canvas.setEnabled(True)
         self.side.set_sam3_running(False)
-        self.side.set_sam3_status("SAM3 all: cancelled")
+        self._set_sam3_status("all: cancelled")
         self.coco.save(is_final=False)
         self._refresh_boxes()
         self.statusBar().showMessage("Auto-annotate cancelled", 3000)
+        QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_resegment_selected(self) -> None:
         """Re-run SAM3 on just the selected bbox (R key / button)."""
@@ -4547,12 +4629,19 @@ class ReviewWindow(QMainWindow):
         if (self._sam3_worker is not None and self._sam3_worker.isRunning()) or \
            (self._sam3_batch_worker is not None
                 and self._sam3_batch_worker.isRunning()):
-            print("⚠️ SAM3 already running, please wait…")
-            self.statusBar().showMessage("SAM3 already running", 2500)
+            # Busy — queue the job; it starts when the current run ends.
+            self._sam3_queue.append({
+                "img_path": img_path,
+                "bboxes_xyxy": bboxes_xyxy,
+                "concepts": concepts,
+                "ann_ids": ann_ids,
+            })
+            self._refresh_sam3_status()
+            self.statusBar().showMessage(
+                f"SAM3 busy — job queued "
+                f"({len(self._sam3_queue)} in queue)", 2500)
             return
-        self.side.set_sam3_status(
-            f"SAM3: running on {len(bboxes_xyxy)} box(es)…"
-        )
+        self._set_sam3_status(f"running on {len(bboxes_xyxy)} box(es)…")
         self.side.set_sam3_running(True)
         self.canvas.setEnabled(False)
         self._sam3_worker = SAM3Worker(
@@ -4572,12 +4661,15 @@ class ReviewWindow(QMainWindow):
         self._sam3_worker.start()
 
     def _on_sam3_progress(self, done: int, total: int, concept: str) -> None:
-        self.side.set_sam3_status(
-            f"SAM3: {done}/{total} concept(s) done — last: {concept}"
+        self._set_sam3_status(
+            f"{done}/{total} concept(s) done — last: {concept}"
         )
 
     def _on_cancel_sam3(self) -> None:
         cancelled_any = False
+        if self._sam3_queue:
+            self._sam3_queue.clear()  # cancel drops queued jobs too
+            cancelled_any = True
         if self._sam3_worker is not None and self._sam3_worker.isRunning():
             self._sam3_worker.cancel()
             cancelled_any = True
@@ -4586,14 +4678,15 @@ class ReviewWindow(QMainWindow):
             self._sam3_batch_worker.cancel()
             cancelled_any = True
         if cancelled_any:
-            self.side.set_sam3_status("SAM3: cancelling…")
+            self._set_sam3_status("cancelling…")
             self.side.btn_cancel_sam3.setEnabled(False)
 
     def _on_sam3_cancelled(self) -> None:
         self.canvas.setEnabled(True)
         self.side.set_sam3_running(False)
-        self.side.set_sam3_status("SAM3: cancelled — no masks applied")
+        self._set_sam3_status("cancelled — no masks applied")
         self.statusBar().showMessage("SAM3 cancelled", 2500)
+        QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_sam3_finished(self, results: list) -> None:
         self.canvas.setEnabled(True)
@@ -4609,8 +4702,8 @@ class ReviewWindow(QMainWindow):
                  if not r.get("success") and r.get("error")), None)
             if first_err:
                 err_txt = f" — {first_err}"
-        self.side.set_sam3_status(
-            f"SAM3: done — {n_ok} mask(s), {n_fail} failed{err_txt}"
+        self._set_sam3_status(
+            f"done — {n_ok} mask(s), {n_fail} failed{err_txt}"
         )
         for r in results:
             ann_id = r.get("ann_id")
@@ -4624,11 +4717,13 @@ class ReviewWindow(QMainWindow):
         # Save progress so masks survive a crash.
         self.coco.save(is_final=False)
         print(f"✅ SAM3 finished — {n_ok}/{len(results)} masks assigned")
+        QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_sam3_failed(self, msg: str) -> None:
         self.canvas.setEnabled(True)
         self.side.set_sam3_running(False)
-        self.side.set_sam3_status(f"SAM3: failed — {msg}")
+        self._sam3_queue.clear()  # hard failure — don't keep retrying queued jobs
+        self._set_sam3_status(f"failed — {msg}")
         QMessageBox.warning(self, "SAM3 failed", msg)
 
     def _on_toggle_masks(self) -> None:
@@ -4658,6 +4753,7 @@ class ReviewWindow(QMainWindow):
         """Cancel and reap the background workers (SAM3 single/all-frames,
         interpolation) so no QThread is destroyed mid-run at exit — Qt
         aborts the process when that happens."""
+        self._sam3_queue.clear()
         for w in (self._sam3_worker, self._sam3_batch_worker,
                   self._interp_worker):
             if w is None or not w.isRunning():
