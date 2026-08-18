@@ -4388,6 +4388,9 @@ class ReviewWindow(QMainWindow):
             return
         ann_id = self.canvas._boxes[sel]["id"]
         if self.coco.set_cat(ann_id, cat_id):
+            # Recat updates the sticky category too: the next drawn box
+            # auto-assigns the category just chosen here.
+            self._last_cat_id = cat_id
             self._refresh_boxes()
             self.canvas._selected_idx = sel
             self.canvas._multi_selected = {sel}
