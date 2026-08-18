@@ -112,7 +112,10 @@ USAGE
     python scripts/09_rerun_label_review.py
 
 Key bindings (in the 2D canvas, when it has focus — click it once):
-    D / del / backspace : delete selected box
+    D / del / backspace : delete selected box(es)
+    shift+click : toggle a box in/out of the multi-selection (delete
+               applies to all selected; the last clicked box stays the
+               primary for move/resize/recat/track)
     A        : toggle draw mode (click-drag a new box)
     N / →    : next frame
     B / ←    : previous frame
@@ -1831,6 +1834,10 @@ class CanvasWidget(QWidget):
         self._masks_visible: bool = True
         self._mask_alpha: int = 120  # 0-255 overlay alpha for mask fill
         self._selected_idx: int = -1
+        # All currently selected box indices (includes _selected_idx, which
+        # is the "primary" selection used for move/resize/recat/track).
+        # Shift+click toggles membership; a plain click resets to {hit}.
+        self._multi_selected: set = set()
         self._drawing: bool = False
         self._draw_start: Optional[Tuple[float, float]] = None
         self._draw_current: Optional[Tuple[float, float]] = None
@@ -1874,6 +1881,7 @@ class CanvasWidget(QWidget):
         optional mask (HxW bool array)."""
         self._boxes = list(boxes)
         self._selected_idx = -1
+        self._multi_selected = set()
         self._waiting_cat = False
         self._pending_rect = None
         self.update()
@@ -1907,6 +1915,7 @@ class CanvasWidget(QWidget):
         self._waiting_cat = False
         self._pending_rect = None
         self._selected_idx = -1
+        self._multi_selected = set()
         self.update()
 
     # ----------------------- coordinate maps --------------------------- #
@@ -2036,8 +2045,13 @@ class CanvasWidget(QWidget):
         p.setFont(font)
         for i, box in enumerate(self._boxes):
             x, y, w, h = box["bbox"]
-            color = QColor(255, 80, 80) if i == self._selected_idx else QColor(255, 220, 30)
-            pen = QPen(color, 2 if i == self._selected_idx else 1.2)
+            if i == self._selected_idx:
+                color, width = QColor(255, 80, 80), 2      # primary selection
+            elif i in self._multi_selected:
+                color, width = QColor(255, 150, 40), 2     # shift-selected
+            else:
+                color, width = QColor(255, 220, 30), 1.2
+            pen = QPen(color, width)
             p.setPen(pen)
             tl = self._img_to_widget(x, y)
             br = self._img_to_widget(x + w, y + h)
@@ -2119,8 +2133,24 @@ class CanvasWidget(QWidget):
                     hit = i
                     break
             if hit >= 0:
+                if ev.modifiers() & Qt.ShiftModifier:
+                    # Shift+click: toggle membership in the multi-selection;
+                    # no drag. The clicked box becomes the primary.
+                    if hit in self._multi_selected:
+                        self._multi_selected.discard(hit)
+                        if self._selected_idx == hit:
+                            self._selected_idx = (
+                                next(iter(self._multi_selected))
+                                if self._multi_selected else -1)
+                    else:
+                        self._multi_selected.add(hit)
+                        self._selected_idx = hit
+                    self.selection_changed.emit(self._selected_idx)
+                    self.update()
+                    return
                 # Select the box and begin move.
                 self._selected_idx = hit
+                self._multi_selected = {hit}
                 self.selection_changed.emit(hit)
                 bx, by, bw, bh = self._boxes[hit]["bbox"]
                 self._edit_mode = "move"
@@ -2130,6 +2160,7 @@ class CanvasWidget(QWidget):
             else:
                 # Click in empty space — deselect.
                 self._selected_idx = -1
+                self._multi_selected = set()
                 self.selection_changed.emit(-1)
                 self.update()
         elif ev.button() == Qt.MiddleButton:
@@ -2314,8 +2345,16 @@ class CanvasWidget(QWidget):
             return
 
         if k in (Qt.Key_D, Qt.Key_Delete, Qt.Key_Backspace):
-            if 0 <= self._selected_idx < len(self._boxes):
-                ann_id = self._boxes[self._selected_idx]["id"]
+            # Delete every selected box (shift-click multi-select), or just
+            # the primary selection when there is no multi-selection.
+            # Capture ids up front: each emitted delete triggers a refresh
+            # that rewrites _boxes, so indexing lazily would skip boxes.
+            sel = sorted(self._multi_selected)
+            if not sel and 0 <= self._selected_idx < len(self._boxes):
+                sel = [self._selected_idx]
+            ids = [self._boxes[i]["id"] for i in sel
+                   if 0 <= i < len(self._boxes)]
+            for ann_id in ids:
                 self.box_deleted.emit(ann_id)
         elif k in (Qt.Key_A,):
             self._drawing = not self._drawing
@@ -4396,6 +4435,7 @@ class ReviewWindow(QMainWindow):
         """Clicking a box-list row selects that box on the canvas."""
         if 0 <= box_idx < len(self.canvas._boxes):
             self.canvas._selected_idx = box_idx
+            self.canvas._multi_selected = {box_idx}
             self.canvas.update()
             self.side.highlight_box_row(box_idx)
             self._prefill_recat()
@@ -4515,6 +4555,7 @@ class ReviewWindow(QMainWindow):
         if self.coco.set_cat(ann_id, cat_id):
             self._refresh_boxes()
             self.canvas._selected_idx = sel
+            self.canvas._multi_selected = {sel}
             self.canvas.update()
             name = self.coco.cat_map.get(cat_id, "?")
             self.statusBar().showMessage(
@@ -4551,6 +4592,7 @@ class ReviewWindow(QMainWindow):
         if self.coco.set_track_id(ann_id, value):
             self._refresh_boxes()
             self.canvas._selected_idx = sel
+            self.canvas._multi_selected = {sel}
             self.canvas.update()
             self.side.prefill_track(value)
             self.statusBar().showMessage(
@@ -4567,13 +4609,35 @@ class ReviewWindow(QMainWindow):
     # ----------------------- SAM3 segmentation ------------------------- #
 
     def _write_tmp_image(self) -> Optional[str]:
-        """Write the current frame's image blob to a tmp file (for run_sam3)."""
+        """Write the current frame's image to a tmp file (for run_sam3).
+
+        File-backed sources (image-folder mode) are used directly — no
+        copy. rrd frames write their blob. Falls back to decode_image →
+        PNG when a frame has neither blob nor file."""
         if self._current_idx < 0 or self._current_idx >= len(self.rrd_index):
             return None
         frame = self.rrd_index.frame_at(self._current_idx)
+        fp = frame.get("file_path")
+        if fp and os.path.exists(fp):
+            return fp
+        tmp_dir = Path(self.coco.output_json).parent / "_tmp_sam3_imgs"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         blob = frame.get("image_blob")
         if not blob:
-            return None
+            # Last resort: decode in memory and write a PNG.
+            try:
+                arr = self.rrd_index.decode_image(self._current_idx)
+            except Exception as e:
+                print(f"⚠️ Failed to decode frame for SAM3: {e}")
+                return None
+            path = tmp_dir / f"frame_{self._current_idx}.png"
+            try:
+                Image.fromarray(arr).save(path)
+                self._tmp_image_path = str(path)
+                return self._tmp_image_path
+            except Exception as e:
+                print(f"⚠️ Failed to write tmp image for SAM3: {e}")
+                return None
         # Pick suffix from media_type if available, else .jpg
         mt = frame.get("media_type") or "image/jpeg"
         ext = ".jpg"
@@ -4583,8 +4647,6 @@ class ReviewWindow(QMainWindow):
             ext = ".webp"
         elif "bmp" in mt:
             ext = ".bmp"
-        tmp_dir = Path(self.coco.output_json).parent / "_tmp_sam3_imgs"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
         path = tmp_dir / f"frame_{self._current_idx}{ext}"
         try:
             with open(path, "wb") as f:
@@ -4612,6 +4674,9 @@ class ReviewWindow(QMainWindow):
             return
         img_path = self._write_tmp_image()
         if img_path is None:
+            self.side.set_sam3_status("SAM3: failed — no image for this frame")
+            self.statusBar().showMessage(
+                "⚠️ Could not prepare the frame image for SAM3", 4000)
             return
         bboxes_xyxy = []
         concepts = []
