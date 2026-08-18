@@ -234,7 +234,7 @@ Qt.MiddleButton = Qt.MouseButton.MiddleButton  # type: ignore[attr-defined]
 Qt.RightButton = Qt.MouseButton.RightButton  # type: ignore[attr-defined]
 Qt.UserRole = Qt.ItemDataRole.UserRole  # type: ignore[attr-defined]
 Qt.Key_Escape = Qt.Key.Key_Escape  # type: ignore[attr-defined]
-Qt.Key_D = Qt.Key.Key_D  # type: ignore[attr-defined]
+Qt.Key_D = Qt.Key.Key_D  # type: ignore[attr-defined]curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
 Qt.Key_Delete = Qt.Key.Key_Delete  # type: ignore[attr-defined]
 Qt.Key_A = Qt.Key.Key_A  # type: ignore[attr-defined]
 Qt.Key_N = Qt.Key.Key_N  # type: ignore[attr-defined]
@@ -4450,8 +4450,16 @@ class ReviewWindow(QMainWindow):
         if not name:
             return
         if name in self.coco.cat_name_to_id:
+            # Make the no-op visible: select the existing row so it's
+            # clear why nothing was added.
+            existing = self.coco.cat_name_to_id[name]
+            for i in range(self.side.cat_list.count()):
+                if self.side.cat_list.item(i).data(Qt.UserRole) == existing:
+                    self.side.cat_list.setCurrentRow(i)
+                    break
             self.statusBar().showMessage(
-                f"⚠️ Category {name!r} already exists", 3000)
+                f"⚠️ Category {name!r} already exists (id {existing}) — "
+                "selected it in the list", 5000)
             return
         new_id = max((c["id"] for c in self.coco.categories), default=-1) + 1
         self.coco.categories.append({"id": new_id, "name": name})
@@ -4875,8 +4883,17 @@ class ReviewWindow(QMainWindow):
         self.side.set_sam3_running(False)
         n_ok = sum(1 for r in results if r.get("success"))
         n_fail = len(results) - n_ok
+        # Surface the first failure reason in the status label — the per-box
+        # errors also go to the terminal, but that's easy to miss.
+        err_txt = ""
+        if n_fail:
+            first_err = next(
+                (r.get("error") for r in results
+                 if not r.get("success") and r.get("error")), None)
+            if first_err:
+                err_txt = f" — {first_err}"
         self.side.set_sam3_status(
-            f"SAM3: done — {n_ok} mask(s), {n_fail} failed"
+            f"SAM3: done — {n_ok} mask(s), {n_fail} failed{err_txt}"
         )
         for r in results:
             ann_id = r.get("ann_id")
