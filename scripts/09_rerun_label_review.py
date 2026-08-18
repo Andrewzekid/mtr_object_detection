@@ -35,7 +35,10 @@ What this does
   the boxes using that category too.
 * The File menu switches the frame source at runtime (the current session
   is saved first, categories are kept): ``Ctrl+O`` open image files,
-  ``Ctrl+Shift+O`` open folder. ``Ctrl+G`` opens the
+  ``Ctrl+Shift+O`` open folder, ``Ctrl+I`` import annotations from a COCO
+  json (images matched by file name, categories merged by name, masks
+  restored from polygon ``segmentation``; duplicates are skipped).
+  ``Ctrl+G`` opens the
   Config settings dialog. ``Ctrl+S`` saves the COCO JSON to the current
   output path without quitting; ``Ctrl+Shift+S`` (Save as…) picks a new
   location and keeps saving there. Image sessions write
@@ -160,6 +163,7 @@ config override the corresponding CLI flags. Example:
         "min_polygon_area": 100       // drop saved mask contours smaller
                                       // than this (px²); filters the speck
                                       // polygons SAM3 occasionally spawns.
+                                      // The largest contour is always kept.
                                       // 0 keeps every contour.
       },
       "ui": {
@@ -342,7 +346,9 @@ def _mask_to_polygons(mask: np.ndarray,
 
     Contours whose area is below ``min_area`` (px²) are dropped — SAM3
     masks occasionally spawn scattered speck polygons far from the object.
-    Returns [] when the mask is empty or no contour has ≥3 points."""
+    The largest contour is ALWAYS kept, even below ``min_area``, so a small
+    object's mask is never silently dropped from the saved file. Returns []
+    only when the mask is empty or no contour has ≥3 points."""
     import cv2  # lazy: heavy import, only needed when masks are saved
     if mask is None or mask.size == 0 or not mask.any():
         return []
@@ -350,10 +356,20 @@ def _mask_to_polygons(mask: np.ndarray,
     contours, _ = cv2.findContours(arr, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
     polys = []
+    best = None
+    best_area = -1.0
     for c in contours:
         flat = c.reshape(-1).tolist()
-        if len(flat) >= 6 and cv2.contourArea(c) >= min_area:
-            polys.append([int(v) for v in flat])
+        if len(flat) < 6:
+            continue
+        poly = [int(v) for v in flat]
+        area = cv2.contourArea(c)
+        if area >= min_area:
+            polys.append(poly)
+        if area > best_area:
+            best_area, best = area, poly
+    if not polys and best is not None:
+        polys = [best]  # keep the main contour — never drop the whole mask
     return polys
 
 
@@ -713,6 +729,88 @@ class CocoState:
             except Exception:
                 pass
         return 0
+
+    def import_coco(self, data: Dict[str, Any],
+                    file_to_frame: Dict[str, int],
+                    frame_index) -> Tuple[int, int, int]:
+        """Import annotations from another COCO dict (File → Load
+        annotations…), matching images to the current source by file
+        basename. Categories are merged by name; images that aren't in the
+        current source are skipped silently. Masks are restored from polygon
+        ``segmentation`` (or the legacy base64 ``mask``). Annotations that
+        duplicate an existing live box (same image, category and bbox) are
+        skipped so re-importing the same file is harmless. Bulk action — no
+        undo entry. Returns (frames_matched, anns_imported, anns_skipped)."""
+        src_cat_to_dst = {}
+        for cat in data.get("categories", []):
+            src_cat_to_dst[int(cat["id"])] = self._resolve_cat_id(cat["name"])
+        img_by_src_id = {int(i["id"]): i for i in data.get("images", [])}
+
+        # Existing live boxes per image for duplicate detection.
+        existing: Dict[int, set] = {}
+        for a in self.annotations:
+            if a["id"] in self.removed_ids:
+                continue
+            key = (a["category_id"],
+                   tuple(round(float(v), 1) for v in a["bbox"]))
+            existing.setdefault(a["image_id"], set()).add(key)
+
+        frames_matched: set = set()
+        n_imported = n_skipped = 0
+        for ann in data.get("annotations", []):
+            src_img = img_by_src_id.get(int(ann["image_id"]))
+            cat_id = src_cat_to_dst.get(int(ann["category_id"]))
+            if src_img is None or cat_id is None:
+                n_skipped += 1  # dangling image/category reference
+                continue
+            frame_idx = file_to_frame.get(
+                os.path.basename(src_img.get("file_name", "")))
+            if frame_idx is None:
+                continue  # image not in the current source — not an error
+            w = int(src_img.get("width", 0))
+            h = int(src_img.get("height", 0))
+            image_id = self.ensure_image(frame_index.frame_at(frame_idx),
+                                         w, h)
+            bbox = [float(v) for v in ann["bbox"]]
+            key = (cat_id, tuple(round(v, 1) for v in bbox))
+            if key in existing.get(image_id, set()):
+                n_skipped += 1  # exact duplicate already in the session
+                continue
+            frames_matched.add(frame_idx)
+            new_ann = {
+                "id": self._ann_id_next,
+                "image_id": image_id,
+                "category_id": cat_id,
+                "bbox": bbox,
+                "area": float(ann.get("area", bbox[2] * bbox[3])),
+                "iscrowd": int(ann.get("iscrowd", 0)),
+            }
+            # Mask: polygon segmentation (current) or legacy base64 PNG.
+            if ann.get("segmentation"):
+                new_ann["_mask"] = _polygons_to_mask(ann["segmentation"],
+                                                     h, w)
+            elif isinstance(ann.get("mask"), str) and ann["mask"]:
+                try:
+                    import base64
+                    new_ann["_mask"] = _decode_mask_png(
+                        base64.b64decode(ann["mask"]))
+                except Exception:
+                    new_ann["_mask"] = None
+            # Keep the source track id when it parses as an int; otherwise
+            # assign a fresh one so tracking stays consistent.
+            try:
+                tid = int(ann["track_id"])
+                new_ann["track_id"] = tid
+                self._track_next = max(self._track_next, tid + 1)
+            except (KeyError, TypeError, ValueError):
+                new_ann["track_id"] = self._fresh_track_id()
+            self.annotations.append(new_ann)
+            existing.setdefault(image_id, set()).add(key)
+            self._ann_id_next += 1
+            n_imported += 1
+        if n_imported:
+            self.dirty = True
+        return len(frames_matched), n_imported, n_skipped
 
     def save(self, is_final: bool) -> None:
         final_anns = []
@@ -2405,7 +2503,8 @@ class ConfigDialog(QtWidgets.QDialog):
         self.spin_min_poly_area.setToolTip(
             "Mask contours smaller than this area are dropped when saving\n"
             "polygons — filters the scattered specks SAM3 occasionally\n"
-            "produces. 0 keeps every contour.")
+            "produces. The largest contour is always kept;\n"
+            "0 keeps every contour.")
         sam3_form.addRow("Min polygon area", self.spin_min_poly_area)
         body.addWidget(sam3_box)
 
@@ -2920,6 +3019,14 @@ class ReviewWindow(QMainWindow):
         act_dir.setShortcut("Ctrl+Shift+O")
         act_dir.triggered.connect(self._open_image_folder)
         m.addAction(act_dir)
+        act_anns = QAction("Load annotations file…", self)
+        act_anns.setShortcut("Ctrl+I")
+        act_anns.setToolTip(
+            "Import boxes/masks from a COCO JSON (e.g. from a previous "
+            "session or a model run), matching images by file name. "
+            "Categories are merged by name.")
+        act_anns.triggered.connect(self._load_annotations_dialog)
+        m.addAction(act_anns)
         m.addSeparator()
         act_save = QAction("Save", self)
         act_save.setShortcut("Ctrl+S")
@@ -2986,6 +3093,38 @@ class ReviewWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Loaded {len(self.frame_index)} frame(s) — saving to {out_json}",
             5000)
+
+    def _load_annotations_dialog(self) -> None:
+        """File → Load annotations file…: import boxes/masks from a COCO
+        JSON into the current session, matching images by file name."""
+        if len(self.frame_index) == 0:
+            QMessageBox.information(
+                self, "Load annotations",
+                "Open an image file/folder first, then load annotations.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load annotations file", "", "COCO JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Load annotations", str(e))
+            return
+        file_to_frame = {
+            os.path.basename(fp): i
+            for i, fp in enumerate(getattr(self.frame_index, "files", []))
+        }
+        n_frames, n_ok, n_skip = self.coco.import_coco(
+            data, file_to_frame, self.frame_index)
+        self.side._rebuild_cat_list()  # import may have added categories
+        self._refresh_boxes()
+        self._update_progress()
+        self.coco.save(is_final=False)
+        self.statusBar().showMessage(
+            f"Imported {n_ok} annotation(s) on {n_frames} frame(s) from "
+            f"{os.path.basename(path)} ({n_skip} skipped)", 6000)
 
     def _load_config_dialog(self) -> None:
         """Open the settings dialog (⚙ Config button / File → Config…).
