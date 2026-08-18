@@ -3957,6 +3957,7 @@ class ReviewWindow(QMainWindow):
             return
         self.coco.save(is_final=True)
         self._quit_confirmed = True
+        self._shutdown_workers()
         QtWidgets.QApplication.quit()
 
     def _on_quit(self) -> None:
@@ -3966,6 +3967,7 @@ class ReviewWindow(QMainWindow):
         if res:
             self.coco.save(is_final=False)
         self._quit_confirmed = True
+        self._shutdown_workers()
         QtWidgets.QApplication.quit()
 
     def _confirm_quit(self) -> Optional[bool]:
@@ -4528,17 +4530,21 @@ class ReviewWindow(QMainWindow):
                 return
             if res:
                 self.coco.save(is_final=False)
-        self._shutdown_sam3_worker()
+        self._shutdown_workers()
         super().closeEvent(ev)
 
-    def _shutdown_sam3_worker(self) -> None:
-        """Cancel and reap the SAM3 threads so they aren't killed mid-run."""
-        for w in (self._sam3_worker, self._sam3_batch_worker):
+    def _shutdown_workers(self) -> None:
+        """Cancel and reap the background workers (SAM3 single/all-frames,
+        interpolation) so no QThread is destroyed mid-run at exit — Qt
+        aborts the process when that happens."""
+        for w in (self._sam3_worker, self._sam3_batch_worker,
+                  self._interp_worker):
             if w is None or not w.isRunning():
                 continue
             w.cancel()
             if not w.wait(2000):
-                # run_sam3 call still in flight — last resort before exit.
+                # A run_sam3 / interpolate call is still in flight —
+                # last resort before exit.
                 w.terminate()
                 w.wait(1000)
 
