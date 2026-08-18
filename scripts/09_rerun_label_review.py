@@ -43,10 +43,13 @@ What this does
 * The File menu switches the frame source at runtime (the current session
   is saved first, categories are kept): ``Ctrl+O`` open image files,
   ``Ctrl+Shift+O`` open folder, ``Ctrl+R`` load a Rerun .rrd (indexes it,
-  spawns the web viewer, and embeds it on the spot). ``Ctrl+G`` loads a
-  JSON config at runtime. Image sessions write ``labels_coco.json`` next to
-  the chosen images; rrd sessions write ``<name>_labels.json`` beside the
-  recording unless ``--output_json`` is given.
+  spawns the web viewer, and embeds it on the spot). ``Ctrl+G`` opens the
+  Config settings dialog. ``Ctrl+S`` saves the COCO JSON to the current
+  output path without quitting; ``Ctrl+Shift+S`` (Save as…) picks a new
+  location and keeps saving there. Image sessions write
+  ``labels_coco.json`` next to the chosen images; rrd sessions write
+  ``<name>_labels.json`` beside the recording unless ``--output_json``
+  is given.
 * Embeds the official Rerun *web* viewer inside a PyQt6 window using
   ``QWebEngineView`` pointed at a locally hosted ``rerun.serve_web_viewer()``
   instance. The viewer shows the full 3D world + camera images, and you can
@@ -3200,6 +3203,20 @@ class ReviewWindow(QMainWindow):
         act_rrd.triggered.connect(self._load_rrd_dialog)
         m.addAction(act_rrd)
         m.addSeparator()
+        act_save = QAction("Save", self)
+        act_save.setShortcut("Ctrl+S")
+        act_save.setToolTip(
+            "Save the COCO JSON to the current output path (no quit).")
+        act_save.triggered.connect(self._on_save)
+        m.addAction(act_save)
+        act_save_as = QAction("Save as…", self)
+        act_save_as.setShortcut("Ctrl+Shift+S")
+        act_save_as.setToolTip(
+            "Save the COCO JSON to a chosen location; the session keeps "
+            "saving there afterwards.")
+        act_save_as.triggered.connect(self._on_save_as)
+        m.addAction(act_save_as)
+        m.addSeparator()
         act_cfg = QAction("Config settings…", self)
         act_cfg.setShortcut("Ctrl+G")
         act_cfg.setToolTip(
@@ -3989,6 +4006,29 @@ class ReviewWindow(QMainWindow):
                 f"Next unlabeled: frame {idx + 1}/{total}", 2500)
             return
         self.statusBar().showMessage("No unlabeled frames left 🎉", 3000)
+
+    def _on_save(self) -> None:
+        """File → Save (Ctrl+S): write the final COCO JSON to the current
+        output path without quitting."""
+        self.coco.save(is_final=True)
+        self.statusBar().showMessage(
+            f"Saved → {self.coco.output_json}", 4000)
+
+    def _on_save_as(self) -> None:
+        """File → Save as… (Ctrl+Shift+S): write the COCO JSON to a chosen
+        location and make it this session's output path (later saves,
+        including progress/tmp writes, go there too)."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save COCO JSON as", self.coco.output_json,
+            "JSON (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        self.coco.output_json = path
+        self.coco.progress_file = path.replace(".json", ".progress")
+        self.coco.save(is_final=True)
+        self.statusBar().showMessage(f"Saved → {path}", 4000)
 
     def _on_save_quit(self) -> None:
         ret = QMessageBox.question(
