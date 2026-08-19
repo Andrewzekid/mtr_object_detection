@@ -544,19 +544,31 @@ class SAM3AutolabelBatchWorker(QThread):
 # A detection this far from the previous box (IoU below this) is not "the
 # same object" — treat the track as lost instead of latching onto an
 # unrelated instance. IoU is 0 when boxes don't overlap at all.
-_PROPAGATE_MIN_IOU = 0.05
+_PROPAGATE_MIN_IOU = 0.3
+
+# Anchor against drift: a detection must also overlap the SEED box (the
+# first box of the chain) by at least this much, otherwise the track is
+# treated as lost even if it still overlaps the previous frame's box.
+# Stops the chain from slowly walking away from the original object under
+# large camera motion.
+_PROPAGATE_MIN_SEED_IOU = 0.2
 
 
 def _propagate_step(image_path: str, prev_bbox_xyxy: List[float],
                     concept: str, model_path: Optional[str], device: str,
                     conf: float,
-                    min_iou: float = _PROPAGATE_MIN_IOU
+                    min_iou: float = _PROPAGATE_MIN_IOU,
+                    seed_bbox_xyxy: Optional[List[float]] = None,
+                    min_seed_iou: float = _PROPAGATE_MIN_SEED_IOU
                     ) -> Tuple[Optional[Dict[str, Any]], str]:
     """One propagation step: re-detect the tracked object on a new frame.
 
     Prompts SAM3 with the previous frame's box as the exemplar and picks
     the detection with the highest IoU to it (the exemplar segments *all*
-    similar objects, so the nearest one is the tracked instance).
+    similar objects, so the nearest one is the tracked instance). The pick
+    must overlap the previous box by >= min_iou and, when seed_bbox_xyxy is
+    given, the seed box by >= min_seed_iou — otherwise the chain would
+    drift away from the original object under large camera motion.
 
     Returns (det, device_in_use):
       det = {"bbox_xyxy", "mask", "confidence"} or None when nothing was
@@ -602,6 +614,13 @@ def _propagate_step(image_path: str, prev_bbox_xyxy: List[float],
     if best_iou < min_iou:
         return None, device
     d = dets[best_i]
+    # Also require overlap with the seed box: under large camera motion
+    # the chain can otherwise drift frame-by-frame onto a different object
+    # while every single hop still passes the previous-box check.
+    if (seed_bbox_xyxy is not None
+            and _iou_xyxy(seed_bbox_xyxy, d.get("bbox", [0, 0, 0, 0]))
+            < min_seed_iou):
+        return None, device
     return {
         "bbox_xyxy": d["bbox"],
         "mask": masks[best_i] if best_i < len(masks) else None,
@@ -631,6 +650,8 @@ class SAM3PropagateWorker(QThread):
     def __init__(self, frame_index, start_frame_idx: int,
                  seed_bbox_xyxy: List[float], concept: str, tmp_dir: str,
                  model_path: Optional[str], device: str, conf: float,
+                 min_iou: float = _PROPAGATE_MIN_IOU,
+                 min_seed_iou: float = _PROPAGATE_MIN_SEED_IOU,
                  parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -641,6 +662,8 @@ class SAM3PropagateWorker(QThread):
         self.model_path = model_path
         self.device = device
         self.conf = conf
+        self.min_iou = min_iou
+        self.min_seed_iou = min_seed_iou
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -675,7 +698,9 @@ class SAM3PropagateWorker(QThread):
             try:
                 det, device = _propagate_step(
                     img_path, prev, self.concept, self.model_path, device,
-                    self.conf)
+                    self.conf, min_iou=self.min_iou,
+                    seed_bbox_xyxy=self.seed_bbox_xyxy,
+                    min_seed_iou=self.min_seed_iou)
             except Exception as e:
                 self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
                 return

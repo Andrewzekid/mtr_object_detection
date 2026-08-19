@@ -22,10 +22,9 @@ USAGE:
         --output ./output/vis_yolo_train_detection
 
     # Visualize YOLO segmentation dataset
-    python scripts/visualize.py --mode yolo-seg \\
-        --dataset ./train_yolo_seg \\
-        --split train \\
-        --output ./output/vis_yolo_seg
+    python scripts/visualize.py --model runs/segment/output/training/mtr4k_exit_sign_yolo26n_v3/yolo_training/weights/best.pt
+        --images-dir ./Datasets/MTR/insta360/insta360_frames/20260811_151944_524/ \
+        --output ./output/vis_yolo_insta_360
 
     # Visualize model predictions
     python scripts/visualize.py --mode predictions \\

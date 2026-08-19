@@ -1321,10 +1321,7 @@ def test_propagate_button_enable_rules(lr, propagate_win):
     win._update_propagate_button()
     assert win.side.btn_propagate.isEnabled()
 
-    win.canvas._multi_selected = {0, 1}  # multi-select → disabled
-    win._update_propagate_button()
-    assert not win.side.btn_propagate.isEnabled()
-    win.canvas._multi_selected = {0}
+    win.canvas._multi_selected = {0, 1}  # multi-select → also enabled
     win._update_propagate_button()
     assert win.side.btn_propagate.isEnabled()
 
@@ -1428,6 +1425,79 @@ def test_propagate_queued_dispatch_after_run_ends(lr, propagate_seeded):
     assert w4 is not w3 and w4.isRunning()
     assert w4.kw["start_frame_idx"] == 2
     assert win._propagate_meta["track_id"] == 7
+
+
+def test_propagate_multi_select_queues_one_job_per_track(lr, propagate_win):
+    """Selecting two boxes of different tracks propagates both: the first
+    starts immediately, the second waits in the SAM3 queue."""
+    win, coco = propagate_win
+    image_id = coco.ensure_image(FakeIdx().frame_at(0), 100, 80)
+    coco.add_box(image_id, 10, 10, 30, 20, 0)
+    coco.add_box(image_id, 50, 40, 20, 20, 0)
+    win._refresh_boxes()
+    win.canvas._multi_selected = {0, 1}
+    win.canvas._selected_idx = 1
+    win._on_propagate_track()
+    assert len(FakePropagateWorker.instances) == 1  # first track running
+    assert FakePropagateWorker.instances[-1].isRunning()
+    assert len(win._sam3_queue) == 1
+    assert win._sam3_queue[0]["kind"] == "propagate"
+    win._sam3_queue.clear()
+
+
+def test_propagate_multi_select_dedupes_shared_track(lr, propagate_win):
+    """Two selected boxes with the SAME track id seed that track once."""
+    win, coco = propagate_win
+    image_id = coco.ensure_image(FakeIdx().frame_at(0), 100, 80)
+    a = coco.add_box(image_id, 10, 10, 30, 20, 0)
+    b = coco.add_box(image_id, 50, 40, 20, 20, 0)
+    tid = coco.get_box(a)["track_id"]
+    coco.set_track_id(b, tid)
+    win._refresh_boxes()
+    win.canvas._multi_selected = {0, 1}
+    win.canvas._selected_idx = 1
+    win._on_propagate_track()
+    assert len(FakePropagateWorker.instances) == 1
+    assert len(win._sam3_queue) == 0  # nothing queued — one track only
+
+
+def test_select_all_and_esc_clear(lr, propagate_win):
+    """Ctrl+A (canvas.select_all) selects every box; Esc
+    (canvas.clear_selection via keyPressEvent) clears the selection."""
+    win, coco = propagate_win
+    image_id = coco.ensure_image(FakeIdx().frame_at(0), 100, 80)
+    coco.add_box(image_id, 10, 10, 30, 20, 0)
+    coco.add_box(image_id, 50, 40, 20, 20, 0)
+    win._refresh_boxes()
+    win.canvas.select_all()
+    assert win.canvas._multi_selected == {0, 1}
+    assert win.side.btn_propagate.isEnabled()
+    esc = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, Qt.Key_Escape,
+                          Qt.NoModifier)
+    win.canvas.keyPressEvent(esc)
+    assert win.canvas._multi_selected == set()
+    assert win.canvas._selected_idx == -1
+    assert not win.side.btn_propagate.isEnabled()
+
+
+def test_paint_masks_tolerates_size_mismatch(lr, propagate_win, qapp):
+    """A mask whose shape differs from the canvas image must be resized,
+    not crash paintEvent (the old code built the RGBA array from the
+    pre-resize shape → ValueError → masks silently never painted)."""
+    win, coco = propagate_win
+    image_id = coco.ensure_image(FakeIdx().frame_at(0), 100, 80)
+    ann_id = coco.add_box(image_id, 10, 10, 30, 20, 0)
+    mask = np.zeros((40, 50), dtype=bool)  # half the canvas image size
+    mask[5:20, 5:30] = True
+    coco.set_mask(ann_id, mask)
+    win._refresh_boxes()
+    win.canvas.show()
+    win.canvas.repaint()
+    qapp.processEvents()
+    img = win.canvas.grab().toImage()
+    pt = win.canvas._img_to_widget(20, 20)
+    c = img.pixelColor(int(pt.x()), int(pt.y()))
+    assert (c.red(), c.green(), c.blue()) != (0, 0, 0)  # mask overlay drawn
 
 
 # ---------------------------------------------------------------------------

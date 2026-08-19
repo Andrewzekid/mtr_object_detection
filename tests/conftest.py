@@ -146,9 +146,11 @@ class FakePropagateWorker:
     instances = []
 
     def __init__(self, frame_index, start_frame_idx, seed_bbox_xyxy,
-                 concept, tmp_dir, model_path, device, conf, parent=None):
+                 concept, tmp_dir, model_path, device, conf,
+                 min_iou=0.3, min_seed_iou=0.2, parent=None):
         self.kw = dict(start_frame_idx=start_frame_idx,
-                       seed_bbox_xyxy=seed_bbox_xyxy, concept=concept)
+                       seed_bbox_xyxy=seed_bbox_xyxy, concept=concept,
+                       min_iou=min_iou, min_seed_iou=min_seed_iou)
         self.frame_done_signal = FakeSig()
         self.progress_signal = FakeSig()
         self.finished_signal = FakeSig()

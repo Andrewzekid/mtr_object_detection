@@ -449,7 +449,8 @@ def test_propagate_worker_chains_and_stops_when_lost(sam3_on, workers,
     scripted = {1: det1, 2: None}  # found on frame 1, lost on frame 2
     calls = []
 
-    def fake_step(image_path, prev_bbox, concept, model_path, device, conf):
+    def fake_step(image_path, prev_bbox, concept, model_path, device, conf,
+                  **kwargs):
         calls.append(list(prev_bbox))
         frame_idx = int(image_path.split("_")[-1].split(".")[0])
         return scripted[frame_idx], device

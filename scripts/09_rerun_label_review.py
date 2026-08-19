@@ -96,14 +96,19 @@ every 10 frames.
 
 SAM3 track propagation
 ----------------------
-With exactly one box selected, "Propagate →" re-detects that object on
-every following frame: each frame's SAM3 exemplar prompt is the previous
-frame's detected box (chained), so the object keeps the seed's track id
-and category. The chain stops automatically at the first frame where SAM3
-finds nothing (object lost); frames that already have a box with that
-track id are skipped. Propagated boxes are ordinary editable boxes with
-masks plus ``propagated: true`` / ``confidence`` provenance fields; the
-whole run is one Ctrl+Z step, and edits you make while it runs stay
+With one or more boxes selected, "Propagate →" re-detects each selected
+object on every following frame: each frame's SAM3 exemplar prompt is the
+previous frame's detected box (chained), so the object keeps the seed's
+track id and category. Several selected tracks run one at a time through
+the SAM3 queue (boxes sharing a track id seed that track once). A chain
+stops automatically at the first frame where SAM3 finds no detection that
+overlaps both the previous frame's box (IoU >= ``propagate_min_iou``,
+default 0.3) and the seed box (IoU >= ``propagate_min_seed_iou``, default
+0.2) — i.e. when the object is lost or has drifted too far from where it
+started; frames that already have a box with that track id are skipped.
+Propagated boxes are ordinary editable boxes with
+masks plus ``propagated: true`` / ``confidence`` provenance fields; each
+track's run is one Ctrl+Z step, and edits you make while it runs stay
 separate undo entries. Propagation shares the SAM3 queue and the Cancel
 button.
 
@@ -136,7 +141,9 @@ Key bindings (in the 2D canvas, when it has focus — click it once):
     B / ←    : previous frame
     X        : discard ALL boxes on this frame and advance
     S        : save final result and quit
-    Q / ESC  : quit (progress saved in tmp file)
+    Q        : quit (progress saved in tmp file)
+    ESC      : clear the current selection; quit when nothing is selected
+    Ctrl+A   : select all boxes on the current frame
     0..9     : when drawing, assign category id to the pending rectangle
                (use the buttons in the side panel for ids > 9). After the
                first box, new draws auto-reuse the previous box's category
@@ -1578,6 +1585,7 @@ class CanvasWidget(QWidget):
                 m_pil = _PILImage.fromarray((mask.astype(np.uint8) * 255), mode="L")
                 m_pil = m_pil.resize((iw, ih), _PILImage.NEAREST)
                 mask = np.array(m_pil) > 0
+                h, w = mask.shape[:2]
             cat_id = box.get("cat_id", 0)
             r, g, b = self._color_for_cat(cat_id)
             rgba = np.zeros((h, w, 4), dtype=np.uint8)
@@ -1905,6 +1913,24 @@ class CanvasWidget(QWidget):
         )
         self.update()
 
+    # ----------------------- selection --------------------------------- #
+
+    def select_all(self) -> None:
+        """Select every box on the current frame (Ctrl+A)."""
+        if not self._boxes:
+            return
+        self._multi_selected = set(range(len(self._boxes)))
+        self._selected_idx = len(self._boxes) - 1
+        self.selection_changed.emit(self._selected_idx)
+        self.update()
+
+    def clear_selection(self) -> None:
+        """Drop the whole selection (Esc)."""
+        self._selected_idx = -1
+        self._multi_selected = set()
+        self.selection_changed.emit(-1)
+        self.update()
+
     # ----------------------- keyboard ---------------------------------- #
 
     def keyPressEvent(self, ev: QtGui.QKeyEvent) -> None:
@@ -1946,8 +1972,15 @@ class CanvasWidget(QWidget):
             self.discard_all.emit()
         elif k in (Qt.Key_S,):
             self.save_quit.emit()
-        elif k in (Qt.Key_Q, Qt.Key_Escape):
+        elif k == Qt.Key_Q:
             self.quit_request.emit()
+        elif k == Qt.Key_Escape:
+            # Esc clears the current selection first; with nothing selected
+            # it falls through to the usual quit request.
+            if self._multi_selected or self._selected_idx >= 0:
+                self.clear_selection()
+            else:
+                self.quit_request.emit()
         elif k == Qt.Key_M:
             self.toggle_masks.emit()
         elif k == Qt.Key_R:
@@ -2198,11 +2231,12 @@ class SidePanel(QWidget):
 
         self.btn_propagate = QPushButton("Propagate →")
         self.btn_propagate.setToolTip(
-            "Propagate the selected box's track forward: SAM3 re-detects "
-            "the object on each following frame (chained from the previous "
-            "frame's box), keeping the same track id. Stops when the "
-            "object is lost. Select exactly one box first.")
-        self.btn_propagate.setEnabled(False)  # needs a single selected box
+            "Propagate the selected boxes' tracks forward: SAM3 re-detects "
+            "each object on every following frame (chained from the "
+            "previous frame's box), keeping the same track id. Each track "
+            "stops when its object is lost; multiple selected tracks run "
+            "one at a time. Select one or more boxes first.")
+        self.btn_propagate.setEnabled(False)  # needs a selected box
         self.btn_propagate.clicked.connect(self.propagate_clicked.emit)
         layout.addWidget(self.btn_propagate)
 
@@ -2290,6 +2324,7 @@ class SidePanel(QWidget):
             "0-9 = pick cat (when drawing) &nbsp; + / - = zoom &nbsp; F = fit<br>"
             "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause<br>"
             "Z = zoom to sel &nbsp; Ctrl+Z = undo &nbsp; Ctrl+Shift+Z = redo<br>"
+            "Ctrl+A = select all &nbsp; Esc = clear sel / quit<br>"
             "U = jump to next unlabeled frame &nbsp; C = focus cat-id field<br>"
             "T = focus track-id field &nbsp; K = toggle keyframe<br>"
             "I = interpolate between nearest labeled frames<br>"
@@ -2678,6 +2713,26 @@ class ConfigDialog(QtWidgets.QDialog):
             "(highest confidence kept). SAM3 often returns several masks\n"
             "for one object. 1.0 disables dedup.")
         sam3_form.addRow("Autolabel NMS IoU", self.spin_nms_iou)
+        self.spin_propagate_iou = QtWidgets.QDoubleSpinBox()
+        self.spin_propagate_iou.setRange(0.0, 1.0)
+        self.spin_propagate_iou.setSingleStep(0.05)
+        self.spin_propagate_iou.setDecimals(2)
+        self.spin_propagate_iou.setToolTip(
+            "Track propagation: a detection must overlap the PREVIOUS\n"
+            "frame's box by at least this much, otherwise the object is\n"
+            "treated as lost and the chain stops. Higher = stricter.")
+        sam3_form.addRow("Propagate min IoU", self.spin_propagate_iou)
+        self.spin_propagate_seed_iou = QtWidgets.QDoubleSpinBox()
+        self.spin_propagate_seed_iou.setRange(0.0, 1.0)
+        self.spin_propagate_seed_iou.setSingleStep(0.05)
+        self.spin_propagate_seed_iou.setDecimals(2)
+        self.spin_propagate_seed_iou.setToolTip(
+            "Track propagation: a detection must also overlap the SEED\n"
+            "(first) box by at least this much. Anchors the chain so it\n"
+            "can't drift onto a different object under large camera\n"
+            "motion. 0 disables the seed anchor.")
+        sam3_form.addRow("Propagate min seed IoU",
+                         self.spin_propagate_seed_iou)
         body.addWidget(sam3_box)
 
         # --- Mask opacity --------------------------------------------------
@@ -2777,6 +2832,8 @@ class ConfigDialog(QtWidgets.QDialog):
         self.check_auto_segment.setChecked(win.auto_segment)
         self.spin_min_poly_area.setValue(int(win.coco.min_polygon_area))
         self.spin_nms_iou.setValue(win.sam3_nms_iou)
+        self.spin_propagate_iou.setValue(win.sam3_propagate_min_iou)
+        self.spin_propagate_seed_iou.setValue(win.sam3_propagate_seed_iou)
         self.spin_opacity.setValue(win.side.opacity_slider.value())
         self.check_sticky_ids.setChecked(win.coco.sticky_track_ids)
 
@@ -2805,6 +2862,12 @@ class ConfigDialog(QtWidgets.QDialog):
         if "autolabel_nms_iou" in sam3:
             self.spin_nms_iou.setValue(
                 max(0.0, min(1.0, float(sam3["autolabel_nms_iou"]))))
+        if "propagate_min_iou" in sam3:
+            self.spin_propagate_iou.setValue(
+                max(0.0, min(1.0, float(sam3["propagate_min_iou"]))))
+        if "propagate_min_seed_iou" in sam3:
+            self.spin_propagate_seed_iou.setValue(
+                max(0.0, min(1.0, float(sam3["propagate_min_seed_iou"]))))
         ui = cfg.get("ui", {})
         if "advanced" in ui:
             self.check_advanced.setChecked(bool(ui["advanced"]))
@@ -2844,6 +2907,9 @@ class ConfigDialog(QtWidgets.QDialog):
                 "auto_segment": self.check_auto_segment.isChecked(),
                 "min_polygon_area": self.spin_min_poly_area.value(),
                 "autolabel_nms_iou": self.spin_nms_iou.value(),
+                "propagate_min_iou": self.spin_propagate_iou.value(),
+                "propagate_min_seed_iou":
+                    self.spin_propagate_seed_iou.value(),
             },
             "ui": {
                 "advanced": advanced,
@@ -2925,6 +2991,12 @@ class ReviewWindow(QMainWindow):
         # IoU threshold for class-aware NMS on autolabel detections
         # (config: sam3.autolabel_nms_iou; 1.0 disables dedup).
         self.sam3_nms_iou: float = 0.7
+        # Lost-detection thresholds for track propagation: a detection must
+        # overlap the previous frame's box by >= min_iou and the seed box
+        # by >= min_seed_iou, otherwise the chain stops (config:
+        # sam3.propagate_min_iou / sam3.propagate_min_seed_iou).
+        self.sam3_propagate_min_iou: float = 0.3
+        self.sam3_propagate_seed_iou: float = 0.2
         self.auto_segment = auto_segment
         self.interp_flow_method = interp_flow_method
         self.interp_camera_model = interp_camera_model
@@ -3122,6 +3194,9 @@ class ReviewWindow(QMainWindow):
         sc_redo.activated.connect(self._on_redo)
         sc_redo_y = QShortcut(QtGui.QKeySequence("Ctrl+Y"), self)
         sc_redo_y.activated.connect(self._on_redo)
+        # Ctrl+A = select all boxes on the current frame.
+        sc_sel_all = QShortcut(QtGui.QKeySequence("Ctrl+A"), self)
+        sc_sel_all.activated.connect(self.canvas.select_all)
 
         # Load first frame, then restore persisted UI state.
         QTimer.singleShot(50, self._load_current)
@@ -3385,6 +3460,12 @@ class ReviewWindow(QMainWindow):
         if "autolabel_nms_iou" in sam3_cfg:
             self.sam3_nms_iou = max(
                 0.0, min(1.0, float(sam3_cfg["autolabel_nms_iou"])))
+        if "propagate_min_iou" in sam3_cfg:
+            self.sam3_propagate_min_iou = max(
+                0.0, min(1.0, float(sam3_cfg["propagate_min_iou"])))
+        if "propagate_min_seed_iou" in sam3_cfg:
+            self.sam3_propagate_seed_iou = max(
+                0.0, min(1.0, float(sam3_cfg["propagate_min_seed_iou"])))
         ui_cfg = cfg.get("ui", {})
         if "advanced" in ui_cfg:
             self.advanced_ui = bool(ui_cfg["advanced"])
@@ -4831,70 +4912,99 @@ class ReviewWindow(QMainWindow):
 
     # ------------------- SAM3 track propagation ------------------------- #
 
+    def _selected_boxes(self) -> List[Dict[str, Any]]:
+        """All selected canvas box dicts (multi-select aware)."""
+        sel = sorted(i for i in self.canvas._multi_selected
+                     if 0 <= i < len(self.canvas._boxes))
+        if not sel and 0 <= self.canvas._selected_idx < len(self.canvas._boxes):
+            sel = [self.canvas._selected_idx]
+        return [self.canvas._boxes[i] for i in sel]
+
     def _selected_single_box(self) -> Optional[Dict[str, Any]]:
         """The canvas box dict when exactly one box is selected, else None."""
-        sel = {i for i in self.canvas._multi_selected
-               if 0 <= i < len(self.canvas._boxes)}
-        if not sel and 0 <= self.canvas._selected_idx < len(self.canvas._boxes):
-            sel = {self.canvas._selected_idx}
-        if len(sel) != 1:
-            return None
-        return self.canvas._boxes[next(iter(sel))]
+        boxes = self._selected_boxes()
+        return boxes[0] if len(boxes) == 1 else None
 
     def _update_propagate_button(self) -> None:
-        """Propagate needs exactly one selected box on a non-last frame."""
-        ok = (self._selected_single_box() is not None
+        """Propagate needs at least one selected box on a non-last frame."""
+        ok = (bool(self._selected_boxes())
               and self._current_idx < len(self.frame_index) - 1)
         self.side.btn_propagate.setEnabled(ok)
 
     def _on_propagate_track(self) -> None:
-        """Seed SAM3 propagation from the selected box (Propagate →)."""
+        """Seed SAM3 propagation from the selected boxes (Propagate →).
+
+        With several boxes selected, each distinct track is propagated —
+        the jobs run one at a time through the SAM3 queue. Boxes sharing a
+        track id collapse into a single seed (the track is propagated
+        once); boxes without a track id each seed a fresh track.
+        """
         if not _SAM3_AVAILABLE:
             QMessageBox.warning(self, "SAM3 unavailable",
                                 "SAM3 (ultralytics) is not importable.")
             return
-        box = self._selected_single_box()
-        if box is None:
+        boxes = self._selected_boxes()
+        if not boxes:
             self.statusBar().showMessage(
-                "Select exactly one box first, then Propagate →", 3000)
+                "Select one or more boxes first, then Propagate →", 3000)
             return
         n = len(self.frame_index)
         if self._current_idx >= n - 1:
             self.statusBar().showMessage(
                 "Seed is on the last frame — nothing to propagate to", 3000)
             return
-        ann_id = box["id"]
-        tid = box.get("track_id")
-        cat_id = box.get("cat_id", 0)
-        concept = self.coco.cat_map.get(cat_id, "object")
-        x, y, w, h = box["bbox"]
-        # A seedless box would get a fresh id, but only commit it after the
-        # user confirms — otherwise "No" leaves a stray track id on the box
-        # and consumes a counter value. Preview it without consuming.
-        tid_shown = (tid if tid is not None
-                     else self.coco.peek_fresh_track_id())
+        # One seed per track id; track-less boxes are separate seeds.
+        seeds: List[Dict[str, Any]] = []
+        seen_tids = set()
+        for box in boxes:
+            tid = box.get("track_id")
+            if tid is not None:
+                if tid in seen_tids:
+                    continue
+                seen_tids.add(tid)
+            seeds.append(box)
+        # Preview the labels without consuming fresh track ids (see the
+        # single-track comment below): only commit them after confirmation.
+        labels = []
+        next_fresh = self.coco.peek_fresh_track_id()
+        for box in seeds:
+            tid = box.get("track_id")
+            cat_id = box.get("cat_id", 0)
+            concept = self.coco.cat_map.get(cat_id, "object")
+            if tid is None:
+                tid_shown = next_fresh
+                next_fresh += 1
+            else:
+                tid_shown = tid
+            labels.append(f"T{tid_shown} ({concept})")
         ret = QMessageBox.question(
-            self, "Propagate track forward?",
-            f"Propagate T{tid_shown} ({concept}) from frame "
+            self, "Propagate track(s) forward?",
+            f"Propagate {', '.join(labels)} from frame "
             f"{self._current_idx + 1} to the end ({n - self._current_idx - 1} "
-            f"frame(s))?\n\nSAM3 re-detects the object frame-by-frame, "
-            f"chained from the previous frame's box. It stops automatically "
-            f"when the object is lost. Frames that already have a "
-            f"T{tid_shown} box are skipped. Runs in the background (device: "
-            f"{self.sam3_device}); Cancel anytime. One Ctrl+Z undoes the "
-            f"whole run.",
+            f"frame(s))?\n\nSAM3 re-detects each object frame-by-frame, "
+            f"chained from the previous frame's box. Each track stops "
+            f"automatically when its object is lost. Frames that already "
+            f"have a box with that track id are skipped. Tracks run one "
+            f"at a time in the background (device: {self.sam3_device}); "
+            f"Cancel anytime. Each track is its own Ctrl+Z step.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes)
         if ret != QMessageBox.StandardButton.Yes:
             return
-        if tid is None:
-            # Seed without a track id: assign a fresh one now that it's
-            # confirmed (its own undoable entry).
-            tid = self.coco._fresh_track_id()
-            self.coco.set_track_id(ann_id, tid)
-            box["track_id"] = tid
-        self._start_propagate_worker(
-            self._current_idx, [x, y, x + w, y + h], concept, tid, cat_id)
+        for box in seeds:
+            tid = box.get("track_id")
+            if tid is None:
+                # Seed without a track id: assign a fresh one now that it's
+                # confirmed (its own undoable entry).
+                tid = self.coco._fresh_track_id()
+                self.coco.set_track_id(box["id"], tid)
+                box["track_id"] = tid
+            cat_id = box.get("cat_id", 0)
+            concept = self.coco.cat_map.get(cat_id, "object")
+            x, y, w, h = box["bbox"]
+            self._start_propagate_worker(
+                self._current_idx, [x, y, x + w, y + h], concept, tid,
+                cat_id)
 
     def _start_propagate_worker(self, start_frame_idx: int,
                                 seed_bbox_xyxy: list, concept: str,
@@ -4925,6 +5035,8 @@ class ReviewWindow(QMainWindow):
             model_path=self.sam3_model,
             device=self.sam3_device,
             conf=self.sam3_conf,
+            min_iou=self.sam3_propagate_min_iou,
+            min_seed_iou=self.sam3_propagate_seed_iou,
             parent=self,
         )
         self._sam3_propagate_worker.frame_done_signal.connect(
