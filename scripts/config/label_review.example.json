@@ -7,6 +7,7 @@
   },
   "sam3": {
     "device": "auto",
+    "model": null,
     "conf": 0.25,
     "auto_segment": false,
     "min_polygon_area": 100,

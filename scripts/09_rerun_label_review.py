@@ -2693,6 +2693,18 @@ class ConfigDialog(QtWidgets.QDialog):
         self.combo_device = QtWidgets.QComboBox()
         self.combo_device.addItems(["auto", "cuda", "cpu"])
         sam3_form.addRow("Device", self.combo_device)
+        self.edit_sam3_model = QtWidgets.QLineEdit()
+        self.edit_sam3_model.setPlaceholderText(
+            "default: core/sam3/models/sam3-model/sam3.pt")
+        self.edit_sam3_model.setToolTip(
+            "Path to the SAM3 weights (.pt). Leave empty for the default\n"
+            "location. Takes effect on the next SAM3 run.")
+        btn_browse_model = QPushButton("Browse…")
+        btn_browse_model.clicked.connect(self._browse_sam3_model)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.edit_sam3_model, 1)
+        model_row.addWidget(btn_browse_model)
+        sam3_form.addRow("Model path", model_row)
         self.spin_sam3_conf = QtWidgets.QDoubleSpinBox()
         self.spin_sam3_conf.setRange(0.0, 1.0)
         self.spin_sam3_conf.setSingleStep(0.05)
@@ -2834,6 +2846,7 @@ class ConfigDialog(QtWidgets.QDialog):
         self.check_confirm_mismatch.setChecked(win.interp_confirm_mismatch)
         self.check_show_track_ids.setChecked(win.show_track_ids)
         self.combo_device.setCurrentText(win.sam3_device)
+        self.edit_sam3_model.setText(win.sam3_model or "")
         self.spin_sam3_conf.setValue(win.sam3_conf)
         self.check_auto_segment.setChecked(win.auto_segment)
         self.spin_min_poly_area.setValue(int(win.coco.min_polygon_area))
@@ -2858,6 +2871,8 @@ class ConfigDialog(QtWidgets.QDialog):
         sam3 = cfg.get("sam3", {})
         if sam3.get("device") in ("auto", "cuda", "cpu"):
             self.combo_device.setCurrentText(sam3["device"])
+        if sam3.get("model"):
+            self.edit_sam3_model.setText(str(sam3["model"]))
         if "conf" in sam3:
             self.spin_sam3_conf.setValue(float(sam3["conf"]))
         if "auto_segment" in sam3:
@@ -2909,6 +2924,7 @@ class ConfigDialog(QtWidgets.QDialog):
             },
             "sam3": {
                 "device": self.combo_device.currentText(),
+                "model": self.edit_sam3_model.text().strip() or None,
                 "conf": self.spin_sam3_conf.value(),
                 "auto_segment": self.check_auto_segment.isChecked(),
                 "min_polygon_area": self.spin_min_poly_area.value(),
@@ -2944,6 +2960,12 @@ class ConfigDialog(QtWidgets.QDialog):
         self._prefill_from_config(cfg)
         self.win._apply_runtime_config(self._collect())
         self.win.statusBar().showMessage(f"Config loaded: {path}", 4000)
+
+    def _browse_sam3_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "SAM3 weights", "", "PyTorch weights (*.pt);;All files (*)")
+        if path:
+            self.edit_sam3_model.setText(path)
 
     def _on_apply(self) -> None:
         self.win._apply_runtime_config(self._collect())
@@ -3456,6 +3478,8 @@ class ReviewWindow(QMainWindow):
             # 'auto' must resolve to a concrete device here — workers hand
             # sam3_device straight to run_sam3, which won't interpret 'auto'.
             self.sam3_device = _resolve_device(dev)
+        if sam3_cfg.get("model"):
+            self.sam3_model = str(sam3_cfg["model"])
         if "conf" in sam3_cfg:
             self.sam3_conf = float(sam3_cfg["conf"])
         if "auto_segment" in sam3_cfg:
@@ -5539,7 +5563,7 @@ def main():
     signal.signal(signal.SIGINT, lambda *a: app.quit())
 
     win = ReviewWindow(frame_index, coco,
-                       sam3_model=args.sam3_model,
+                       sam3_model=sam3_cfg.get("model") or args.sam3_model,
                        sam3_device=sam3_device,
                        sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),
                        auto_segment=bool(sam3_cfg.get("auto_segment",
