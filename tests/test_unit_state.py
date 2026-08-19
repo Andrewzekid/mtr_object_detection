@@ -372,6 +372,7 @@ def test_save_load_roundtrip_fields(lr, tmp_path):
     assert d["categories"] == cats
     assert d["images"][0]["timestamp_ns"] == 3 * 10**9
     assert d["annotations"][0]["bbox"] == [5.0, 6.0, 7.0, 8.0]
+    assert d["annotated_image_ids"] == [d["images"][0]["id"]]
     # progress sidecar
     prog = json.load(open(path.replace(".json", ".progress")))
     assert prog["reviewed"] == [3]

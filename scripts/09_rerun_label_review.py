@@ -119,6 +119,8 @@ json via ``--json``.
 Timestamps are stored in the COCO output as the ``timestamp_ns`` field on
 each image, and a side-table ``timestamp_ns → image_id`` is written into the
 JSON so the result can be joined back to external databases by timestamp.
+The JSON also carries ``annotated_image_ids``: the sorted ids of images
+that have at least one annotation.
 
 USAGE
 -----
@@ -906,6 +908,10 @@ class CocoState:
             "images": self.images,
             "annotations": final_anns,
             "categories": self.categories,
+            # Convenience index: ids of images that have at least one
+            # annotation (i.e. the frames actually annotated).
+            "annotated_image_ids": sorted(
+                {a["image_id"] for a in final_anns}),
         }
         path = self.output_json if is_final else tmp_path
         with open(path, "w", encoding="utf-8") as f:
