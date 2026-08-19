@@ -57,8 +57,39 @@ reference with inputs/outputs is at the bottom of this file.
 ## Prerequisites
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt        # loose bounds
+# or exactly reproduce the dev machine:
+pip install -r requirements-lock.txt
 ```
+
+### Standalone bundle (no Python needed on the target)
+
+The label review app can be frozen into a single-folder executable with
+PyInstaller (Linux "exe"):
+
+```bash
+pyinstaller scripts/label_review.spec --distpath dist --workpath build --noconfirm
+# result: dist/label-review/label-review
+```
+
+Copy the `dist/label-review/` folder to the target machine (e.g.
+`tar czf label-review.tar.gz -C dist label-review`) and run:
+
+```bash
+./label-review --images /path/to/frames --output_json out/coco.json \
+    --sam3-model /path/to/sam3.pt
+```
+
+Notes:
+
+- SAM3 weights are not bundled (3.4 GB) — pass `--sam3-model` or place
+  `core/sam3/models/sam3-model/sam3.pt` under the working directory.
+- The bundle inherits this machine's torch build: a CUDA torch bundle needs
+  a compatible NVIDIA driver on the target; build in a CPU-torch env for
+  CPU-only targets.
+- On a fresh Linux install PyQt6 needs system GL/X libraries:
+  `sudo apt install libgl1 libegl1 libxkbcommon0 libdbus-1-3`.
+
 
 - **Qwen3.6 labeling** can run locally with Ollama or via DashScope API.
   The examples below use the DashScope API. Set your key first:

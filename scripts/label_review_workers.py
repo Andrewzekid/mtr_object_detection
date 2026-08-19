@@ -734,6 +734,11 @@ def _get_interp13():
     if _interp13_mod is None:
         from importlib import util
         path = Path(__file__).resolve().parent / "13_interpolate_tracks.py"
+        if not path.exists():
+            # PyInstaller bundle: shipped as a data file in the bundle root.
+            import sys
+            path = Path(getattr(sys, "_MEIPASS", ".")) / \
+                "13_interpolate_tracks.py"
         spec = util.spec_from_file_location("interpolate_tracks", path)
         mod = util.module_from_spec(spec)
         spec.loader.exec_module(mod)

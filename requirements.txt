@@ -32,3 +32,8 @@ PyYAML>=6.0
 
 # Additional Utilities
 pillow>=9.0.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+
+# Tests
+pytest>=8.0.0

@@ -1,0 +1,20 @@
+# Pinned versions from the known-working dev machine (Python 3.13).
+# Use this for an exact reproduction: pip install -r requirements-lock.txt
+# requirements.txt keeps loose lower bounds for flexibility.
+PyQt6==6.11.0
+PyQt6-WebEngine==6.11.0
+rerun-sdk==0.34.1
+pyarrow==25.0.0
+opencv-python-headless==4.10.0.84
+numpy==2.3.5
+torch==2.12.1
+ultralytics==8.4.83
+segment-anything==1.0
+requests==2.33.1
+openai==2.44.0
+python-dotenv==1.2.1
+PyYAML==6.0.3
+pillow==11.3.0
+matplotlib==3.11.0
+tqdm==4.67.3
+pytest==9.1.1
