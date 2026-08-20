@@ -96,6 +96,19 @@ class CocoState:
         # successful save(). Cleared by save(). UI shows a "●" indicator.
         self.dirty: bool = False
         self.undo_stack: UndoStack = undo_stack or UndoStack()
+        # --- Hot-path query caches (invalidated by _invalidate_ann_caches) ---
+        # anns_for_image() and labeled_frame_idxs() are called on every
+        # playback tick; without these they were O(total_annotations) /
+        # O(annotations*images) per tick, capping playback well below the
+        # configured speed. A dirty flag + lazy rebuild keeps them O(1) /
+        # O(images) on the hot path.
+        self._anns_cache_dirty: bool = True
+        self._anns_by_image: Dict[int, List[Dict[str, Any]]] = {}
+        self._labeled_frame_idxs_cache: Optional[List[int]] = None
+        self._labeled_frame_idxs_side_cache: Dict[str, List[int]] = {}
+        # Image-record-by-id index so ensure_image's size-update path is
+        # O(1) instead of scanning self.images linearly every tick.
+        self._img_by_id: Dict[int, Dict[str, Any]] = {}
 
     # ------------------------- persistence ---------------------------- #
 
@@ -165,8 +178,10 @@ class CocoState:
                     self._img_id_by_ts[(ts, side)] = img["id"]
                 self._img_id_by_idx[(img.get("frame_idx", 0), side)] = \
                     img["id"]
+                self._img_by_id[img["id"]] = img
             print(f"📂 Loaded existing COCO: {path} "
                   f"({len(self.images)} imgs, {len(self.annotations)} anns)")
+            self._invalidate_ann_caches()
 
     def load_progress(self, total_frames: int) -> int:
         if os.path.exists(self.progress_file):
@@ -275,6 +290,7 @@ class CocoState:
             n_imported += 1
         if n_imported:
             self.dirty = True
+            self._invalidate_ann_caches()
         return len(frames_matched), n_imported, n_skipped
 
     def save(self, is_final: bool) -> None:
@@ -354,12 +370,12 @@ class CocoState:
         ts_key = (ts, side)
         if ts_key in self._img_id_by_ts:
             img_id = self._img_id_by_ts[ts_key]
-            # update size if needed
-            for img in self.images:
-                if img["id"] == img_id:
-                    img["width"] = width
-                    img["height"] = height
-                    break
+            # update size if needed (O(1) via the by-id index instead of
+            # scanning self.images linearly — that scan ran every tick).
+            img = self._img_by_id.get(img_id)
+            if img is not None:
+                img["width"] = width
+                img["height"] = height
             return img_id
         img_id = len(self.images) + 1
         img_rec = {
@@ -373,6 +389,7 @@ class CocoState:
             "side": side,
         }
         self.images.append(img_rec)
+        self._img_by_id[img_id] = img_rec
         self._img_id_by_ts[ts_key] = img_id
         self._img_id_by_idx[(frame["frame_idx"], side)] = img_id
         return img_id
@@ -395,6 +412,7 @@ class CocoState:
         self.annotations.append(ann)
         self._ann_id_next += 1
         self.dirty = True
+        self._invalidate_ann_caches()
         # No undo entry: seeding happens automatically on first frame visit,
         # so undoable seeds would (a) evict real user history from the
         # bounded stack and (b) let Ctrl+Z mutate frames the user isn't
@@ -419,6 +437,7 @@ class CocoState:
         self.annotations.append(ann)
         self._ann_id_next += 1
         self.dirty = True
+        self._invalidate_ann_caches()
         new_id = ann["id"]
         # Undo: remove the added box.
         self.undo_stack.push(
@@ -439,6 +458,7 @@ class CocoState:
                 break
         self.removed_ids.add(ann_id)
         self.dirty = True
+        self._invalidate_ann_caches()
         # Undo: re-add the box (un-remove).
         self.undo_stack.push(
             f"delete box #{ann_id}",
@@ -650,32 +670,54 @@ class CocoState:
         ``side=None`` means "either side" (progress/UX semantics — a frame
         counts as labeled when any side has boxes); pass ``"left"`` /
         ``"right"`` for side-specific queries (interpolation anchors)."""
-        boxed_img_ids = {
-            ann["image_id"] for ann in self.annotations
-            if ann["id"] not in self.removed_ids
-        }
-        out = {
-            img.get("frame_idx", 0)
-            for img in self.images
-            if img["id"] in boxed_img_ids
-            and (side is None or img.get("side", "left") == side)
-        }
-        return sorted(out)
+        if side is None:
+            if self._labeled_frame_idxs_cache is not None:
+                return list(self._labeled_frame_idxs_cache)
+        else:
+            cached = self._labeled_frame_idxs_side_cache.get(side)
+            if cached is not None:
+                return list(cached)
+        if self._anns_cache_dirty:
+            self._rebuild_ann_caches()
+        # Map image_id -> frame_idx (+ side) for the boxed images only.
+        boxed_img_ids = set(self._anns_by_image.keys())
+        if side is None:
+            out = sorted({
+                img.get("frame_idx", 0)
+                for img in self.images
+                if img["id"] in boxed_img_ids
+            })
+            self._labeled_frame_idxs_cache = out
+        else:
+            out = sorted({
+                img.get("frame_idx", 0)
+                for img in self.images
+                if img["id"] in boxed_img_ids
+                and img.get("side", "left") == side
+            })
+            self._labeled_frame_idxs_side_cache[side] = out
+        return list(out)
 
     def frame_has_boxes(self, frame_idx: int,
                         side: Optional[str] = None) -> bool:
         """``side=None`` → "either side" (progress/UX); pass a side for
         side-specific checks (interpolation anchor detection)."""
         if side is not None:
-            img_ids = [self._img_id_by_idx.get((frame_idx, side))]
-        else:
-            img_ids = [img_id for (fi, _s), img_id
-                       in self._img_id_by_idx.items() if fi == frame_idx]
-        return any(
-            ann["image_id"] == img_id and ann["id"] not in self.removed_ids
-            for img_id in img_ids if img_id is not None
-            for ann in self.annotations
-        )
+            img_id = self._img_id_by_idx.get((frame_idx, side))
+            if img_id is None:
+                return False
+            if self._anns_cache_dirty:
+                self._rebuild_ann_caches()
+            return bool(self._anns_by_image.get(img_id))
+        # side=None: check both sides' image records for this frame.
+        for s in ("left", "right"):
+            img_id = self._img_id_by_idx.get((frame_idx, s))
+            if img_id is not None:
+                if self._anns_cache_dirty:
+                    self._rebuild_ann_caches()
+                if self._anns_by_image.get(img_id):
+                    return True
+        return False
 
     def anchor_candidates(self, side: Optional[str] = None) -> List[int]:
         """Sorted frame_idxs usable as interpolation anchors (have boxes).
@@ -712,6 +754,7 @@ class CocoState:
         """Inverse of add_box / seed_box — remove the box."""
         self.removed_ids.add(ann_id)
         self.dirty = True
+        self._invalidate_ann_caches()
 
     def _redo_add(self, ann_snapshot: Dict[str, Any]) -> None:
         """Re-apply an add_box — re-insert the snapshot and un-remove."""
@@ -726,6 +769,7 @@ class CocoState:
                 new["_mask"] = new["_mask"].copy()
             self.annotations.append(new)
         self.dirty = True
+        self._invalidate_ann_caches()
 
     def _undo_restore(self, ann_id: int, prev: Optional[Dict[str, Any]]) -> None:
         """Inverse of remove_box — restore the box."""
@@ -741,10 +785,12 @@ class CocoState:
                 new["_mask"] = new["_mask"].copy()
             self.annotations.append(new)
         self.dirty = True
+        self._invalidate_ann_caches()
 
     def _redo_remove(self, ann_id: int) -> None:
         self.removed_ids.add(ann_id)
         self.dirty = True
+        self._invalidate_ann_caches()
 
     def _undo_set_bbox(self, ann_id: int, prev_bbox: Optional[List[float]]) -> None:
         if prev_bbox is None:
@@ -786,11 +832,31 @@ class CocoState:
                 return ann.get("_mask")
         return None
 
+    def _invalidate_ann_caches(self) -> None:
+        """Mark the anns_for_image / labeled_frame_idxs caches stale.
+
+        Called from every annotation mutation (add/remove/move/mask/
+        track-id/import/undo/redo/load). The caches rebuild lazily on the
+        next query, so the cost is paid once per mutation, not per tick.
+        """
+        self._anns_cache_dirty = True
+        self._labeled_frame_idxs_cache = None
+        self._labeled_frame_idxs_side_cache.clear()
+
+    def _rebuild_ann_caches(self) -> None:
+        """Rebuild _anns_by_image from the current annotation list."""
+        by_img: Dict[int, List[Dict[str, Any]]] = {}
+        for ann in self.annotations:
+            if ann["id"] in self.removed_ids:
+                continue
+            by_img.setdefault(ann["image_id"], []).append(ann)
+        self._anns_by_image = by_img
+        self._anns_cache_dirty = False
+
     def anns_for_image(self, image_id: int) -> List[Dict[str, Any]]:
-        return [
-            ann for ann in self.annotations
-            if ann["image_id"] == image_id and ann["id"] not in self.removed_ids
-        ]
+        if self._anns_cache_dirty:
+            self._rebuild_ann_caches()
+        return self._anns_by_image.get(image_id, [])
 
     def _resolve_cat_id(self, label: str) -> int:
         # If the label parses as an int matching an existing cat id, use it.

@@ -11,7 +11,10 @@
     "conf": 0.25,
     "auto_segment": false,
     "min_polygon_area": 100,
-    "autolabel_nms_iou": 0.7
+    "autolabel_nms_iou": 0.7,
+    "propagate_method": "memory",
+    "propagate_min_iou": 0.3,
+    "propagate_min_seed_iou": 0.2
   },
   "ui": {
     "advanced": false,

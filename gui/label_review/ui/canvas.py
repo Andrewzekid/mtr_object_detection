@@ -53,6 +53,10 @@ class CanvasWidget(QWidget):
         self._boxes: List[Dict[str, Any]] = []  # see set_boxes
         self._masks_visible: bool = True
         self._mask_alpha: int = 120  # 0-255 overlay alpha for mask fill
+        # When True, set_image/set_boxes/set_info skip their self.update()
+        # call — the caller is responsible for one update() at the end.
+        # Used by load_frame to avoid 3 repaints per canvas per play tick.
+        self._suppress_update: bool = False
         # Cached composed mask overlay (one QPixmap for all boxes), rebuilt
         # only when the box set or alpha changes — NOT on every repaint.
         # Building it per-repaint at full image resolution made slider
@@ -121,7 +125,8 @@ class CanvasWidget(QWidget):
         self._pixmap = QPixmap.fromImage(qimg)
         self._user_zoomed = False
         self._fit_to_view()
-        self.update()
+        if not self._suppress_update:
+            self.update()
 
     def set_boxes(self, boxes: List[Dict[str, Any]]) -> None:
         """boxes: list of dicts with keys id, bbox=[x,y,w,h], cat_name, cat_id,
@@ -132,7 +137,8 @@ class CanvasWidget(QWidget):
         self._multi_selected = set()
         self._waiting_cat = False
         self._pending_rect = None
-        self.update()
+        if not self._suppress_update:
+            self.update()
 
     def set_masks_visible(self, visible: bool) -> None:
         self._masks_visible = visible
@@ -151,6 +157,23 @@ class CanvasWidget(QWidget):
 
     def set_info(self, text: str) -> None:
         self._info_text = text
+        if not self._suppress_update:
+            self.update()
+
+    def load_frame(self, arr: np.ndarray, boxes: List[Dict[str, Any]],
+                    info: str, image_id: Optional[int]) -> None:
+        """Batched frame load: set image + boxes + info + image_id with a
+        SINGLE repaint (instead of 3). This is the hot path for playback —
+        the per-tick cost of 3 full repaints per canvas capped playback
+        well below the configured speed."""
+        self._suppress_update = True
+        try:
+            self.set_image(arr)
+            self.set_boxes(boxes)
+            self._image_id = image_id
+            self._info_text = info
+        finally:
+            self._suppress_update = False
         self.update()
 
     def get_pending_rect(self) -> Optional[Tuple[float, float, float, float]]:

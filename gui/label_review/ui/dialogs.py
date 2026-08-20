@@ -139,6 +139,40 @@ class ConfigDialog(QtWidgets.QDialog):
             "(highest confidence kept). SAM3 often returns several masks\n"
             "for one object. 1.0 disables dedup.")
         sam3_form.addRow("Autolabel NMS IoU", self.spin_nms_iou)
+        self.combo_propagate_method = QtWidgets.QComboBox()
+        self.combo_propagate_method.addItem(
+            "Memory bank (SAM3 video session)", "memory")
+        self.combo_propagate_method.addItem(
+            "Frame-by-frame chain (IoU)", "chain")
+        self.combo_propagate_method.setToolTip(
+            "How 'Propagate →' tracks objects forward:\n"
+            "- Memory bank: one SAM3 video session per side; all selected\n"
+            "  boxes tracked together with SAM3's internal memory. A lost\n"
+            "  object may recover on later frames. Builds a temp clip of\n"
+            "  the remaining range first.\n"
+            "- Frame-by-frame chain: re-detects each object on every frame\n"
+            "  (previous box as prompt, IoU-gated). A track stops\n"
+            "  permanently at the first frame with no detection.")
+        sam3_form.addRow("Propagate method", self.combo_propagate_method)
+        self.spin_propagate_min_iou = QtWidgets.QDoubleSpinBox()
+        self.spin_propagate_min_iou.setRange(0.0, 1.0)
+        self.spin_propagate_min_iou.setSingleStep(0.05)
+        self.spin_propagate_min_iou.setDecimals(2)
+        self.spin_propagate_min_iou.setToolTip(
+            "Chain mode only: a detection with IoU to the previous frame's\n"
+            "box below this is rejected (track reported lost) — stops the\n"
+            "chain latching onto an unrelated similar object.")
+        sam3_form.addRow("Propagate min IoU", self.spin_propagate_min_iou)
+        self.spin_propagate_seed_iou = QtWidgets.QDoubleSpinBox()
+        self.spin_propagate_seed_iou.setRange(0.0, 1.0)
+        self.spin_propagate_seed_iou.setSingleStep(0.05)
+        self.spin_propagate_seed_iou.setDecimals(2)
+        self.spin_propagate_seed_iou.setToolTip(
+            "Chain mode only: a detection must also overlap the SEED box\n"
+            "by at least this much — anchors the chain against drift under\n"
+            "large camera motion.")
+        sam3_form.addRow("Propagate min seed IoU",
+                         self.spin_propagate_seed_iou)
         body.addWidget(sam3_box)
 
         # --- Mask opacity --------------------------------------------------
@@ -255,6 +289,13 @@ class ConfigDialog(QtWidgets.QDialog):
         self.check_auto_segment.setChecked(win.auto_segment)
         self.spin_min_poly_area.setValue(int(win.coco.min_polygon_area))
         self.spin_nms_iou.setValue(win.sam3_nms_iou)
+        idx = self.combo_propagate_method.findData(
+            getattr(win, "propagate_method", "memory"))
+        self.combo_propagate_method.setCurrentIndex(max(0, idx))
+        self.spin_propagate_min_iou.setValue(
+            getattr(win, "propagate_min_iou", 0.3))
+        self.spin_propagate_seed_iou.setValue(
+            getattr(win, "propagate_min_seed_iou", 0.2))
         self.spin_opacity.setValue(win.side.opacity_slider.value())
         self.spin_max_image_dim.setValue(win.display_max_dim)
         self.check_sticky_ids.setChecked(win.coco.sticky_track_ids)
@@ -286,6 +327,16 @@ class ConfigDialog(QtWidgets.QDialog):
         if "autolabel_nms_iou" in sam3:
             self.spin_nms_iou.setValue(
                 max(0.0, min(1.0, float(sam3["autolabel_nms_iou"]))))
+        if sam3.get("propagate_method") in ("memory", "chain"):
+            self.combo_propagate_method.setCurrentIndex(
+                self.combo_propagate_method.findData(
+                    sam3["propagate_method"]))
+        if "propagate_min_iou" in sam3:
+            self.spin_propagate_min_iou.setValue(
+                max(0.0, min(1.0, float(sam3["propagate_min_iou"]))))
+        if "propagate_min_seed_iou" in sam3:
+            self.spin_propagate_seed_iou.setValue(
+                max(0.0, min(1.0, float(sam3["propagate_min_seed_iou"]))))
         ui = cfg.get("ui", {})
         if "advanced" in ui:
             self.check_advanced.setChecked(bool(ui["advanced"]))
@@ -330,6 +381,11 @@ class ConfigDialog(QtWidgets.QDialog):
                 "auto_segment": self.check_auto_segment.isChecked(),
                 "min_polygon_area": self.spin_min_poly_area.value(),
                 "autolabel_nms_iou": self.spin_nms_iou.value(),
+                "propagate_method":
+                    self.combo_propagate_method.currentData(),
+                "propagate_min_iou": self.spin_propagate_min_iou.value(),
+                "propagate_min_seed_iou":
+                    self.spin_propagate_seed_iou.value(),
             },
             "ui": {
                 "advanced": advanced,

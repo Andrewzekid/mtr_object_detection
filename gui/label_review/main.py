@@ -403,6 +403,11 @@ def main():
         sam3_device = args.sam3_device
     sam3_device = _resolve_device(sam3_device)
     print(f"🖥️  SAM3 device: {sam3_device}")
+    propagate_method = sam3_cfg.get("propagate_method", "memory")
+    if propagate_method not in ("memory", "chain"):
+        print(f"⚠️ config sam3.propagate_method {propagate_method!r} "
+              "invalid; using 'memory'")
+        propagate_method = "memory"
 
     # ---------- 1. Index the frame source ----------
     if args.images_right and not args.images:
@@ -416,6 +421,8 @@ def main():
             print(f"✅ Indexed {len(frame_index)} stereo pair(s) "
                   f"(left={len(frame_index.left)}, "
                   f"right={len(frame_index.right)})")
+            if frame_index.pairing_warning:
+                print(f"⚠️  {frame_index.pairing_warning}")
         else:
             frame_index = ImageFolderIndex(args.images)
             print(f"✅ Indexed {len(frame_index)} images")
@@ -461,6 +468,11 @@ def main():
                        sam3_model=sam3_cfg.get("model") or args.sam3_model,
                        sam3_device=sam3_device,
                        sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),
+                       propagate_method=propagate_method,
+                       propagate_min_iou=float(sam3_cfg.get(
+                           "propagate_min_iou", 0.3)),
+                       propagate_min_seed_iou=float(sam3_cfg.get(
+                           "propagate_min_seed_iou", 0.2)),
                        auto_segment=bool(sam3_cfg.get("auto_segment",
                                                       args.auto_segment)),
                         interp_flow_method=flow_method,

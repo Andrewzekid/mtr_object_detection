@@ -2,10 +2,54 @@
 image files (from --images or the File menu)."""
 
 import os
-from typing import Any, Dict, List
+import threading
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from PIL import Image
+
+
+# ---------------------------------------------------------------------------
+# LRU decode cache — playback navigates one frame at a time and re-decodes
+# the same image on every revisit (slider scrubbing, N/B back-and-forth).
+# A small per-index LRU cache avoids the ~5-30 ms PIL open+convert per call,
+# which was the dominant per-tick cost capping playback well below the
+# configured speed. Sized small (8) so memory stays bounded even for 4K
+# stereo folders: ~8 * 2 * (W*H*3) bytes.
+# ---------------------------------------------------------------------------
+_DECODE_CACHE_SIZE = 8
+
+
+class _DecodeCache(OrderedDict):
+    """LRU cache mapping file_path -> np.ndarray (RGB).
+
+    Thread-safe: prefetch workers fill it from a background thread while
+    the main thread reads during playback.
+    """
+
+    def __init__(self, capacity: int = _DECODE_CACHE_SIZE):
+        super().__init__()
+        self._cap = capacity
+        self._lock = threading.Lock()
+
+    def get_or_none(self, key):
+        with self._lock:
+            v = self.get(key)
+            if v is not None:
+                self.move_to_end(key)
+            return v
+
+    def put(self, key, value):
+        with self._lock:
+            self[key] = value
+            self.move_to_end(key)
+            while len(self) > self._cap:
+                self.popitem(last=False)
+
+    def contains(self, key) -> bool:
+        with self._lock:
+            return key in self
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +98,10 @@ class ImageFolderIndex:
                            key=lambda fp: (int(os.path.splitext(
                                os.path.basename(fp))[0]), fp))
         self.files = files
+        # Per-index LRU decode cache (keyed by file_path). Avoids re-reading
+        # + re-decoding the same JPEG/PNG on every playback tick / slider
+        # scrub — the dominant per-tick cost that capped playback speed.
+        self._decode_cache: _DecodeCache = _DecodeCache()
         self.frames: List[Dict[str, Any]] = []
         for idx, fp in enumerate(files):
             if self.timestamps_real:
@@ -78,8 +126,14 @@ class ImageFolderIndex:
         return self.frames[idx]
 
     def decode_image(self, idx: int) -> np.ndarray:
-        with Image.open(self.frames[idx]["file_path"]) as im:
-            return np.array(im.convert("RGB"))
+        fp = self.frames[idx]["file_path"]
+        cached = self._decode_cache.get_or_none(fp)
+        if cached is not None:
+            return cached
+        with Image.open(fp) as im:
+            arr = np.array(im.convert("RGB"))
+        self._decode_cache.put(fp, arr)
+        return arr
 
     def find_idx_by_timestamp(self, ts_ns: int) -> int:
         if not self.frames:
@@ -170,6 +224,25 @@ class StereoIndex:
         # `.files` (left side) keeps mono call sites (source label, YOLO
         # export) working unchanged.
         self.files = self.files_left
+        # Filename-equality guard: pairing is positional, but if the
+        # basenames don't match the user has almost certainly loaded
+        # mismatched folders and all downstream labels will be shifted.
+        self.pairing_warning: Optional[str] = None
+        if self._len > 0:
+            mismatches = [
+                (i, os.path.basename(l), os.path.basename(r))
+                for i, (l, r) in enumerate(zip(self.files_left,
+                                               self.files_right))
+                if os.path.basename(l) != os.path.basename(r)]
+            if mismatches:
+                shown = mismatches[:3]
+                lines = ", ".join(
+                    f"#{i}: {ln!r} vs {rn!r}" for i, ln, rn in shown)
+                if len(mismatches) > 3:
+                    lines += f" (+ {len(mismatches) - 3} more)"
+                self.pairing_warning = (
+                    f"Stereo filename mismatch: {lines}; pairing is "
+                    f"positional — verify the folders are aligned!")
 
     def __len__(self) -> int:
         return self._len

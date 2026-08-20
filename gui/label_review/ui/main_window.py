@@ -2,11 +2,13 @@
 
 import json
 import os
+import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+from PyQt6.QtCore import QRunnable, QThreadPool
 
 from ..qt_compat import Qt, QtCore, QtGui, QtWidgets, QEvent, QTimer, _QT_HORZ  # first: enum shims  # noqa: E501
 from ..qt_compat import (  # noqa: F401
@@ -29,6 +31,33 @@ from .dialogs import ConfigDialog
 
 
 # ---------------------------------------------------------------------------
+# Prefetch runnable: decode one frame in the background for playback.
+# ---------------------------------------------------------------------------
+
+class _PrefetchRunnable(QRunnable):
+    """Decode a single frame into the index's LRU cache.
+
+    The cache is thread-safe, so multiple runnables can run in parallel.
+    If the frame is already cached, decode_image returns immediately.
+    """
+
+    def __init__(self, frame_index, idx: int, side: Optional[str]):
+        super().__init__()
+        self.frame_index = frame_index
+        self.idx = idx
+        self.side = side
+
+    def run(self) -> None:
+        try:
+            if self.side is None:
+                self.frame_index.decode_image(self.idx)
+            else:
+                self.frame_index.decode_image(self.idx, side=self.side)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -39,6 +68,9 @@ class ReviewWindow(QMainWindow):
                  sam3_model: Optional[str] = None,
                  sam3_device: str = "cuda",
                   sam3_conf: float = 0.25,
+                  propagate_method: str = "memory",
+                  propagate_min_iou: float = 0.3,
+                  propagate_min_seed_iou: float = 0.2,
                   auto_segment: bool = False,
                   interp_flow_method: str = "dis",
                   interp_camera_model: str = "none",
@@ -56,6 +88,16 @@ class ReviewWindow(QMainWindow):
         self.sam3_model = sam3_model
         self.sam3_device = sam3_device
         self.sam3_conf = sam3_conf
+        # Propagate method: "memory" (SAM3 video memory bank, one session
+        # per side) or "chain" (frame-by-frame re-detection, IoU-chained,
+        # permanent stop on first miss). Config: sam3.propagate_method.
+        self.propagate_method: str = (
+            propagate_method if propagate_method in ("memory", "chain")
+            else "memory")
+        # Chain-mode IoU gates (config: sam3.propagate_min_iou /
+        # sam3.propagate_min_seed_iou).
+        self.propagate_min_iou: float = float(propagate_min_iou)
+        self.propagate_min_seed_iou: float = float(propagate_min_seed_iou)
         # IoU threshold for class-aware NMS on autolabel detections
         # (config: sam3.autolabel_nms_iou; 1.0 disables dedup).
         self.sam3_nms_iou: float = 0.7
@@ -95,10 +137,6 @@ class ReviewWindow(QMainWindow):
         self._sam3_autolabel_worker: Optional[SAM3AutolabelWorker] = None
         self._sam3_autolabel_batch_worker: Optional[SAM3AutolabelBatchWorker] = None
         self._sam3_propagate_worker: Optional[SAM3PropagateWorker] = None
-        # Meta for the running propagate job (seeds, side, count).
-        self._propagate_meta: Dict[str, Any] = {
-            "seeds": [], "side": "left",
-            "added": 0, "ann_ids": [], "anns": []}
         # Bumped on every source switch. Workers capture the value at start
         # (`_lr_session`); result handlers drop signals from stale sessions
         # so a job started on the old source can't write masks/boxes into
@@ -130,6 +168,15 @@ class ReviewWindow(QMainWindow):
         self._play_timer.timeout.connect(self._on_play_tick)
         self._play_interval_ms: int = 33  # 1x = 30 fps (matches combo_speed)
         self._playing: bool = False
+        # Prefetch timer: during playback, decode the upcoming frames in
+        # the background so playback is not capped by decode latency.
+        self._prefetch_timer = QTimer(self)
+        self._prefetch_timer.timeout.connect(self._prefetch_tick)
+        self._prefetch_lookahead = 8
+        # Per-tick counter used to throttle the keyframe/annotated/progress
+        # UI syncs during playback (refresh every ~8 ticks instead of every
+        # tick so the sync cost doesn't cap playback speed).
+        self._play_tick_count: int = 0
         # Session-only opt-out from the X discard-all confirmation dialog.
         self._skip_discard_confirm: bool = False
         # Set once quit has been confirmed, so closeEvent doesn't ask twice.
@@ -146,9 +193,9 @@ class ReviewWindow(QMainWindow):
         self.canvases["left"] = self.canvas
         self._splitter.addWidget(self.canvas)
         if self._stereo:
-            self.canvas_right = self._make_canvas("right")
-            self.canvases["right"] = self.canvas_right
-            self._splitter.addWidget(self.canvas_right)
+            canvas_right = self._make_canvas("right")
+            self.canvases["right"] = canvas_right
+            self._splitter.addWidget(canvas_right)
         # The canvas that window-level edit shortcuts (D/A/X/R/digits…) and
         # per-frame ops act on — the last one clicked (left in mono).
         self._active_canvas: CanvasWidget = self.canvas
@@ -660,6 +707,15 @@ class ReviewWindow(QMainWindow):
         if "autolabel_nms_iou" in sam3_cfg:
             self.sam3_nms_iou = max(
                 0.0, min(1.0, float(sam3_cfg["autolabel_nms_iou"])))
+        pm = sam3_cfg.get("propagate_method")
+        if pm in ("memory", "chain"):
+            self.propagate_method = pm
+        if "propagate_min_iou" in sam3_cfg:
+            self.propagate_min_iou = max(
+                0.0, min(1.0, float(sam3_cfg["propagate_min_iou"])))
+        if "propagate_min_seed_iou" in sam3_cfg:
+            self.propagate_min_seed_iou = max(
+                0.0, min(1.0, float(sam3_cfg["propagate_min_seed_iou"])))
         ui_cfg = cfg.get("ui", {})
         if "advanced" in ui_cfg:
             self.advanced_ui = bool(ui_cfg["advanced"])
@@ -738,6 +794,9 @@ class ReviewWindow(QMainWindow):
         out_json = os.path.join(out_dir, "labels_coco.json")
         label = f"{out_dir} (stereo)" if stereo else out_dir
         self._switch_source(new_index, out_json, label)
+        if stereo and getattr(new_index, "pairing_warning", None):
+            print(f"⚠️ {new_index.pairing_warning}")
+            self.statusBar().showMessage(new_index.pairing_warning, 8000)
 
     # ----------------------- frame playback ----------------------------- #
 
@@ -755,11 +814,53 @@ class ReviewWindow(QMainWindow):
             self._play_timer.stop()
             self._play_timer.start(self._play_interval_ms)
 
+    def _prefetch_tick(self) -> None:
+        """Decode upcoming frames in the background to keep the LRU cache
+        warm during playback."""
+        if not self._playing:
+            return
+        frame_index = self.frame_index
+        n = len(frame_index)
+        if n == 0:
+            return
+        # Determine which caches we can warm. Fake test indexes may not
+        # expose the cache, in which case we just skip prefetching.
+        if self._stereo and hasattr(frame_index, "left"):
+            sides = ["left", "right"]
+            caches = {
+                "left": getattr(getattr(frame_index, "left", None),
+                                "_decode_cache", None),
+                "right": getattr(getattr(frame_index, "right", None),
+                                 "_decode_cache", None),
+            }
+        elif hasattr(frame_index, "_decode_cache"):
+            sides = [None]
+            caches = {None: frame_index._decode_cache}
+        else:
+            return
+        for side in sides:
+            cache = caches.get(side)
+            if cache is None:
+                continue
+            for offset in range(1, self._prefetch_lookahead + 1):
+                idx = self._current_idx + offset
+                if idx >= n:
+                    break
+                frame = (frame_index.frame_at(idx) if side is None
+                         else frame_index.frame_at(idx, side=side))
+                fp = frame.get("file_path")
+                if fp and cache.contains(fp):
+                    continue
+                QThreadPool.globalInstance().start(
+                    _PrefetchRunnable(frame_index, idx, side))
+
     def _start_playback(self) -> None:
         if self._playing:
             return
         self._playing = True
         self._play_timer.start(self._play_interval_ms)
+        self._prefetch_tick()  # warm the first lookahead batch immediately
+        self._prefetch_timer.start(100)
         self.statusBar().showMessage(
             f"Playing at ~{1000 / self._play_interval_ms:.0f} fps "
             f"({self._play_interval_ms} ms/frame)", 2000
@@ -770,6 +871,14 @@ class ReviewWindow(QMainWindow):
             return
         self._playing = False
         self._play_timer.stop()
+        self._prefetch_timer.stop()
+        # Refresh the throttled UI syncs immediately on pause so the
+        # keyframe/annotated buttons, progress bar, and box list are
+        # accurate for the current frame.
+        self._refresh_boxes()
+        self._sync_keyframe_button()
+        self._sync_annotated_button()
+        self._update_progress()
         # Persist progress once per play run instead of per tick.
         if 0 <= self._current_idx < len(self.frame_index):
             self.coco.save(is_final=False)
@@ -811,27 +920,31 @@ class ReviewWindow(QMainWindow):
         ts_real = getattr(self.frame_index, "timestamps_real", True)
         # Decode + fill one canvas per side (just "left" in mono). Frame
         # navigation is index-based and moves all canvases together.
+        # Uses load_frame (batched: 1 repaint/canvas instead of 3) — the
+        # per-tick repaint cost was capping playback below the speed setting.
         for side, canvas in self.canvases.items():
             frame = self._frame_at_side(idx, side)
             arr = self._decode_side(idx, side)
             h, w = arr.shape[:2]
-            canvas._image_id = self.coco.ensure_image(frame, w, h, side=side)
-            boxes = self._boxes_for_image(canvas._image_id)
-            canvas.set_image(arr)
-            canvas.set_boxes(boxes)
+            image_id = self.coco.ensure_image(frame, w, h, side=side)
+            boxes = self._boxes_for_image(image_id)
             pos = (f"ts={frame['timestamp_ns']}" if ts_real else f"index={idx}")
             tag = f"{side.upper()}  |  " if self._stereo else ""
-            canvas.set_info(
-                f"{tag}Frame {idx + 1}/{len(self.frame_index)}  |  {pos}"
-            )
+            info = (f"{tag}Frame {idx + 1}/{len(self.frame_index)}  |  {pos}")
+            canvas.load_frame(arr, boxes, info, image_id)
         # The compat attribute tracks the ACTIVE side's image id (identical
         # to the only canvas's in mono).
         self._current_image_id = self._active_canvas._image_id
 
-        # Side panel mirrors the active side's box list.
+        # Side panel mirrors the active side's box list. During playback,
+        # the box list rebuild (QListWidget clear+re-add) is skipped — it's
+        # O(boxes) per tick and the user is watching the canvas, not the
+        # list. The info label + slider stay live (cheap, always relevant).
+        # The full box list + buttons refresh on pause / explicit nav.
         boxes = self._active_canvas._boxes
-        self.side.set_boxes(boxes)
-        self.side.highlight_box_row(-1)
+        if not self._playing:
+            self.side.set_boxes(boxes)
+            self.side.highlight_box_row(-1)
         self.side.set_slider(idx)
         self.side.set_info(idx, len(self.frame_index),
                            self._frame_at_side(idx, "left")["timestamp_ns"],
@@ -844,9 +957,25 @@ class ReviewWindow(QMainWindow):
         #   - on slider release (see _on_slider_released)
         #   - on quit (closeEvent, _on_save_quit, _on_quit)
         self.coco.current_idx = idx
-        self._sync_keyframe_button()
-        self._sync_annotated_button()
-        self._update_progress()
+        # Throttle the per-frame sync calls during playback: keyframe /
+        # annotated button sync + progress bar rebuild are cheap
+        # individually but add up at high speeds. During playback we
+        # refresh them on a coarse interval via _status_timer (250 ms)
+        # instead of every tick; on pause / explicit nav they refresh
+        # immediately for accurate UI.
+        if self._playing:
+            self._play_tick_count += 1
+            # Refresh progress + buttons every ~8 ticks during playback
+            # (≈4×/s at 30 fps) — smooth enough to feel live, cheap enough
+            # not to cap playback speed.
+            if self._play_tick_count & 7 == 0:
+                self._sync_keyframe_button()
+                self._sync_annotated_button()
+                self._update_progress()
+        else:
+            self._sync_keyframe_button()
+            self._sync_annotated_button()
+            self._update_progress()
 
     # ----------------------- event handlers ---------------------------- #
 
@@ -1602,6 +1731,10 @@ class ReviewWindow(QMainWindow):
         del self.coco.cat_map[cat_id]
         del self.coco.cat_name_to_id[name]
         self.coco.dirty = True
+        # Direct removed_ids mutation bypasses remove_box(), so the ann
+        # cache must be invalidated explicitly (otherwise _refresh_boxes
+        # would still show the deleted boxes via the stale cache).
+        self.coco._invalidate_ann_caches()
         # Clear any pending preselection pointing at the deleted category.
         if self._pending_cat_id == cat_id:
             self._pending_cat_id = None
@@ -2295,10 +2428,10 @@ class ReviewWindow(QMainWindow):
         """Seed SAM3 propagation from the selected boxes (Propagate →).
 
         With several boxes selected, each distinct track is propagated —
-        one SAM3 video session per side covering ALL of that side's seeds
-        (in stereo the two sides run back-to-back through the SAM3 queue).
-        Boxes sharing a track id on the SAME side collapse into a single
-        seed; boxes without a track id each seed a fresh track.
+        one run per side covering ALL of that side's seeds (in stereo the
+        two sides run back-to-back through the SAM3 queue). Boxes sharing
+        a track id on the SAME side collapse into a single seed; boxes
+        without a track id each seed a fresh track.
         """
         if not _SAM3_AVAILABLE:
             QMessageBox.warning(self, "SAM3 unavailable",
@@ -2344,41 +2477,58 @@ class ReviewWindow(QMainWindow):
             if self._stereo:
                 label += f" [{side}]"
             labels.append(label)
+        if self.propagate_method == "chain":
+            method_blurb = (
+                "Frame-by-frame chain: each object is re-detected with the\n"
+                "previous frame's box as prompt, IoU-gated. A track stops\n"
+                "permanently at the first frame with no detection.")
+        else:
+            method_blurb = (
+                "SAM3 video memory bank: one session per side covering all\n"
+                "of that side's selected boxes. A track reported lost may\n"
+                "recover on later frames. The remaining range is built into\n"
+                "a temporary clip first.")
         ret = QMessageBox.question(
             self, "Propagate track(s) forward?",
             f"Propagate {', '.join(labels)} from frame "
             f"{self._current_idx + 1} to the end ({n - self._current_idx - 1} "
-            f"frame(s))?\n\nSAM3 tracks each object with its video "
-            f"memory bank — one session per side covering all of that "
-            f"side's selected boxes. A track is reported lost from the "
-            f"first frame with no detection (the memory bank may recover "
-            f"it on later frames). Frames that already have a box with "
-            f"that track id are skipped. Each side runs "
-            f"as one background job (device: {self.sam3_device}); "
-            f"Cancel anytime. Each side's run is one Ctrl+Z step.",
+            f"frame(s)) with method '{self.propagate_method}'?\n\n"
+            f"{method_blurb}\n\n"
+            f"Frames that already have a box with that track id are skipped. "
+            f"Each side runs as one background job "
+            f"(device: {self.sam3_device}). Cancel anytime. "
+            f"Each side's run is one Ctrl+Z step.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes)
         if ret != QMessageBox.StandardButton.Yes:
             return
         by_side: Dict[str, List[Dict[str, Any]]] = {}
-        for side, box in seeds:
-            tid = box.get("track_id")
-            if tid is None:
-                # Seed without a track id: assign a fresh one now that it's
-                # confirmed (its own undoable entry).
-                tid = self.coco._fresh_track_id()
-                self.coco.set_track_id(box["id"], tid)
-                box["track_id"] = tid
-            x, y, w, h = box["bbox"]
-            by_side.setdefault(side, []).append({
-                "track_id": tid,
-                "cat_id": box.get("cat_id", 0),
-                "bbox_xyxy": [x, y, x + w, y + h],
-            })
-        # One memory-bank session per side covers ALL of that side's
-        # seeds at once; the second side queues behind the first.
+        # Track-id changes made for seed-less boxes are recorded so the
+        # whole propagate run can be undone in one step.
+        seed_tid_changes: List[Tuple[int, Optional[int], int]] = []
+        with self.coco.undo_stack.mute():
+            for side, box in seeds:
+                tid = box.get("track_id")
+                if tid is None:
+                    old_tid = box.get("track_id")
+                    tid = self.coco._fresh_track_id()
+                    self.coco.set_track_id(box["id"], tid)
+                    seed_tid_changes.append((box["id"], old_tid, tid))
+                    box["track_id"] = tid
+                cat_id = box.get("cat_id", 0)
+                x, y, w, h = box["bbox"]
+                by_side.setdefault(side, []).append({
+                    "track_id": tid,
+                    "cat_id": cat_id,
+                    "concept": self.coco.cat_map.get(cat_id, ""),
+                    "bbox_xyxy": [x, y, x + w, y + h],
+                })
+        # One run per side covers ALL of that side's seeds at once; the
+        # second side queues behind the first.
         for side, side_seeds in by_side.items():
-            self._start_propagate_worker(self._current_idx, side_seeds, side)
+            self._start_propagate_worker(
+                self._current_idx, side_seeds, side,
+                seed_tid_changes=seed_tid_changes)
 
     def _propagate_label(self, seeds: List[Dict[str, Any]],
                          side: str) -> str:
@@ -2390,7 +2540,11 @@ class ReviewWindow(QMainWindow):
 
     def _start_propagate_worker(self, start_frame_idx: int,
                                 seeds: List[Dict[str, Any]],
-                                side: Optional[str] = None) -> None:
+                                side: Optional[str] = None,
+                                seed_tid_changes:
+                                Optional[List[Tuple[int, Optional[int],
+                                                    int]]] = None
+                                ) -> None:
         if side is None:
             side = self._active_canvas.side
         if self._sam3_busy():
@@ -2409,16 +2563,23 @@ class ReviewWindow(QMainWindow):
         total = len(self.frame_index) - start_frame_idx - 1
         self._set_sam3_status(f"propagate {label}: 0/{total} frames…")
         self.side.set_sam3_running(True)
-        self._propagate_meta = {"seeds": seeds, "side": side,
-                                "added": 0, "ann_ids": [], "anns": []}
         tmp_dir = str(Path(self.coco.output_json).parent / "_tmp_sam3_imgs")
         self._sam3_propagate_worker = SAM3PropagateWorker(
             self._side_worker_index(side), start_frame_idx, seeds, tmp_dir,
             model_path=self.sam3_model,
             device=self.sam3_device,
             conf=self.sam3_conf,
+            method=self.propagate_method,
+            min_iou=self.propagate_min_iou,
+            min_seed_iou=self.propagate_min_seed_iou,
             parent=self,
         )
+        self._sam3_propagate_worker._meta = {
+            "seeds": seeds, "side": side,
+            "added": 0, "ann_ids": [], "anns": [],
+            "seed_tid_changes": seed_tid_changes or []}
+        self._last_propagate_meta = self._sam3_propagate_worker._meta
+        self._sam3_propagate_worker._lr_session = self._session_seq
         self._sam3_propagate_worker.frame_done_signal.connect(
             self._on_propagate_frame_done)
         self._sam3_propagate_worker.stage_signal.connect(
@@ -2432,15 +2593,25 @@ class ReviewWindow(QMainWindow):
             self._on_propagate_failed)
         self._sam3_propagate_worker.cancelled_signal.connect(
             self._on_propagate_cancelled)
-        self._sam3_propagate_worker._lr_session = self._session_seq
         self._sam3_propagate_worker.start()
+
+    def _propagate_meta(self) -> Dict[str, Any]:
+        """Return the meta dict attached to the propagate worker that sent
+        the signal, or the legacy fallback. Using the worker's own meta
+        makes concurrent/interleaved runs safe."""
+        sender = self.sender()
+        if sender is not None and isinstance(sender, SAM3PropagateWorker):
+            return getattr(sender, "_meta", {})
+        return getattr(self, "_last_propagate_meta", {})
 
     def _on_propagate_frame_done(self, frame_idx: int, dets) -> None:
         """Add propagated boxes (one per seed, keeping each seed's track
         id), or skip. `dets` is aligned with meta["seeds"]."""
         if self._stale_sender():
             return
-        meta = self._propagate_meta
+        meta = self._propagate_meta()
+        if not meta:
+            return
         side = meta.get("side", "left")
         for seed, det in zip(meta.get("seeds", []), dets or []):
             if det is None:
@@ -2479,7 +2650,10 @@ class ReviewWindow(QMainWindow):
                 if mask is not None:
                     self.coco.set_mask(ann_id, mask)
             meta["ann_ids"].append(ann_id)
-            meta["anns"].append(dict(self.coco.get_box(ann_id)))
+            # Deep copy so later edits to the annotation don't corrupt the
+            # redo snapshot stored in the composite undo entry.
+            ann_copy = copy.deepcopy(self.coco.get_box(ann_id))
+            meta["anns"].append(ann_copy)
             meta["added"] += 1
         if frame_idx == self._current_idx:
             self._refresh_boxes()
@@ -2489,20 +2663,31 @@ class ReviewWindow(QMainWindow):
 
     def _end_propagate(self, status: str, message: Optional[str]) -> None:
         """Shared teardown for finished / failed / cancelled."""
-        meta = self._propagate_meta
-        ids = list(meta["ann_ids"])
-        anns = list(meta["anns"])
-        if ids:
+        meta = self._propagate_meta()
+        ids = list(meta.get("ann_ids", []))
+        anns = list(meta.get("anns", []))
+        seed_tid_changes = list(meta.get("seed_tid_changes", []))
+        if ids or seed_tid_changes:
             # One composite undo entry for the whole run (the per-frame
-            # pushes were muted).
+            # pushes were muted). It also reverses any fresh track ids
+            # assigned to previously track-less seed boxes.
             coco = self.coco
             seeds = meta.get("seeds", [])
             what = (f"track T{seeds[0]['track_id']}" if len(seeds) == 1
                     else f"{len(seeds)} tracks")
+            def _undo():
+                for i in reversed(ids):
+                    coco._undo_remove(i)
+                for ann_id, old_tid, _ in seed_tid_changes:
+                    coco._undo_set_track(ann_id, old_tid)
+            def _redo():
+                for a in anns:
+                    coco._redo_add(a)
+                for ann_id, _, new_tid in seed_tid_changes:
+                    coco._undo_set_track(ann_id, new_tid)
             coco.undo_stack.push(
                 f"propagate {what} ({len(ids)} box(es))",
-                undo=lambda: [coco._undo_remove(i) for i in reversed(ids)],
-                redo=lambda: [coco._redo_add(a) for a in anns])
+                undo=_undo, redo=_redo)
         self.side.set_sam3_running(False)
         self._set_sam3_status(status)
         self.coco.save(is_final=False)
@@ -2514,13 +2699,13 @@ class ReviewWindow(QMainWindow):
     def _on_propagate_finished(self, n_found: int, lost_map) -> None:
         if self._stale_sender():
             return
-        meta = self._propagate_meta
+        meta = self._propagate_meta()
         seeds = meta.get("seeds", [])
         label = self._propagate_label(seeds, meta.get("side", "left"))
         # n_found counts detections, but frames that already carried the
         # track id (or a sub-2px box) were skipped — report boxes actually
         # added.
-        added = meta["added"]
+        added = meta.get("added", 0)
         status = f"propagate {label}: done — {added} box(es) added"
         notes = [f"T{seeds[i]['track_id']} lost at frame {f + 1}"
                  for i, f in sorted((lost_map or {}).items())
@@ -2532,7 +2717,7 @@ class ReviewWindow(QMainWindow):
     def _on_propagate_failed(self, err: str) -> None:
         if self._stale_sender():
             return
-        meta = self._propagate_meta
+        meta = self._propagate_meta()
         label = self._propagate_label(meta.get("seeds", []),
                                       meta.get("side", "left"))
         print(f"❌ SAM3 propagate failed: {err}")
@@ -2542,10 +2727,10 @@ class ReviewWindow(QMainWindow):
     def _on_propagate_cancelled(self) -> None:
         if self._stale_sender():
             return
-        meta = self._propagate_meta
+        meta = self._propagate_meta()
         label = self._propagate_label(meta.get("seeds", []),
                                       meta.get("side", "left"))
-        added = meta["added"]
+        added = meta.get("added", 0)
         self._end_propagate(
             f"propagate {label}: cancelled ({added} box(es) kept)",
             "Propagate cancelled — boxes already added were kept")
