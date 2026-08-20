@@ -63,7 +63,7 @@ All functions are headless and return structured results.
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any, List, Tuple
+from typing import Optional, Callable, Dict, Any, List, Tuple, Iterator
 import json
 import requests
 import base64
@@ -338,10 +338,144 @@ def run_sam3(
             "error": "ultralytics not installed. Install with: pip install ultralytics",
         }
     except Exception as e:
+        # The error string alone has proven useless for diagnosing failures
+        # inside ultralytics (e.g. a bare "expected str ... not NoneType"
+        # with no location) — always log the full traceback so the failing
+        # call can be pinpointed from the console output.
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "error": f"SAM3 inference failed: {str(e)}",
         }
+
+
+def sam3_video_propagate(
+    video_path: str | Path,
+    seed_bboxes_xyxy: List[List[float]],
+    model_path: Optional[str | Path] = None,
+    device: str = "cuda",
+    conf: float = 0.25,
+    imgsz: int = 1024,
+    quantize: Optional[int] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
+) -> Iterator[Tuple[int, List[Tuple[Optional[np.ndarray],
+                                    Optional[List[float]], float]]]]:
+    """Track seeded objects through a video with SAM3's memory bank.
+
+    Mirrors ultralytics SAM3VideoPredictor's high-level streaming driver
+    (BasePredictor.stream_inference → SAM2VideoPredictor.inference)
+    frame-by-frame: pull each batch from the dataset loader (which advances
+    dataset.frame), set predictor.batch, preprocess, and store the frame in
+    inference_state["im"] so the tracker extracts features from the CURRENT
+    frame. Frame indices inside the predictor are 1-based (the loader
+    increments dataset.frame after each read), exactly as in the high-level
+    flow. Prompts are registered once on the first frame via the same
+    _prepare_prompts/add_new_prompts box-prompt path the high-level API
+    uses; the mask-prompt path from track_sam3_video.py's reseed mode is
+    broken in ultralytics 8.4.83 (add_new_prompts rejects
+    _bb_feat_sizes-sized masks).
+
+    Per-frame outputs are taken from propagate_in_video instead of
+    inference()'s return value, because inference() filters out blank masks
+    and would break the seed↔mask alignment for multi-object tracking.
+    propagate_in_video's pred_masks are raw logits — they are binarized
+    against the model's mask_threshold (a plain bool cast treats every
+    nonzero, even negative, logit as foreground).
+
+    Yields (video_frame_idx, per_seed) starting at video frame 0 (the seed
+    frame). per_seed[i] is (mask_bool, bbox_xyxy, score) for seed i, or
+    (None, None, 0.0) when that object is lost on that frame — the memory
+    bank may recover it on later frames. score is the sigmoid-squashed
+    object score logit (0..1), for the box's confidence provenance field.
+    """
+    import torch
+    from ultralytics.models.sam import SAM3VideoPredictor
+
+    if model_path is None:
+        model_path = (Path(__file__).parent / "sam3" / "models"
+                      / "sam3-model" / "sam3.pt")
+    overrides = dict(conf=conf, task="segment", mode="predict",
+                     model=str(model_path), device=device, imgsz=imgsz)
+    if quantize is not None:
+        overrides["quantize"] = quantize
+    predictor = SAM3VideoPredictor(overrides=overrides)
+    n_seeds = len(seed_bboxes_xyxy)
+    try:
+        predictor.setup_model()
+        predictor.setup_source(str(video_path))
+        predictor.init_state(predictor)
+        num_frames = predictor.dataset.frames
+        mask_threshold = getattr(predictor.model, "mask_threshold", 0.0)
+
+        dataset_iter = iter(predictor.dataset)
+        for frame_idx in range(num_frames):
+            if is_cancelled is not None and is_cancelled():
+                return
+            batch = next(dataset_iter)
+            predictor.batch = batch
+            # The high-level driver runs under smart_inference_mode; without
+            # it, propagated masks require grad and can't go to numpy.
+            with torch.inference_mode():
+                im = predictor.preprocess(batch[1])
+                # The loader advanced dataset.frame past the frame it just
+                # returned — this is the 1-based index the predictor uses
+                # internally (same convention as the high-level driver).
+                frame = predictor.dataset.frame
+                predictor.inference_state["im"] = im
+                if frame_idx == 0:
+                    frame_h, frame_w = batch[1][0].shape[:2]
+                    # Register each exemplar box as its own object — the same
+                    # box-prompt path SAM2VideoPredictor.inference() uses
+                    # when the high-level API is given bboxes.
+                    points, labels, _ = predictor._prepare_prompts(
+                        im.shape[2:], (frame_h, frame_w),
+                        [list(b) for b in seed_bboxes_xyxy], None, None, None)
+                    for i in range(len(points)):
+                        predictor.add_new_prompts(obj_id=i,
+                                                  points=points[[i]],
+                                                  labels=labels[[i]],
+                                                  frame_idx=frame)
+                # Consolidate prompt outputs before tracking (inference()
+                # calls this every frame; with no new prompts it's a no-op).
+                predictor.propagate_in_video_preflight()
+                obj_ids, pred_masks, obj_scores = \
+                    predictor.propagate_in_video(predictor.inference_state,
+                                                 frame)
+            masks_np = (pred_masks.detach().cpu().numpy()
+                        if hasattr(pred_masks, "detach")
+                        else np.asarray(pred_masks))
+            scores_np = (obj_scores.detach().cpu().numpy()
+                         if hasattr(obj_scores, "detach")
+                         else np.asarray(obj_scores))
+            per_seed: List[Tuple[Optional[np.ndarray],
+                                 Optional[List[float]], float]] = \
+                [(None, None, 0.0)] * n_seeds
+            for j in range(len(obj_ids)):
+                oid = int(obj_ids[j])
+                if not (0 <= oid < n_seeds):
+                    continue
+                # pred_masks are raw logits — binarize against the model's
+                # mask threshold like inference() does; a plain astype(bool)
+                # turns every nonzero (even negative) logit into foreground.
+                mask = masks_np[j] > mask_threshold
+                if mask.shape != (frame_h, frame_w):
+                    mask = cv2.resize(mask.astype(np.uint8),
+                                      (frame_w, frame_h),
+                                      interpolation=cv2.INTER_NEAREST
+                                      ).astype(bool)
+                if not mask.any():
+                    continue  # object lost on this frame (may recover)
+                ys, xs = np.where(mask)
+                bbox = [float(xs.min()), float(ys.min()),
+                        float(xs.max()), float(ys.max())]
+                score = float(1.0 / (1.0 + np.exp(-float(scores_np[j]))))
+                per_seed[oid] = (mask, bbox, score)
+            yield frame_idx, per_seed
+    finally:
+        del predictor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def find_sam3_checkpoint(model_dir: Path) -> Optional[Path]:

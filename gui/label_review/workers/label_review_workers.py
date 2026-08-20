@@ -1,8 +1,8 @@
-"""Worker threads for 09_rerun_label_review.py.
+"""Worker threads for 09_label_review.py.
 
 Background QThread workers — SAM3 single-frame, SAM3 all-frames, and
 optical-flow interpolation between labeled frames — plus their pure
-helpers, extracted from 09_rerun_label_review.py to keep that file
+helpers, extracted from 09_label_review.py to keep that file
 UI-focused. Everything here is UI-agnostic: inputs are plain data and
 results are reported via Qt signals.
 """
@@ -23,13 +23,14 @@ from PyQt6.QtCore import QThread, pyqtSignal
 _SAM3_AVAILABLE = False
 try:
     import sys as _sys
-    _PROJ_ROOT = str(Path(__file__).resolve().parent.parent)
+    _PROJ_ROOT = str(Path(__file__).resolve().parents[3])  # repo root
     if _PROJ_ROOT not in _sys.path:
         _sys.path.insert(0, _PROJ_ROOT)
-    from core.models_inference import run_sam3  # type: ignore[import-not-found]
+    from core.models_inference import run_sam3, sam3_video_propagate  # type: ignore[import-not-found]
     _SAM3_AVAILABLE = True
 except Exception as _sam3_import_err:
     run_sam3 = None  # type: ignore[assignment]
+    sam3_video_propagate = None  # type: ignore[assignment]
     print(f"⚠️ SAM3 not available ({_sam3_import_err}). "
           f"Segmentation features will be disabled.")
 
@@ -179,60 +180,34 @@ def _segment_concepts(image_path: str, bboxes_xyxy: list, concepts: list,
                 conf=conf,
             )
         except Exception as e:
-            # CUDA OOM (e.g. another process hogging the GPU): fall back
-            # to CPU for this concept and everything after it.
-            if device != "cpu" and "out of memory" in str(e).lower():
-                print("⚠️ SAM3 CUDA OOM — retrying on CPU "
-                      "(and using CPU for the remaining concepts)")
-                device = "cpu"
-                try:
-                    res = run_sam3(
-                        image_path=image_path,
-                        bboxes=bxs,
-                        concepts=[concept],
-                        model_path=model_path,
-                        device=device,
-                        conf=conf,
-                    )
-                except Exception as e2:
-                    _fail_all(idxs, concept, str(e2))
-                    _progress(concept)
-                    continue
-            else:
-                _fail_all(idxs, concept, str(e))
-                _progress(concept)
-                continue
+            res = {"success": False, "error": str(e)}
+
+        if not res.get("success") and device != "cpu":
+            # Any CUDA failure (OOM — e.g. another process hogging the
+            # GPU — or an ultralytics-internal error) falls back to CPU
+            # for this concept and everything after it. run_sam3 logs the
+            # full traceback, so the original CUDA error is not lost.
+            err = str(res.get("error", ""))
+            kind = "OOM" if "out of memory" in err.lower() else "error"
+            print(f"⚠️ SAM3 CUDA {kind} — retrying on CPU "
+                  "(and using CPU for the remaining concepts)")
+            device = "cpu"
+            try:
+                res = run_sam3(
+                    image_path=image_path,
+                    bboxes=bxs,
+                    concepts=[concept],
+                    model_path=model_path,
+                    device=device,
+                    conf=conf,
+                )
+            except Exception as e2:
+                res = {"success": False, "error": str(e2)}
 
         if not res.get("success"):
-            # run_sam3 swallows CUDA OOM into {"success": False, "error":
-            # ...} (it never raises), so the except branch above is dead for
-            # OOM — key the CPU fallback off the returned error instead.
-            err = str(res.get("error", ""))
-            if device != "cpu" and "out of memory" in err.lower():
-                print("⚠️ SAM3 CUDA OOM — retrying on CPU "
-                      "(and using CPU for the remaining concepts)")
-                device = "cpu"
-                try:
-                    res = run_sam3(
-                        image_path=image_path,
-                        bboxes=bxs,
-                        concepts=[concept],
-                        model_path=model_path,
-                        device=device,
-                        conf=conf,
-                    )
-                except Exception as e2:
-                    _fail_all(idxs, concept, str(e2))
-                    _progress(concept)
-                    continue
-                if not res.get("success"):
-                    _fail_all(idxs, concept, res.get("error", "SAM3 failed"))
-                    _progress(concept)
-                    continue
-            else:
-                _fail_all(idxs, concept, res.get("error", "SAM3 failed"))
-                _progress(concept)
-                continue
+            _fail_all(idxs, concept, res.get("error", "SAM3 failed"))
+            _progress(concept)
+            continue
 
         masks = res.get("masks", []) or []
         dets = res.get("detections", []) or []
@@ -345,7 +320,7 @@ class SAM3BatchWorker(QThread):
 # ---------------------------------------------------------------------------
 
 def _default_sam3_weights() -> str:
-    return str(Path(__file__).resolve().parent.parent
+    return str(Path(__file__).resolve().parents[3]  # repo root
                / "core" / "sam3" / "models" / "sam3-model" / "sam3.pt")
 
 
@@ -538,137 +513,91 @@ class SAM3AutolabelBatchWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# SAM3 track propagation: seed with one box, re-detect frame-by-frame.
+# SAM3 track propagation: one memory-bank video session per run.
 # ---------------------------------------------------------------------------
 
-# A detection this far from the previous box (IoU below this) is not "the
-# same object" — treat the track as lost instead of latching onto an
-# unrelated instance. IoU is 0 when boxes don't overlap at all.
-_PROPAGATE_MIN_IOU = 0.3
-
-# Anchor against drift: a detection must also overlap the SEED box (the
-# first box of the chain) by at least this much, otherwise the track is
-# treated as lost even if it still overlaps the previous frame's box.
-# Stops the chain from slowly walking away from the original object under
-# large camera motion.
-_PROPAGATE_MIN_SEED_IOU = 0.2
-
-
-def _propagate_step(image_path: str, prev_bbox_xyxy: List[float],
-                    concept: str, model_path: Optional[str], device: str,
-                    conf: float,
-                    min_iou: float = _PROPAGATE_MIN_IOU,
-                    seed_bbox_xyxy: Optional[List[float]] = None,
-                    min_seed_iou: float = _PROPAGATE_MIN_SEED_IOU
-                    ) -> Tuple[Optional[Dict[str, Any]], str]:
-    """One propagation step: re-detect the tracked object on a new frame.
-
-    Prompts SAM3 with the previous frame's box as the exemplar and picks
-    the detection with the highest IoU to it (the exemplar segments *all*
-    similar objects, so the nearest one is the tracked instance). The pick
-    must overlap the previous box by >= min_iou and, when seed_bbox_xyxy is
-    given, the seed box by >= min_seed_iou — otherwise the chain would
-    drift away from the original object under large camera motion.
-
-    Returns (det, device_in_use):
-      det = {"bbox_xyxy", "mask", "confidence"} or None when nothing was
-      found (object lost — the caller stops the chain). On CUDA OOM the
-      call is retried on CPU and "cpu" is returned.
-    """
-    def _run(dev: str):
-        return run_sam3(image_path=image_path,
-                        bboxes=[list(prev_bbox_xyxy)],
-                        concepts=[concept],
-                        model_path=model_path, device=dev, conf=conf)
-
-    try:
-        res = _run(device)
-    except Exception as e:
-        if device != "cpu" and "out of memory" in str(e).lower():
-            print("⚠️ SAM3 CUDA OOM — retrying propagation on CPU")
-            device = "cpu"
-            res = _run(device)
-        else:
-            raise
-    # run_sam3 swallows CUDA OOM into a failure dict (it never raises), so
-    # also detect it here on the returned error before giving up.
-    if (not res.get("success") and device != "cpu"
-            and "out of memory" in str(res.get("error", "")).lower()):
-        print("⚠️ SAM3 CUDA OOM — retrying propagation on CPU")
-        device = "cpu"
-        res = _run(device)
-    if not res.get("success"):
-        raise RuntimeError(res.get("error", "SAM3 failed"))
-    dets = res.get("detections", []) or []
-    masks = res.get("masks", []) or []
-    if not dets:
-        return None, device
-    best_i, best_iou = -1, -1.0
-    for i, d in enumerate(dets):
-        iou = _iou_xyxy(prev_bbox_xyxy, d.get("bbox", [0, 0, 0, 0]))
-        if iou > best_iou:
-            best_iou, best_i = iou, i
-    # Reject a "match" that doesn't actually overlap the previous box —
-    # otherwise a lost track latches onto an unrelated similar object and
-    # the chain chases it for the rest of the clip.
-    if best_iou < min_iou:
-        return None, device
-    d = dets[best_i]
-    # Also require overlap with the seed box: under large camera motion
-    # the chain can otherwise drift frame-by-frame onto a different object
-    # while every single hop still passes the previous-box check.
-    if (seed_bbox_xyxy is not None
-            and _iou_xyxy(seed_bbox_xyxy, d.get("bbox", [0, 0, 0, 0]))
-            < min_seed_iou):
-        return None, device
-    return {
-        "bbox_xyxy": d["bbox"],
-        "mask": masks[best_i] if best_i < len(masks) else None,
-        "confidence": float(d.get("confidence", 1.0)),
-    }, device
-
-
 class SAM3PropagateWorker(QThread):
-    """Propagate one seeded box forward across frames ("Propagate →").
+    """Propagate seeded boxes forward across frames ("Propagate →").
 
-    Starts from `seed_bbox_xyxy` on `start_frame_idx`; for each following
-    frame the previous frame's detected box is the SAM3 exemplar prompt.
-    Emits frame_done_signal(frame_idx, det_or_None) per frame — the det is
-    emitted even when the UI will skip the frame (e.g. the track id already
-    exists there), because the chain needs it. Stops early when a frame
-    yields no detection (object lost). Cancel is cooperative, checked
-    between frames.
+    All seeds (one per selected track on this side) are tracked together in
+    a single SAM3VideoPredictor session: the frame range is written to a
+    temp mp4, every seed box is registered as its own object on video frame
+    0, and SAM3's memory bank follows each object — no per-frame
+    re-detection, no IoU chaining. Emits frame_done_signal(frame_idx, dets)
+    per frame with dets aligned with `seeds` (None = that object lost on
+    this frame; the memory bank may recover it later). The seed frame's own
+    result is consumed but not emitted (those boxes already exist). Cancel
+    is cooperative, checked between frames; the temp mp4 is removed on
+    every exit.
     """
 
-    frame_done_signal = pyqtSignal(int, object)  # frame_idx, det or None
+    frame_done_signal = pyqtSignal(int, object)  # frame_idx, [det|None] *
     progress_signal = pyqtSignal(int, int)       # frames done, total frames
-    finished_signal = pyqtSignal(int, int)       # boxes found, lost-at idx
-                                                 # (-1 = ran to the end)
+    stage_signal = pyqtSignal(str)               # free-text stage line
+    finished_signal = pyqtSignal(int, object)    # boxes found, lost_map
+                                                 # {seed idx: lost-at idx}
     failed_signal = pyqtSignal(str)
     cancelled_signal = pyqtSignal()
 
     def __init__(self, frame_index, start_frame_idx: int,
-                 seed_bbox_xyxy: List[float], concept: str, tmp_dir: str,
+                 seeds: List[Dict[str, Any]], tmp_dir: str,
                  model_path: Optional[str], device: str, conf: float,
-                 min_iou: float = _PROPAGATE_MIN_IOU,
-                 min_seed_iou: float = _PROPAGATE_MIN_SEED_IOU,
                  parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
         self.start_frame_idx = start_frame_idx
-        self.seed_bbox_xyxy = seed_bbox_xyxy
-        self.concept = concept
+        self.seeds = seeds
         self.tmp_dir = tmp_dir
         self.model_path = model_path
         self.device = device
         self.conf = conf
-        self.min_iou = min_iou
-        self.min_seed_iou = min_seed_iou
         self._cancel_requested = False
 
     def cancel(self) -> None:
         """Ask the worker to stop after the current frame."""
         self._cancel_requested = True
+
+    def _build_clip(self, video_path: str, n_frames: int) -> bool:
+        """Write frames start..end to `video_path` (mp4v). Returns False if
+        cancelled; raises on unreadable frames / writer failures.
+
+        The ultralytics video predictor only accepts a REAL video file as a
+        video source (a frames folder loads as mode="image" and fails
+        init_state's assert), so the range is materialized as an mp4 — the
+        same thing scripts/track_sam3_video.py does.
+        """
+        import cv2  # lazy: only needed on this path
+        writer = None
+        total = n_frames - self.start_frame_idx
+        try:
+            for frame_idx in range(self.start_frame_idx, n_frames):
+                if self._cancel_requested:
+                    return False
+                frame = self.frame_index.frame_at(frame_idx)
+                img_path = frame.get("file_path")
+                bgr = (cv2.imread(str(img_path))
+                       if img_path and os.path.exists(img_path) else None)
+                if bgr is None:
+                    arr = self.frame_index.decode_image(frame_idx)  # RGB
+                    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                if writer is None:
+                    h, w = bgr.shape[:2]
+                    writer = cv2.VideoWriter(
+                        video_path, cv2.VideoWriter_fourcc(*"mp4v"), 30,
+                        (w, h))
+                    if not writer.isOpened():
+                        raise RuntimeError(
+                            f"could not open {video_path} for writing")
+                writer.write(bgr)
+                # Building the clip is the long silent phase — report it
+                # (throttled: every 10 frames, plus first and last).
+                done = frame_idx - self.start_frame_idx + 1
+                if done == 1 or done == total or done % 10 == 0:
+                    self.stage_signal.emit(f"building clip {done}/{total}…")
+        finally:
+            if writer is not None:
+                writer.release()
+        return True
 
     def run(self) -> None:  # noqa: D401 (QThread override)
         if not _SAM3_AVAILABLE:
@@ -678,41 +607,58 @@ class SAM3PropagateWorker(QThread):
         n_frames = len(self.frame_index)
         total = n_frames - self.start_frame_idx - 1
         if total <= 0:
-            self.finished_signal.emit(0, -1)
+            self.finished_signal.emit(0, {})
             return
-        prev = list(self.seed_bbox_xyxy)
-        device = self.device
-        n_found = 0
-        for step, frame_idx in enumerate(
-                range(self.start_frame_idx + 1, n_frames)):
-            if self._cancel_requested:
+        video_path = os.path.join(self.tmp_dir, "propagate_clip.mp4")
+        frame_idx = self.start_frame_idx
+        try:
+            if not self._build_clip(video_path, n_frames):
                 self.cancelled_signal.emit()
                 return
-            frame = self.frame_index.frame_at(frame_idx)
-            img_path = frame.get("file_path")
-            if not img_path or not os.path.exists(img_path):
-                arr = self.frame_index.decode_image(frame_idx)
-                img_path = os.path.join(self.tmp_dir,
-                                        f"propagate_{frame_idx:06d}.png")
-                Image.fromarray(arr).save(img_path)
+            self.stage_signal.emit(
+                "loading model — propagation starts shortly…")
+            n_found = 0
+            # Per-seed last frame with a detection (for the lost report).
+            last_seen = [self.start_frame_idx] * len(self.seeds)
+            for k, per_seed in sam3_video_propagate(
+                    video_path,
+                    [list(s["bbox_xyxy"]) for s in self.seeds],
+                    model_path=self.model_path, device=self.device,
+                    conf=self.conf,
+                    is_cancelled=lambda: self._cancel_requested):
+                if self._cancel_requested:
+                    self.cancelled_signal.emit()
+                    return
+                frame_idx = self.start_frame_idx + k
+                if k == 0:
+                    continue  # seed frame — those boxes already exist
+                dets = []
+                for i, (mask, bbox, score) in enumerate(per_seed):
+                    if mask is None or bbox is None:
+                        dets.append(None)
+                        continue
+                    last_seen[i] = frame_idx
+                    dets.append({"bbox_xyxy": bbox, "mask": mask,
+                                 "confidence": score})
+                n_found += sum(d is not None for d in dets)
+                self.frame_done_signal.emit(frame_idx, dets)
+                self.progress_signal.emit(k, total)
+            if self._cancel_requested:
+                # The engine may have ended the generator silently via its
+                # own is_cancelled check — never report that as "finished".
+                self.cancelled_signal.emit()
+                return
+        except Exception as e:
+            self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
+            return
+        finally:
             try:
-                det, device = _propagate_step(
-                    img_path, prev, self.concept, self.model_path, device,
-                    self.conf, min_iou=self.min_iou,
-                    seed_bbox_xyxy=self.seed_bbox_xyxy,
-                    min_seed_iou=self.min_seed_iou)
-            except Exception as e:
-                self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
-                return
-            self.frame_done_signal.emit(frame_idx, det)
-            self.progress_signal.emit(step + 1, total)
-            if det is None:
-                # Object lost — stop the chain here.
-                self.finished_signal.emit(n_found, frame_idx)
-                return
-            prev = det["bbox_xyxy"]
-            n_found += 1
-        self.finished_signal.emit(n_found, -1)
+                os.remove(video_path)
+            except OSError:
+                pass
+        lost = {i: last_seen[i] + 1 for i in range(len(self.seeds))
+                if last_seen[i] < n_frames - 1}
+        self.finished_signal.emit(n_found, lost)
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +679,8 @@ def _get_interp13():
     global _interp13_mod
     if _interp13_mod is None:
         from importlib import util
-        path = Path(__file__).resolve().parent / "13_interpolate_tracks.py"
+        path = Path(__file__).resolve().parents[3] / "scripts" / \
+            "13_interpolate_tracks.py"
         if not path.exists():
             # PyInstaller bundle: shipped as a data file in the bundle root.
             import sys

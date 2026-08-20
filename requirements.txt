@@ -2,9 +2,9 @@
 
 # GUI Framework
 PyQt6>=6.4.0
-PyQt6-WebEngine>=6.5.0  # for 09_rerun_label_review.py embedded viewer
+PyQt6-WebEngine>=6.5.0  # for gui.label_review embedded viewer
 
-# Rerun (for 09_rerun_label_review.py — review .rrd recordings + label)
+# Rerun (for gui.label_review — review .rrd recordings + label)
 rerun-sdk>=0.34.0
 pyarrow>=14.0.0
 

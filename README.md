@@ -6,6 +6,13 @@ training and inference, built with PyQt6 and Ultralytics YOLO.
 ---
 
 ## Overview
+Label review and segmentation:
+```
+python -m gui.label_review.main
+# stereo dual-view (left/right folders, frames paired positionally):
+python -m gui.label_review.main --images /path/to/left --images-right /path/to/right
+```
+Launches interactive GUI for complete label review and segmentation.
 
 End-to-end pipeline that takes **raw images** and produces a **trained YOLO
 detection/segmentation model** plus **tracking results**, with a
@@ -35,7 +42,7 @@ Nth frame, interpolate the rest.):
 
 ```
 12 extract keyframes → 07 Qwen seed boxes on keyframes → 08 review keyframes
-   → 13 KLT optical-flow interpolation to all frames → 08 review all
+   → 13 interpolation to all frames → 08 review all
    → 09 SAM3 segmentation dataset → Review the masks on roboflow and augment data → 04 YOLO train → 05 evaluate → 11 tracking on raw frames
 ```
 
@@ -71,6 +78,11 @@ PyInstaller (Linux "exe"):
 pyinstaller scripts/label_review.spec --distpath dist --workpath build --noconfirm
 # result: dist/label-review/label-review
 ```
+
+> **Note:** the spec is stale — it still targets the old monolithic
+> `scripts/09_label_review.py`. It needs updating for the new
+> `gui/label_review/` package layout (entry point
+> `python -m gui.label_review.main`) before this works again.
 
 Copy the `dist/label-review/` folder to the target machine (e.g.
 `tar czf label-review.tar.gz -C dist label-review`) and run:

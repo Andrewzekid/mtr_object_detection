@@ -6,7 +6,7 @@ JSONs into one file.
 Split mode
 ----------
 Split the images of a folder (sorted by name, timestamp-aware like
-09_rerun_label_review.py) into subfolders, either by explicit index ranges
+gui.label_review) into subfolders, either by explicit index ranges
 or by an even N-way divide:
 
     # one subfolder per range (indices inclusive, into the sorted file list):
