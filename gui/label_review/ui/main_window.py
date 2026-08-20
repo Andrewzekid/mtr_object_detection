@@ -2503,9 +2503,12 @@ class ReviewWindow(QMainWindow):
         if ret != QMessageBox.StandardButton.Yes:
             return
         by_side: Dict[str, List[Dict[str, Any]]] = {}
-        # Track-id changes made for seed-less boxes are recorded so the
-        # whole propagate run can be undone in one step.
-        seed_tid_changes: List[Tuple[int, Optional[int], int]] = []
+        # Track-id changes made for seed-less boxes are recorded per side
+        # so each side's composite undo entry reverses only its own
+        # track-id assignments (sharing one list across sides would make
+        # both sides' undo entries undo the same changes, double-applying
+        # _undo_set_track and permanently losing track ids).
+        seed_tid_changes_by_side: Dict[str, List[Tuple[int, Optional[int], int]]] = {}
         with self.coco.undo_stack.mute():
             for side, box in seeds:
                 tid = box.get("track_id")
@@ -2513,7 +2516,8 @@ class ReviewWindow(QMainWindow):
                     old_tid = box.get("track_id")
                     tid = self.coco._fresh_track_id()
                     self.coco.set_track_id(box["id"], tid)
-                    seed_tid_changes.append((box["id"], old_tid, tid))
+                    seed_tid_changes_by_side.setdefault(side, []).append(
+                        (box["id"], old_tid, tid))
                     box["track_id"] = tid
                 cat_id = box.get("cat_id", 0)
                 x, y, w, h = box["bbox"]
@@ -2528,7 +2532,7 @@ class ReviewWindow(QMainWindow):
         for side, side_seeds in by_side.items():
             self._start_propagate_worker(
                 self._current_idx, side_seeds, side,
-                seed_tid_changes=seed_tid_changes)
+                seed_tid_changes=seed_tid_changes_by_side.get(side, []))
 
     def _propagate_label(self, seeds: List[Dict[str, Any]],
                          side: str) -> str:
@@ -2936,6 +2940,17 @@ class ReviewWindow(QMainWindow):
         autolabel/propagate, interpolation) so no QThread is destroyed
         mid-run at exit — Qt aborts the process when that happens."""
         self._sam3_queue.clear()
+        # Stop playback + prefetch so no new prefetch runnables are queued.
+        self._playing = False
+        if self._play_timer.isActive():
+            self._play_timer.stop()
+        if self._prefetch_timer.isActive():
+            self._prefetch_timer.stop()
+        # Clear pending prefetch runnables from the global thread pool and
+        # wait briefly for any in-flight ones to finish — they only call
+        # decode_image (no Qt object access), so a short wait is enough.
+        QThreadPool.globalInstance().clear()
+        QThreadPool.globalInstance().waitForDone(500)
         for w in (self._sam3_worker, self._sam3_batch_worker,
                   self._sam3_autolabel_worker,
                   self._sam3_autolabel_batch_worker,

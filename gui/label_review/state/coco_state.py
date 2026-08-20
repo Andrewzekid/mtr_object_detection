@@ -856,7 +856,9 @@ class CocoState:
     def anns_for_image(self, image_id: int) -> List[Dict[str, Any]]:
         if self._anns_cache_dirty:
             self._rebuild_ann_caches()
-        return self._anns_by_image.get(image_id, [])
+        # Return a shallow copy so callers can't mutate the cached list
+        # (e.g. append/remove/sort) and silently corrupt the cache.
+        return list(self._anns_by_image.get(image_id, []))
 
     def _resolve_cat_id(self, label: str) -> int:
         # If the label parses as an int matching an existing cat id, use it.

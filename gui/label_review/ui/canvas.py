@@ -205,7 +205,8 @@ class CanvasWidget(QWidget):
             (vw - iw * scale) / 2.0, (vh - ih * scale) / 2.0
         )
         self._user_zoomed = False
-        self.update()
+        if not self._suppress_update:
+            self.update()
 
     def _img_to_widget(self, x: float, y: float) -> QtCore.QPointF:
         return QtCore.QPointF(
