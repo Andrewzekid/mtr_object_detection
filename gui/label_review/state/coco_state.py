@@ -71,8 +71,9 @@ class CocoState:
         self.keyframes: set = set()
         # Frames the user explicitly marked as annotated ("Mark as
         # annotated" button) even though they have no boxes. Unioned into
-        # the output JSON's `annotated_image_idxs` on save; persisted in
-        # the .progress sidecar like `reviewed`.
+        # the output JSON's `annotated_image_ids` on save (resolved from
+        # frame_idx to image_id(s)); persisted in the .progress sidecar
+        # like `reviewed`.
         self.annotated_marks: set = set()
         # Track id assignment for newly drawn boxes. Default (False): every
         # new box gets a fresh id from the global auto-increment counter.
@@ -317,21 +318,22 @@ class CocoState:
                 if polys:
                     out["segmentation"] = polys
             final_anns.append(out)
-        # Convenience index: frame indices (0-based, matching each image's
-        # ``frame_idx``) that count as annotated — images with at least one
-        # annotation, plus frames the user explicitly marked with the
-        # "Mark as annotated" button. Both sides' image records share the
-        # same frame_idx, so a box on either side marks the frame — the
-        # union across sides falls out of the id → frame_idx mapping.
-        idx_by_id = {img["id"]: img.get("frame_idx") for img in self.images}
-        annotated_idxs = {idx_by_id.get(a["image_id"]) for a in final_anns}
-        annotated_idxs.discard(None)
-        annotated_idxs |= self.annotated_marks
+        # Convenience index: image ids that count as annotated — images with
+        # at least one annotation, plus frames the user explicitly marked
+        # with the "Mark as annotated" button (resolved to their image_id(s)
+        # via the frame-idx → image-id lookup). Both sides' image records
+        # share the same frame_idx in stereo, so a marked frame contributes
+        # every side's image_id for that frame.
+        annotated_ids = {a["image_id"] for a in final_anns}
+        for frame_idx in self.annotated_marks:
+            for (fi, _side), img_id in self._img_id_by_idx.items():
+                if fi == frame_idx and img_id is not None:
+                    annotated_ids.add(img_id)
         data = {
             "images": self.images,
             "annotations": final_anns,
             "categories": self.categories,
-            "annotated_image_idxs": sorted(annotated_idxs),
+            "annotated_image_ids": sorted(annotated_ids),
         }
         path = self.output_json if is_final else tmp_path
         with open(path, "w", encoding="utf-8") as f:

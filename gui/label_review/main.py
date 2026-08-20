@@ -75,8 +75,8 @@ Stereo dual-view
   active side only.
 * Annotations distinguish sides: each image record in the COCO output
   carries ``"side": "left"|"right"`` (old files without the field count
-  as left), and ``annotated_image_idxs`` unions frames annotated on either
-  side. The default output in stereo is ``<left folder>/labels_coco.json``.
+  as left), and ``annotated_image_ids`` lists the image ids annotated on
+  either side. The default output in stereo is ``<left folder>/labels_coco.json``.
   Annotation import (Ctrl+I) matches images by (file name, side).
 
 SAM3 segmentation
@@ -143,10 +143,9 @@ json via ``--json``.
 Timestamps are stored in the COCO output as the ``timestamp_ns`` field on
 each image, and a side-table ``timestamp_ns → image_id`` is written into the
 JSON so the result can be joined back to external databases by timestamp.
-The JSON also carries ``annotated_image_idxs``: the sorted 0-based frame
-indices (matching each image's ``frame_idx``) that count as annotated —
-images with at least one annotation, plus frames explicitly marked with
-the "Mark as annotated" button in the side panel.
+The JSON also carries ``annotated_image_ids``: the sorted COCO image ids
+that count as annotated — images with at least one annotation, plus frames
+explicitly marked with the "Mark as annotated" button in the side panel.
 
 USAGE
 -----

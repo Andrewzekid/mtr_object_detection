@@ -179,13 +179,13 @@ class SidePanel(QWidget):
         layout.addLayout(jump_row)
 
         # Mark the current frame as annotated without drawing any boxes —
-        # it is included in the output JSON's ``annotated_image_idxs``.
+        # it is included in the output JSON's ``annotated_image_ids``.
         self.btn_mark_annotated = QPushButton("✔ Mark as annotated")
         self.btn_mark_annotated.setCheckable(True)
         self.btn_mark_annotated.setToolTip(
             "Count this frame as annotated even though it has no boxes: "
             "its index is written into the output JSON's "
-            "annotated_image_idxs list. Toggle again to unmark.")
+            "annotated_image_ids list. Toggle again to unmark.")
         self.btn_mark_annotated.clicked.connect(
             self.toggle_annotated_clicked.emit)
         layout.addWidget(self.btn_mark_annotated)

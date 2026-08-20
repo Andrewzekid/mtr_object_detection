@@ -1091,7 +1091,7 @@ class ReviewWindow(QMainWindow):
 
     def _on_toggle_annotated(self) -> None:
         """'✔ Mark as annotated' button: count this frame as annotated
-        (it lands in the output JSON's annotated_image_idxs) even though
+        (it lands in the output JSON's annotated_image_ids) even though
         it has no boxes."""
         idx = self._current_idx
         if idx in self.coco.annotated_marks:
@@ -1100,7 +1100,7 @@ class ReviewWindow(QMainWindow):
         else:
             self.coco.annotated_marks.add(idx)
             msg = f"Marked as annotated (frame {idx + 1})"
-        # The mark changes the saved JSON's annotated_image_idxs, so force
+        # The mark changes the saved JSON's annotated_image_ids, so force
         # a full write on the next save (not just the progress sidecar).
         self.coco.dirty = True
         self._sync_annotated_button()
