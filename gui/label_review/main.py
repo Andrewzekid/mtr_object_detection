@@ -13,7 +13,12 @@ Run it
     # With an image source:
     python -m gui.label_review.main \
         --images /path/to/folder_or_image.jpg \
-        --output_json output/my_labels/coco.json
+        --output_json output/my_labels/coco.json \
+        [--rrd output/my_labels/label_review.rrd]
+
+    (--rrd records a Rerun .rrd of what you label: every "Mark as
+    annotated" logs the frame's image, boxes and box-center keypoints.
+    View it afterwards with `rerun output/my_labels/label_review.rrd`.)
 
     # Stereo pair (left + right folders, frames paired positionally):
     python -m gui.label_review.main \
@@ -334,6 +339,11 @@ def main():
     parser.add_argument("--db", help="Deprecated/unused: categories are no longer read "
                         "from a SQLite DB. Kept so old commands still parse.")
     parser.add_argument("--output-yolo-dir", help="Also export YOLO dataset on exit.")
+    parser.add_argument("--rrd", default=None,
+                        help="Write a Rerun recording (.rrd) of what you "
+                             "label: each 'Mark as annotated' logs the "
+                             "frame's image, boxes and box-center "
+                             "keypoints. View afterwards with: rerun <path>")
     parser.add_argument("--data-yaml", help="Reference data.yaml for YOLO class order.")
     # SAM3 options
     parser.add_argument("--sam3-model", default=None,
@@ -463,7 +473,12 @@ def main():
     # Resolve ReviewWindow through the package at call time (not a module
     # global) so tests can monkeypatch gui.label_review.ReviewWindow.
     ReviewWindow = sys.modules[__package__].ReviewWindow
+    from .rerun_logger import RerunLogger
+    rerun_logger = RerunLogger(args.rrd)
+    if rerun_logger.enabled:
+        print(f"🎬 Rerun recording enabled: {args.rrd}")
     win = ReviewWindow(frame_index, coco,
+                       rerun_logger=rerun_logger,
                        sam3_model=sam3_cfg.get("model") or args.sam3_model,
                        sam3_device=sam3_device,
                        sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),

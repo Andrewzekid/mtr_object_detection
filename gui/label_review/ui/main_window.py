@@ -81,6 +81,7 @@ class ReviewWindow(QMainWindow):
                    advanced_ui: bool = False,
                    show_track_ids: bool = True,
                    display_max_dim: int = 0,
+                   rerun_logger=None,
                    parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -122,6 +123,10 @@ class ReviewWindow(QMainWindow):
         # resolution; config: display.max_image_dim). Box/mask coordinates
         # are unaffected — the canvases keep logical image coords.
         self.display_max_dim: int = max(0, int(display_max_dim))
+        # Optional Rerun (.rrd) recorder: when enabled (--rrd), marking a
+        # frame as annotated logs its image, boxes and box-center
+        # keypoints to the recording (see rerun_logger.py).
+        self.rerun = rerun_logger
 
         self.setWindowTitle("Computer Vision Label Review Tool")
         self.resize(1600, 900)
@@ -1105,7 +1110,29 @@ class ReviewWindow(QMainWindow):
         self.coco.dirty = True
         self._sync_annotated_button()
         self.coco.save(is_final=False)
+        # Rerun recording: log what this frame currently holds (image,
+        # boxes, box-center keypoints) so the .rrd always reflects the
+        # latest state of the mark.
+        self._log_rerun_current()
         self.statusBar().showMessage(msg, 2500)
+
+    def _log_rerun_current(self) -> None:
+        """Log the current frame (all sides) to the Rerun recording."""
+        if self.rerun is None or not getattr(self.rerun, "enabled", False):
+            return
+        try:
+            idx = self._current_idx
+            for side, canvas in self.canvases.items():
+                frame = self._frame_at_side(idx, side)
+                arr = self._decode_side(idx, side)
+                image_id = canvas._image_id
+                anns = self.coco.anns_for_image(image_id) \
+                    if image_id is not None else []
+                self.rerun.log_frame(frame, arr, anns,
+                                     self.coco.cat_map, side=side)
+            self.rerun.flush()
+        except Exception as exc:
+            print(f"WARNING: Rerun logging failed: {exc}")
 
     @staticmethod
     def _ann_to_interp_dict(ann: Dict[str, Any]) -> Dict[str, Any]:
@@ -2924,6 +2951,9 @@ class ReviewWindow(QMainWindow):
     # ----------------------- shutdown ---------------------------------- #
 
     def closeEvent(self, ev: QtGui.QCloseEvent) -> None:
+        # Flush the Rerun recording so the .rrd is complete on disk.
+        if self.rerun is not None:
+            self.rerun.flush()
         # _on_quit / _on_save_quit already confirmed + saved; don't ask twice.
         if not self._quit_confirmed:
             res = self._confirm_quit()
