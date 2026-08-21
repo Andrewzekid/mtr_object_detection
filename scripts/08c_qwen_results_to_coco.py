@@ -8,13 +8,13 @@ Reads a folder of ``<timestamp>_result.json`` files as produced by
 
 - ``images``: id, file_name, width, height, timestamp_ns (from the file
   name), frame_idx (sorted order), side
-- ``annotations``: id, image_id, category_id, bbox [x1, y1, x2, y2], area,
-  iscrowd 0
+- ``annotations``: id, image_id, category_id, bbox [x, y, w, h] (COCO
+  convention - what gui/label_review expects), area, iscrowd 0
 - ``categories``: one per distinct label, ids starting at 0
 - ``annotated_image_ids``: ids of images that have at least one annotation
 
 Usage:
-    python 17_qwen_results_to_coco.py \
+    python 08c_qwen_results_to_coco.py \
         --qwen-results-dir output/<run>/qwen/left \
         --output output/<run>/qwen/left/labels_coco.json \
         [--side left]
@@ -122,7 +122,7 @@ def main():
                 "id": next_ann_id,
                 "image_id": next_image_id,
                 "category_id": cat_id_by_name[label],
-                "bbox": [x1, y1, x2, y2],
+                "bbox": [x1, y1, w, h],
                 "area": w * h,
                 "iscrowd": 0,
             })
