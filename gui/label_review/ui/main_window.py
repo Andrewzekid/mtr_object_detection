@@ -82,6 +82,7 @@ class ReviewWindow(QMainWindow):
                    show_track_ids: bool = True,
                    display_max_dim: int = 0,
                    rerun_logger=None,
+                   pose_db=None,
                    parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -127,6 +128,9 @@ class ReviewWindow(QMainWindow):
         # frame as annotated logs its image, boxes and box-center
         # keypoints to the recording (see rerun_logger.py).
         self.rerun = rerun_logger
+        # Optional pose DB (Clio inspection SQLite) used to place marked
+        # frames on the point-cloud map (see map_view.py).
+        self._pose_db = pose_db
 
         self.setWindowTitle("Computer Vision Label Review Tool")
         self.resize(1600, 900)
@@ -537,6 +541,22 @@ class ReviewWindow(QMainWindow):
             "Categories are merged by name.")
         act_anns.triggered.connect(self._load_annotations_dialog)
         m.addAction(act_anns)
+        act_rerun = QAction("Open rerun file…", self)
+        act_rerun.setToolTip(
+            "Open a Rerun recording (.rrd) in the rerun viewer, or a "
+            "colored point-cloud map (.pcd): the map is loaded into this "
+            "session's recording and a live-connected rerun viewer opens. "
+            "Marking frames as annotated then marks their camera position "
+            "on the map (needs a pose DB, File -> Open pose database…).")
+        act_rerun.triggered.connect(self._open_rerun_file)
+        m.addAction(act_rerun)
+        act_pose_db = QAction("Open pose database…", self)
+        act_pose_db.setToolTip(
+            "Clio inspection DB (SQLite) with an 'images' table holding "
+            "per-timestamp cam_tf / lidar poses. Used to place annotated "
+            "frames on the point-cloud map.")
+        act_pose_db.triggered.connect(self._open_pose_db)
+        m.addAction(act_pose_db)
         m.addSeparator()
         act_save = QAction("Save", self)
         act_save.setShortcut("Ctrl+S")
@@ -629,6 +649,85 @@ class ReviewWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Loaded {len(self.frame_index)} frame(s) — saving to {out_json}",
             5000)
+
+    def _open_rerun_file(self) -> None:
+        """File -> Open rerun file…: view a .rrd recording, or load a .pcd
+        colored map into this session's recording (and open a live
+        rerun viewer so mark-as-annotated markers appear on the map)."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open rerun file", "",
+            "Rerun / point cloud (*.rrd *.pcd);;Rerun recording (*.rrd);;"
+            "Point cloud map (*.pcd)")
+        if not path:
+            return
+        if path.lower().endswith(".rrd"):
+            # Static recording: just launch the rerun viewer on it.
+            import subprocess
+            try:
+                subprocess.Popen(["rerun", path])
+                self.statusBar().showMessage(
+                    f"Opened {path} in the rerun viewer", 4000)
+            except FileNotFoundError:
+                QMessageBox.warning(
+                    self, "rerun not found",
+                    "The `rerun` viewer executable is not on PATH. "
+                    "Install rerun-sdk / the rerun CLI first.")
+            return
+        # .pcd colored map: log it into the session recording.
+        from ..map_view import load_pcd
+        try:
+            positions, colors = load_pcd(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not read point cloud",
+                                f"{path}:\n{exc}")
+            return
+        logger = self._ensure_rerun()
+        if logger is None or not logger.enabled:
+            QMessageBox.warning(
+                self, "Rerun unavailable",
+                "Could not start a Rerun recording (is rerun-sdk "
+                "installed?). The map cannot be displayed.")
+            return
+        self.statusBar().showMessage(
+            f"Loading {len(positions):,} map points into Rerun…", 3000)
+        QApplication.processEvents()
+        logger.log_map(positions, colors)
+        logger.flush()
+        logger.spawn()
+        self.statusBar().showMessage(
+            f"Map loaded ({len(positions):,} points). Marking frames as "
+            "annotated marks their camera position on the map"
+            + ("" if self._pose_db else
+               " - open a pose DB (File -> Open pose database…) to enable "
+               "map markers"), 8000)
+
+    def _open_pose_db(self) -> None:
+        """File -> Open pose database…: Clio inspection SQLite whose
+        'images' table carries per-timestamp cam_tf/lidar poses."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open pose database", "", "SQLite DB (*.db *.db3 *.sqlite)")
+        if not path:
+            return
+        from ..map_view import PoseDb
+        try:
+            self._pose_db = PoseDb(path)
+        except Exception as exc:
+            self._pose_db = None
+            QMessageBox.warning(self, "Could not read pose database",
+                                f"{path}:\n{exc}")
+            return
+        n = len(self._pose_db._ts)
+        self.statusBar().showMessage(
+            f"Pose DB loaded: {n:,} image poses from {path}", 5000)
+
+    def _ensure_rerun(self):
+        """The active RerunLogger, creating one on demand (recording next
+        to the COCO output) when the session wasn't started with --rrd."""
+        if self.rerun is None:
+            from ..rerun_logger import RerunLogger
+            out = Path(self.coco.output_json)
+            self.rerun = RerunLogger(str(out.with_suffix(".rrd")))
+        return self.rerun
 
     def _load_annotations_dialog(self) -> None:
         """File → Load annotations file…: import boxes/masks from a COCO
@@ -1122,6 +1221,7 @@ class ReviewWindow(QMainWindow):
             return
         try:
             idx = self._current_idx
+            marked = idx in self.coco.annotated_marks
             for side, canvas in self.canvases.items():
                 frame = self._frame_at_side(idx, side)
                 arr = self._decode_side(idx, side)
@@ -1130,6 +1230,12 @@ class ReviewWindow(QMainWindow):
                     if image_id is not None else []
                 self.rerun.log_frame(frame, arr, anns,
                                      self.coco.cat_map, side=side)
+                # Mark the frame's camera position on the colored map.
+                if marked and self._pose_db is not None:
+                    pos = self._pose_db.pose_at(frame.get("timestamp_ns"))
+                    if pos is not None:
+                        self.rerun.log_map_marker(
+                            pos, label=f"frame {idx + 1} ({side})")
             self.rerun.flush()
         except Exception as exc:
             print(f"WARNING: Rerun logging failed: {exc}")

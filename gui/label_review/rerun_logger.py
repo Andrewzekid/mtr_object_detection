@@ -133,3 +133,45 @@ class RerunLogger:
                 self._stream.flush()
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------ #
+    # Colored point-cloud map + annotated-frame positions
+
+    def log_map(self, positions: "np.ndarray", colors: "np.ndarray") -> None:
+        """Log a colored point-cloud map (from a .pcd) as static 3D points."""
+        if not self.enabled or self._stream is None:
+            return
+        try:
+            self._stream.log(
+                "world/map",
+                rr.Points3D(positions, colors=colors),
+                static=True,
+            )
+        except Exception as exc:
+            print(f"WARNING: Rerun map logging failed: {exc}")
+
+    def log_map_marker(self, position, label: str,
+                       color=(255, 60, 60)) -> None:
+        """Mark one annotated frame's position on the map (large point)."""
+        if not self.enabled or self._stream is None:
+            return
+        try:
+            self._stream.log(
+                "world/map/annotated_frames",
+                rr.Points3D([position], radii=0.15, colors=[color],
+                            labels=[label]),
+            )
+        except Exception as exc:
+            print(f"WARNING: Rerun map marker logging failed: {exc}")
+
+    def spawn(self) -> bool:
+        """Open the standalone `rerun` viewer, live-connected to this
+        recording (gRPC), so later mark-as-annotated logs appear in it."""
+        if not self.enabled or self._stream is None:
+            return False
+        try:
+            self._stream.spawn()
+            return True
+        except Exception as exc:
+            print(f"WARNING: could not spawn the rerun viewer: {exc}")
+            return False

@@ -344,6 +344,12 @@ def main():
                              "label: each 'Mark as annotated' logs the "
                              "frame's image, boxes and box-center "
                              "keypoints. View afterwards with: rerun <path>")
+    parser.add_argument("--pose-db", default=None,
+                        help="Clio inspection DB (SQLite) whose 'images' "
+                             "table holds per-timestamp cam_tf/lidar "
+                             "poses. With --rrd (or an opened .pcd map), "
+                             "marking a frame as annotated also marks its "
+                             "camera position on the point-cloud map.")
     parser.add_argument("--data-yaml", help="Reference data.yaml for YOLO class order.")
     # SAM3 options
     parser.add_argument("--sam3-model", default=None,
@@ -477,8 +483,17 @@ def main():
     rerun_logger = RerunLogger(args.rrd)
     if rerun_logger.enabled:
         print(f"🎬 Rerun recording enabled: {args.rrd}")
+    pose_db = None
+    if args.pose_db:
+        from .map_view import PoseDb
+        try:
+            pose_db = PoseDb(args.pose_db)
+            print(f"🗺️  Pose DB loaded: {len(pose_db._ts):,} image poses")
+        except Exception as exc:
+            print(f"⚠️ Could not load pose DB {args.pose_db}: {exc}")
     win = ReviewWindow(frame_index, coco,
                        rerun_logger=rerun_logger,
+                       pose_db=pose_db,
                        sam3_model=sam3_cfg.get("model") or args.sam3_model,
                        sam3_device=sam3_device,
                        sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),
