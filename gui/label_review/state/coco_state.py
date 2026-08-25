@@ -13,6 +13,22 @@ from ..utils.mask_utils import (
 from .undo_stack import UndoStack
 
 
+def _imported_mask(ann: Dict[str, Any], h: int, w: int):
+    """Extract the in-memory mask from a loaded/imported annotation dict:
+    polygon ``segmentation`` (current format) or legacy base64 ``mask``.
+    Returns None when absent or undecodable (never raises)."""
+    try:
+        if ann.get("segmentation"):
+            return _polygons_to_mask(ann["segmentation"], h, w)
+        mask_b64 = ann.get("mask")
+        if isinstance(mask_b64, str) and mask_b64:
+            import base64
+            return _decode_mask_png(base64.b64decode(mask_b64))
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # COCO state
 # ---------------------------------------------------------------------------
@@ -75,6 +91,12 @@ class CocoState:
         # frame_idx to image_id(s)); persisted in the .progress sidecar
         # like `reviewed`.
         self.annotated_marks: set = set()
+        # Frames the user explicitly discarded ("Discard image" button) —
+        # excluded from the FINAL json (images + their annotations +
+        # annotated marks) but kept in the session and in the _tmp progress
+        # file, so the toggle stays reversible until the final export.
+        # Persisted in the .progress sidecar like `reviewed`.
+        self.discarded_frames: set = set()
         # Track id assignment for newly drawn boxes. Default (False): every
         # new box gets a fresh id from the global auto-increment counter.
         # When True (config "tracking": {"sticky_ids": true}), the k-th box
@@ -87,6 +109,13 @@ class CocoState:
         # a COCO polygon — drops the scattered speck polygons SAM3
         # occasionally produces. Config: "sam3": {"min_polygon_area": ...}.
         self.min_polygon_area: float = 100.0
+        # Synced-timestamp filter for stereo sessions: the sorted set of
+        # timestamps present in BOTH folders (set via
+        # set_synced_timestamps). When set, save() writes only image
+        # records whose timestamp is in this set — unsynced images
+        # (e.g. stale records loaded from an older save file) are dropped
+        # from the JSON. None disables filtering (mono sessions).
+        self._synced_ts: Optional[set] = None
         # Image-id lookup tables, keyed by (timestamp_ns, side) and
         # (frame_idx, side) — stereo sessions have one image record per
         # side. _SideKeyedDict maps bare keys to the left side.
@@ -112,6 +141,30 @@ class CocoState:
         self._img_by_id: Dict[int, Dict[str, Any]] = {}
 
     # ------------------------- persistence ---------------------------- #
+
+    def set_synced_timestamps(self, timestamps) -> None:
+        """Restrict saved images to these timestamps (stereo sessions: the
+        sorted timestamps present in both folders). Pass None to disable."""
+        self._synced_ts = set(timestamps) if timestamps is not None else None
+
+    def register_all_frames(self, frame_index) -> int:
+        """Create an image record for every frame of the index (both sides
+        in stereo), so the saved JSON lists every synced image — not just
+        the frames actually visited. New records get width/height 0 until
+        the frame is first decoded (``ensure_image`` fills real dims in on
+        visit and never clobbers them with 0); downstream tools infer dims
+        of unvisited images from the files. Returns records created."""
+        stereo = getattr(frame_index, "stereo", False)
+        sides = ("left", "right") if stereo else ("left",)
+        created = 0
+        for idx in range(len(frame_index)):
+            for side in sides:
+                frame = (frame_index.frame_at(idx, side) if stereo
+                         else frame_index.frame_at(idx))
+                before = len(self.images)
+                self.ensure_image(frame, 0, 0, side=side)
+                created += len(self.images) - before
+        return created
 
     def load_existing(self) -> None:
         # Prefer the newest of the final JSON and the _tmp progress JSON —
@@ -154,22 +207,10 @@ class CocoState:
                 if isinstance(tid, int) and not isinstance(tid, bool):
                     self._track_next = max(self._track_next, tid + 1)
                 # Restore the in-memory mask: COCO polygon "segmentation"
-                # (current format) or legacy base64 PNG ("mask").
-                mask_b64 = ann.get("mask")
-                if isinstance(mask_b64, str) and mask_b64:
-                    try:
-                        import base64
-                        # None on decode failure; no `or None` — ndarray
-                        # truthiness is ambiguous and raises.
-                        ann["_mask"] = _decode_mask_png(
-                            base64.b64decode(mask_b64))
-                    except Exception:
-                        ann["_mask"] = None
-                elif ann.get("segmentation"):
-                    h, w = img_dims.get(ann["image_id"], (0, 0))
-                    ann["_mask"] = _polygons_to_mask(ann["segmentation"], h, w)
-                else:
-                    ann["_mask"] = ann.get("_mask")  # may be None or ndarray
+                # (current format) or legacy base64 PNG ("mask"). A corrupt
+                # entry must not kill the whole load — drop just the mask.
+                h, w = img_dims.get(ann["image_id"], (0, 0))
+                ann["_mask"] = _imported_mask(ann, h, w)
             for img in self.images:
                 # Images saved before the stereo feature have no "side"
                 # field — they are treated as left.
@@ -193,6 +234,7 @@ class CocoState:
                 self.reviewed = set(data.get("reviewed", []))
                 self.keyframes = set(data.get("keyframes", []))
                 self.annotated_marks = set(data.get("annotated_marks", []))
+                self.discarded_frames = set(data.get("discarded", []))
                 if 0 <= idx < total_frames:
                     print(f"⏳ Resuming from frame {idx + 1}/{total_frames}")
                     return idx
@@ -202,7 +244,7 @@ class CocoState:
 
     def import_coco(self, data: Dict[str, Any],
                     file_to_frame: Dict[str, int],
-                    frame_index) -> Tuple[int, int, int]:
+                    frame_index) -> Tuple[int, int, int, int]:
         """Import annotations from another COCO dict (File → Load
         annotations…), matching images to the current source by file
         basename (and ``side``, in stereo sessions — imported images
@@ -211,24 +253,29 @@ class CocoState:
         current source are skipped silently. Masks are restored from polygon
         ``segmentation`` (or the legacy base64 ``mask``). Annotations that
         duplicate an existing live box (same image, category and bbox) are
-        skipped so re-importing the same file is harmless. Bulk action — no
-        undo entry. Returns (frames_matched, anns_imported, anns_skipped)."""
+        skipped so re-importing the same file is harmless — but when the
+        existing box has no mask and the duplicate carries one, the mask is
+        merged onto the existing box (this is how masks from an external
+        SAM3 run reach boxes that were already drawn). Bulk action — no
+        undo entry. Returns (frames_matched, anns_imported, anns_skipped,
+        masks_merged)."""
         src_cat_to_dst = {}
         for cat in data.get("categories", []):
             src_cat_to_dst[int(cat["id"])] = self._resolve_cat_id(cat["name"])
         img_by_src_id = {int(i["id"]): i for i in data.get("images", [])}
 
-        # Existing live boxes per image for duplicate detection.
-        existing: Dict[int, set] = {}
+        # Existing live boxes per image for duplicate detection + mask
+        # merge (image_id -> {(cat_id, bbox-key): ann}).
+        existing: Dict[int, Dict[tuple, Dict[str, Any]]] = {}
         for a in self.annotations:
             if a["id"] in self.removed_ids:
                 continue
             key = (a["category_id"],
                    tuple(round(float(v), 1) for v in a["bbox"]))
-            existing.setdefault(a["image_id"], set()).add(key)
+            existing.setdefault(a["image_id"], {})[key] = a
 
         frames_matched: set = set()
-        n_imported = n_skipped = 0
+        n_imported = n_skipped = n_merged = 0
         for ann in data.get("annotations", []):
             src_img = img_by_src_id.get(int(ann["image_id"]))
             cat_id = src_cat_to_dst.get(int(ann["category_id"]))
@@ -247,15 +294,34 @@ class CocoState:
                 continue  # image not in the current source — not an error
             w = int(src_img.get("width", 0))
             h = int(src_img.get("height", 0))
-            if getattr(frame_index, "stereo", False):
-                frame = frame_index.frame_at(frame_idx, side)
-            else:
-                frame = frame_index.frame_at(frame_idx)
+            stereo = getattr(frame_index, "stereo", False)
+            # Mask-bearing anns need real image dims to rasterize; when the
+            # source record lacks them, decode the actual frame once.
+            if (w <= 0 or h <= 0) and \
+                    (ann.get("segmentation") or ann.get("mask")):
+                try:
+                    arr = (frame_index.decode_image(frame_idx, side)
+                           if stereo else frame_index.decode_image(frame_idx))
+                    h, w = arr.shape[:2]
+                except Exception:
+                    pass
+            frame = (frame_index.frame_at(frame_idx, side)
+                     if stereo else frame_index.frame_at(frame_idx))
             image_id = self.ensure_image(frame, w, h, side=side)
             bbox = [float(v) for v in ann["bbox"]]
             key = (cat_id, tuple(round(v, 1) for v in bbox))
-            if key in existing.get(image_id, set()):
-                n_skipped += 1  # exact duplicate already in the session
+            dup = existing.get(image_id, {}).get(key)
+            if dup is not None:
+                # Exact duplicate already in the session — don't re-add the
+                # box, but DO merge the mask when the live box has none
+                # (otherwise re-loading a SAM3-annotated file over existing
+                # boxes silently drops every mask).
+                if dup.get("_mask") is None:
+                    mask = _imported_mask(ann, h, w)
+                    if mask is not None:
+                        dup["_mask"] = mask
+                        n_merged += 1
+                n_skipped += 1
                 continue
             frames_matched.add(frame_idx)
             new_ann = {
@@ -266,17 +332,7 @@ class CocoState:
                 "area": float(ann.get("area", bbox[2] * bbox[3])),
                 "iscrowd": int(ann.get("iscrowd", 0)),
             }
-            # Mask: polygon segmentation (current) or legacy base64 PNG.
-            if ann.get("segmentation"):
-                new_ann["_mask"] = _polygons_to_mask(ann["segmentation"],
-                                                     h, w)
-            elif isinstance(ann.get("mask"), str) and ann["mask"]:
-                try:
-                    import base64
-                    new_ann["_mask"] = _decode_mask_png(
-                        base64.b64decode(ann["mask"]))
-                except Exception:
-                    new_ann["_mask"] = None
+            new_ann["_mask"] = _imported_mask(ann, h, w)
             # Keep the source track id when it parses as an int; otherwise
             # assign a fresh one so tracking stays consistent.
             try:
@@ -286,13 +342,13 @@ class CocoState:
             except (KeyError, TypeError, ValueError):
                 new_ann["track_id"] = self._fresh_track_id()
             self.annotations.append(new_ann)
-            existing.setdefault(image_id, set()).add(key)
+            existing.setdefault(image_id, {})[key] = new_ann
             self._ann_id_next += 1
             n_imported += 1
-        if n_imported:
+        if n_imported or n_merged:
             self.dirty = True
             self._invalidate_ann_caches()
-        return len(frames_matched), n_imported, n_skipped
+        return len(frames_matched), n_imported, n_skipped, n_merged
 
     def save(self, is_final: bool) -> None:
         tmp_path = self.output_json.replace(".json", "_tmp.json")
@@ -304,9 +360,30 @@ class CocoState:
             # spammed "Saved progress" on every step.
             self._write_progress()
             return
+        # Discarded frames are excluded from the FINAL export only: their
+        # images, those images' annotations, and their annotated marks.
+        # The _tmp file keeps everything so "Discard image" stays
+        # reversible until the final save.
+        drop_img_ids: set = set()
+        if is_final and self.discarded_frames:
+            drop_img_ids = {img["id"] for img in self.images
+                            if img.get("frame_idx") in self.discarded_frames}
+        # Unsynced image records (stereo sessions: timestamps present in
+        # only one folder) are excluded from EVERY save — they can arrive
+        # via stale records in a previously loaded JSON and must never be
+        # written back out.
+        if self._synced_ts is not None:
+            unsynced = {img["id"] for img in self.images
+                        if img.get("timestamp_ns") not in self._synced_ts}
+            if unsynced:
+                print(f"🧹 Excluding {len(unsynced)} unsynced image "
+                      f"record(s) — no matching timestamp on the other side")
+            drop_img_ids |= unsynced
         final_anns = []
         for ann in self.annotations:
             if ann["id"] in self.removed_ids:
+                continue
+            if ann["image_id"] in drop_img_ids:
                 continue
             out = {k: v for k, v in ann.items() if not k.startswith("_")}
             # Legacy base64-PNG "mask" field is superseded by COCO polygon
@@ -326,11 +403,23 @@ class CocoState:
         # every side's image_id for that frame.
         annotated_ids = {a["image_id"] for a in final_anns}
         for frame_idx in self.annotated_marks:
+            if frame_idx in self.discarded_frames:
+                continue
             for (fi, _side), img_id in self._img_id_by_idx.items():
-                if fi == frame_idx and img_id is not None:
+                if fi == frame_idx and img_id is not None \
+                        and img_id not in drop_img_ids:
                     annotated_ids.add(img_id)
+        out_images = ([img for img in self.images
+                       if img["id"] not in drop_img_ids]
+                      if drop_img_ids else self.images)
+        # Deterministic order: by timestamp (earlier first), left before
+        # right within a pair.
+        out_images = sorted(
+            out_images,
+            key=lambda i: (i.get("timestamp_ns") or 0,
+                           0 if i.get("side", "left") == "left" else 1))
         data = {
-            "images": self.images,
+            "images": out_images,
             "annotations": final_anns,
             "categories": self.categories,
             "annotated_image_ids": sorted(annotated_ids),
@@ -345,13 +434,14 @@ class CocoState:
 
     def _write_progress(self) -> None:
         """Write only the small .progress sidecar (resume position,
-        reviewed set, keyframes, annotated marks). Cheap — safe to call
-        per navigation."""
+        reviewed set, keyframes, annotated marks, discarded frames).
+        Cheap — safe to call per navigation."""
         with open(self.progress_file, "w") as f:
             json.dump({"last_index": self.current_idx + 1,
                        "reviewed": sorted(self.reviewed),
                        "keyframes": sorted(self.keyframes),
-                       "annotated_marks": sorted(self.annotated_marks)}, f)
+                       "annotated_marks": sorted(self.annotated_marks),
+                       "discarded": sorted(self.discarded_frames)}, f)
 
     # ------------------------- mutation -------------------------------- #
 
@@ -374,8 +464,11 @@ class CocoState:
             img_id = self._img_id_by_ts[ts_key]
             # update size if needed (O(1) via the by-id index instead of
             # scanning self.images linearly — that scan ran every tick).
+            # Never clobber known dims with 0 (e.g. an import whose source
+            # records lack width/height): zero dims silently drop every
+            # mask on reload (polygons rasterize to nothing).
             img = self._img_by_id.get(img_id)
-            if img is not None:
+            if img is not None and width > 0 and height > 0:
                 img["width"] = width
                 img["height"] = height
             return img_id
@@ -837,8 +930,11 @@ class CocoState:
     def _invalidate_ann_caches(self) -> None:
         """Mark the anns_for_image / labeled_frame_idxs caches stale.
 
-        Called from every annotation mutation (add/remove/move/mask/
-        track-id/import/undo/redo/load). The caches rebuild lazily on the
+        Called from every annotation mutation that changes WHICH anns
+        exist or WHERE they belong (add/remove/move/import/undo/redo/
+        load). Mask updates (set_mask) don't need this: the cache holds
+        aliases to the same ann dicts, so in-place ``_mask`` changes are
+        visible immediately. The caches rebuild lazily on the
         next query, so the cost is paid once per mutation, not per tick.
         """
         self._anns_cache_dirty = True

@@ -297,17 +297,34 @@ def main():
             print(f"  {split_name}: {count} images")
         
         # Generate dataset.yaml if requested
-        if args.generate_yaml and args.class_names:
+        class_names = args.class_names
+        if args.generate_yaml and not class_names:
+            # Fall back to classes.txt produced by 01b_coco_to_yolo_seg.py /
+            # copied through by 02_augment_data.py (one class name per line).
+            for candidate in (
+                Path(args.input_dir) / "classes.txt",
+                Path(args.input_dir).parent / "classes.txt",
+            ):
+                if candidate.is_file():
+                    class_names = [
+                        line.strip()
+                        for line in candidate.read_text().splitlines()
+                        if line.strip()
+                    ]
+                    print(f"\nLoaded {len(class_names)} class names from {candidate}")
+                    break
+
+        if args.generate_yaml and class_names:
             print(f"\nGenerating dataset.yaml...")
             from core.model_trainer import ModelTrainer
             trainer = ModelTrainer()
             yaml_path = trainer.create_dataset_yaml(
-                class_names=args.class_names,
+                class_names=class_names,
                 dataset_path=args.output_dir,
             )
             print(f"  Created: {yaml_path}")
         elif args.generate_yaml:
-            print("\nWarning: --generate-yaml requires --class-names to be specified")
+            print("\nWarning: --generate-yaml requires --class-names or a classes.txt in the input directory")
         
         print(f"\nOutput directory: {args.output_dir}")
     else:

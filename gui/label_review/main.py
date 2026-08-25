@@ -397,6 +397,7 @@ def main():
             sys.exit(1)
     interp_cfg = cfg.get("interpolation", {})
     sam3_cfg = cfg.get("sam3", {})
+    autolabel_cfg = cfg.get("autolabel", {})
     ui_cfg = cfg.get("ui", {})
     tracking_cfg = cfg.get("tracking", {})
     display_cfg = cfg.get("display", {})
@@ -468,6 +469,13 @@ def main():
     coco.min_polygon_area = max(
         0.0, float(sam3_cfg.get("min_polygon_area", 100)))
     coco.load_existing()
+    # Stereo: only timestamps present in BOTH folders may be saved.
+    if getattr(frame_index, "stereo", False) and \
+            getattr(frame_index, "timestamps_real", False):
+        coco.set_synced_timestamps(frame_index.paired_timestamps)
+    # Register every frame up front so the saved JSON lists ALL synced
+    # images, not just the ones visited/annotated this session.
+    coco.register_all_frames(frame_index)
     coco.current_idx = coco.load_progress(len(frame_index))
 
     # ---------- 3. Qt app ----------
@@ -494,6 +502,16 @@ def main():
     win = ReviewWindow(frame_index, coco,
                        rerun_logger=rerun_logger,
                        pose_db=pose_db,
+                       autolabel_detector=autolabel_cfg.get(
+                           "detector", "sam3"),
+                       owlv2_model=autolabel_cfg.get("owlv2_model"),
+                       owlv2_conf=float(autolabel_cfg.get(
+                           "owlv2_conf", 0.3)),
+                       gdino_model=autolabel_cfg.get("gdino_model"),
+                       gdino_conf=float(autolabel_cfg.get(
+                           "gdino_conf", 0.35)),
+                       florence2_model=autolabel_cfg.get("florence2_model"),
+                       falcon_model=autolabel_cfg.get("falcon_model"),
                        sam3_model=sam3_cfg.get("model") or args.sam3_model,
                        sam3_device=sam3_device,
                        sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),

@@ -498,10 +498,12 @@ def test_import_coco_merge_dedup_masks(lr, tmp_path):
                        {"id": 8, "name": "imported_cat"}],
     }
     file_to_frame = {os.path.basename(fp): i for i, fp in enumerate(idx.files)}
-    n_frames, n_ok, n_skip = coco.import_coco(src, file_to_frame, idx)
+    n_frames, n_ok, n_skip, n_merged = coco.import_coco(src, file_to_frame,
+                                                        idx)
     assert n_frames == 2
     assert n_ok == 2
     assert n_skip == 1  # dangling category 99
+    assert n_merged == 0
     assert coco.cat_name_to_id.get("imported_cat") is not None
 
     # box lands on the right frame's image with remapped ids + kept track id
@@ -523,6 +525,112 @@ def test_import_coco_merge_dedup_masks(lr, tmp_path):
     # importing the same file again is a no-op (duplicate guard)
     n2 = coco.import_coco(src, file_to_frame, idx)
     assert n2[1] == 0 and n2[2] >= 2
+
+
+def test_import_coco_merges_masks_into_duplicate_boxes(lr, tmp_path):
+    """Re-loading a SAM3-annotated file over already-drawn boxes must merge
+    the masks onto the existing boxes instead of silently dropping them
+    (the duplicate guard used to skip the whole annotation)."""
+    folder = make_image_folder(tmp_path / "src", ["a.png"], size=(10, 12))
+    idx = lr.ImageFolderIndex([str(folder)])
+    coco = lr.CocoState(str(tmp_path / "out.json"), [{"id": 0, "name": "k"}])
+
+    # the box already exists in the session (drawn by the user), no mask
+    frame = idx.frame_at(0)
+    img_id = coco.ensure_image(frame, 12, 10)
+    coco.add_box(img_id, 1, 1, 4, 4, 0)
+
+    mask = np.zeros((10, 12), bool)
+    mask[2:8, 2:9] = True
+    polys = lr._mask_to_polygons(mask, 0)
+    src = {
+        "images": [{"id": 1, "file_name": "a.png", "width": 12,
+                    "height": 10}],
+        "annotations": [{"id": 1, "image_id": 1, "category_id": 0,
+                         "bbox": [1, 1, 4, 4], "segmentation": polys}],
+        "categories": [{"id": 0, "name": "k"}],
+    }
+    file_to_frame = {os.path.basename(fp): i for i, fp in enumerate(idx.files)}
+    n_frames, n_ok, n_skip, n_merged = coco.import_coco(src, file_to_frame,
+                                                        idx)
+    assert (n_ok, n_skip, n_merged) == (0, 1, 1)
+    assert len(coco.annotations) == 1  # still just the original box
+    merged = coco.annotations[0].get("_mask")
+    assert isinstance(merged, np.ndarray) and merged.any()
+
+    # second import: the box already has a mask — nothing to merge
+    n2 = coco.import_coco(src, file_to_frame, idx)
+    assert n2[3] == 0
+
+
+def test_import_coco_zero_dim_source_decodes_frame(lr, tmp_path):
+    """Source image records without width/height must not produce 0-dim
+    image records (which silently drop every mask on reload) — the frame
+    is decoded for the real dims."""
+    folder = make_image_folder(tmp_path / "src", ["a.png"], size=(10, 12))
+    idx = lr.ImageFolderIndex([str(folder)])
+    coco = lr.CocoState(str(tmp_path / "out.json"), [{"id": 0, "name": "k"}])
+    mask = np.zeros((10, 12), bool)
+    mask[2:8, 2:9] = True
+    src = {
+        "images": [{"id": 1, "file_name": "a.png"}],  # no width/height
+        "annotations": [{"id": 1, "image_id": 1, "category_id": 0,
+                         "bbox": [1, 1, 4, 4],
+                         "segmentation": lr._mask_to_polygons(mask, 0)}],
+        "categories": [{"id": 0, "name": "k"}],
+    }
+    file_to_frame = {os.path.basename(fp): i for i, fp in enumerate(idx.files)}
+    coco.import_coco(src, file_to_frame, idx)
+    img = coco.images[0]
+    assert (img["width"], img["height"]) == (12, 10)
+    assert coco.annotations[0].get("_mask") is not None
+
+
+def test_ensure_image_never_clobbers_dims_with_zero(lr, make_coco):
+    coco = make_coco([])
+    frame = {"timestamp_ns": 5, "log_time_ns": 5, "frame_idx": 0,
+             "existing_boxes": [], "file_name": "a.png"}
+    img_id = coco.ensure_image(frame, 12, 10)
+    coco.ensure_image(frame, 0, 0)  # e.g. import from a dim-less source
+    img = next(i for i in coco.images if i["id"] == img_id)
+    assert (img["width"], img["height"]) == (12, 10)
+
+
+# ---------------------------------------------------------------------------
+# discard frames (excluded from the final JSON)
+# ---------------------------------------------------------------------------
+
+def test_discarded_frames_excluded_from_final_only(lr, tmp_path):
+    folder = make_image_folder(tmp_path / "src", ["a.png", "b.png"],
+                               size=(10, 12))
+    idx = lr.ImageFolderIndex([str(folder)])
+    out = str(tmp_path / "out.json")
+    coco = lr.CocoState(out, [{"id": 0, "name": "k"}])
+    id_a = coco.ensure_image(idx.frame_at(0), 12, 10)
+    id_b = coco.ensure_image(idx.frame_at(1), 12, 10)
+    coco.add_box(id_a, 0, 0, 2, 2, 0)
+    coco.add_box(id_b, 1, 1, 2, 2, 0)
+    coco.annotated_marks.add(1)
+    coco.discarded_frames.add(1)
+
+    # tmp save keeps everything (discard stays reversible)
+    coco.save(is_final=False)
+    tmp = json.load(open(out.replace(".json", "_tmp.json")))
+    assert len(tmp["images"]) == 2 and len(tmp["annotations"]) == 2
+
+    # final save drops the discarded frame's image, boxes and marks
+    coco.save(is_final=True)
+    final = json.load(open(out))
+    assert [i["id"] for i in final["images"]] == [id_a]
+    assert {a["image_id"] for a in final["annotations"]} == {id_a}
+    assert final["annotated_image_ids"] == [id_a]
+
+    # the discard set persists in the .progress sidecar
+    progress = json.load(open(out.replace(".json", ".progress")))
+    assert progress["discarded"] == [1]
+    coco2 = lr.CocoState(out, [{"id": 0, "name": "k"}])
+    coco2.load_progress(2)
+    assert coco2.discarded_frames == {1}
 
 
 # ---------------------------------------------------------------------------

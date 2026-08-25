@@ -37,6 +37,7 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+    python scripts/04_train_model.py --config ./Datasets/HKU_GH/HKU_GH_1k/data.yaml --epochs 1000 --batch-size 32 --task segment -m yolo26n --imgsz 1024 --output-dir ./output/training/yolo_training/HKU_GH/yolo26n
     # Basic training with defaults
     python scripts/04_train_model.py --config ./output/split/dataset.yaml
 

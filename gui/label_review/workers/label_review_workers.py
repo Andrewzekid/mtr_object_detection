@@ -226,6 +226,11 @@ def _segment_concepts(image_path: str, bboxes_xyxy: list, concepts: list,
             # If no detection matched by IoU, fall back to the k-th mask.
             if best_mask is None and k < len(masks):
                 best_mask = masks[k]
+            # An all-empty mask counts as a failure, not a success: it
+            # would display as nothing, save as nothing, AND (stored as a
+            # non-None _mask) block later "SAM3 ALL" re-runs on the box.
+            if best_mask is not None and not best_mask.any():
+                best_mask = None
             area = float(best_mask.sum()) if best_mask is not None else 0.0
             results.append({
                 "ann_id": ann_ids[i],
@@ -957,3 +962,378 @@ class InterpBatchWorker(QThread):
             self.progress_signal.emit(n + 1, len(self.jobs))
         self.finished_signal.emit(results_out)
 
+
+
+# ---------------------------------------------------------------------------
+# OWLv2 autolabel: zero-shot text-prompted box detection (no masks).
+# Mirrors the SAM3 autolabel workers; detections carry mask=None so the
+# same apply path (boxes only) is reused.
+# ---------------------------------------------------------------------------
+
+_OWLV2_AVAILABLE = False
+try:
+    from core.owlv2_detector import owlv2_detect  # type: ignore[import-not-found]
+    _OWLV2_AVAILABLE = True
+except Exception as _owlv2_import_err:
+    owlv2_detect = None  # type: ignore[assignment]
+    print(f"⚠️ OWLv2 not available ({_owlv2_import_err}). "
+          f"OWLv2 autolabel will be disabled.")
+
+
+class Owlv2AutolabelWorker(QThread):
+    """Single-frame OWLv2 autolabel ("Autolabel frame" with detector=owlv2).
+
+    Emits finished_signal(image_id, detections); detections carry
+    cat_id resolved from the query->category mapping.
+    """
+
+    finished_signal = pyqtSignal(int, list)  # image_id, detections
+    failed_signal = pyqtSignal(str)
+
+    def __init__(self, image_path: str, concepts: List[str],
+                 cat_ids: List[int], image_id: int,
+                 model_id: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.concepts = concepts
+        self.cat_ids = cat_ids
+        self.image_id = image_id
+        self.model_id = model_id
+        self.device = device
+        self.conf = conf
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _OWLV2_AVAILABLE:
+            self.failed_signal.emit("OWLv2 (core.owlv2_detector) is not "
+                                    "importable.")
+            return
+        try:
+            dets = owlv2_detect(self.image_path, self.concepts,
+                                model_id=self.model_id, device=self.device,
+                                conf=self.conf)
+        except Exception as e:
+            self.failed_signal.emit(str(e))
+            return
+        cat_by_name = dict(zip(self.concepts, self.cat_ids))
+        for d in dets:
+            d["cat_id"] = cat_by_name.get(d["label"])
+        self.finished_signal.emit(self.image_id, dets)
+
+
+class Owlv2AutolabelBatchWorker(QThread):
+    """OWLv2 autolabel over many frames ("Autolabel ALL frames").
+
+    The model is loaded once (state dict reused across frames). Emits
+    frame_done_signal(frame_idx, detections) per frame; cancel is
+    cooperative (checked between frames).
+    """
+
+    frame_done_signal = pyqtSignal(int, list)  # frame_idx, detections
+    progress_signal = pyqtSignal(int, int)     # frames done, total frames
+    finished_signal = pyqtSignal(int)          # total detections
+    failed_signal = pyqtSignal(str)
+    cancelled_signal = pyqtSignal()
+
+    def __init__(self, frame_index, frame_idxs: List[int],
+                 concepts: List[str], cat_ids: List[int], tmp_dir: str,
+                 model_id: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.frame_index = frame_index
+        self.frame_idxs = frame_idxs
+        self.concepts = concepts
+        self.cat_ids = cat_ids
+        self.tmp_dir = tmp_dir
+        self.model_id = model_id
+        self.device = device
+        self.conf = conf
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Ask the worker to stop after the current frame."""
+        self._cancel_requested = True
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _OWLV2_AVAILABLE:
+            self.failed_signal.emit("OWLv2 (core.owlv2_detector) is not "
+                                    "importable.")
+            return
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        cat_by_name = dict(zip(self.concepts, self.cat_ids))
+        state: Dict[str, Any] = {}  # cached model + device fallback
+        total_dets = 0
+        for n, frame_idx in enumerate(self.frame_idxs):
+            if self._cancel_requested:
+                self.cancelled_signal.emit()
+                return
+            frame = self.frame_index.frame_at(frame_idx)
+            img_path = frame.get("file_path")
+            if not img_path or not os.path.exists(img_path):
+                arr = self.frame_index.decode_image(frame_idx)
+                img_path = os.path.join(self.tmp_dir,
+                                        f"owlv2_{frame_idx:06d}.png")
+                Image.fromarray(arr).save(img_path)
+            try:
+                dets = owlv2_detect(img_path, self.concepts,
+                                    model_id=self.model_id,
+                                    device=self.device, conf=self.conf,
+                                    _state=state)
+            except Exception as e:
+                self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
+                return
+            for d in dets:
+                d["cat_id"] = cat_by_name.get(d["label"])
+            total_dets += len(dets)
+            self.frame_done_signal.emit(frame_idx, dets)
+            self.progress_signal.emit(n + 1, len(self.frame_idxs))
+        self.finished_signal.emit(total_dets)
+
+
+# ---------------------------------------------------------------------------
+# Generic open-set autolabel backends (Grounding DINO, Florence-2, Falcon)
+# plus OWLv2 exemplar (1-shot image-guided) detection.
+# Same worker/signal shape as the OWLv2 workers so the MainWindow apply path
+# is shared. Falcon detections carry real masks; the others mask=None.
+# ---------------------------------------------------------------------------
+
+GENERIC_DETECTORS = ("grounding_dino", "florence2", "falcon")
+
+
+def _generic_detect(detector: str, img, concepts: List[str],
+                    model_id: Optional[str], device: str, conf: float,
+                    state: Optional[dict]) -> List[Dict[str, Any]]:
+    """Dispatch one detection call to the selected open-set backend.
+
+    ``conf`` maps to Grounding DINO's box_threshold; Florence-2 and Falcon
+    emit no scores so it is ignored there. Import errors surface as
+    exceptions so the worker can report them via failed_signal.
+    """
+    if detector == "grounding_dino":
+        from core.grounding_dino_detector import grounding_dino_detect
+        return grounding_dino_detect(img, concepts, model_id=model_id,
+                                     device=device, box_threshold=conf,
+                                     _state=state)
+    if detector == "florence2":
+        from core.florence2_detector import florence2_detect
+        return florence2_detect(img, concepts, model_id=model_id,
+                                device=device, _state=state)
+    if detector == "falcon":
+        from core.falcon_detector import falcon_detect
+        return falcon_detect(img, concepts, model_id=model_id,
+                             device=device, _state=state)
+    raise ValueError(f"Unknown autolabel detector backend: {detector}")
+
+
+class GenericAutolabelWorker(QThread):
+    """Single-frame autolabel with a generic open-set backend.
+
+    Emits finished_signal(image_id, detections); detections carry
+    cat_id resolved from the query->category mapping.
+    """
+
+    finished_signal = pyqtSignal(int, list)  # image_id, detections
+    failed_signal = pyqtSignal(str)
+
+    def __init__(self, detector: str, image_path: str, concepts: List[str],
+                 cat_ids: List[int], image_id: int,
+                 model_id: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.detector = detector
+        self.image_path = image_path
+        self.concepts = concepts
+        self.cat_ids = cat_ids
+        self.image_id = image_id
+        self.model_id = model_id
+        self.device = device
+        self.conf = conf
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        try:
+            dets = _generic_detect(self.detector, self.image_path,
+                                   self.concepts, self.model_id,
+                                   self.device, self.conf, None)
+        except Exception as e:
+            self.failed_signal.emit(f"{self.detector}: {e}")
+            return
+        cat_by_name = dict(zip(self.concepts, self.cat_ids))
+        for d in dets:
+            d["cat_id"] = cat_by_name.get(d["label"])
+        self.finished_signal.emit(self.image_id, dets)
+
+
+class GenericAutolabelBatchWorker(QThread):
+    """Generic open-set autolabel over many frames ("Autolabel ALL frames").
+
+    The model is loaded once (state dict reused across frames). Emits
+    frame_done_signal(frame_idx, detections) per frame; cancel is
+    cooperative (checked between frames).
+    """
+
+    frame_done_signal = pyqtSignal(int, list)  # frame_idx, detections
+    progress_signal = pyqtSignal(int, int)     # frames done, total frames
+    finished_signal = pyqtSignal(int)          # total detections
+    failed_signal = pyqtSignal(str)
+    cancelled_signal = pyqtSignal()
+
+    def __init__(self, detector: str, frame_index, frame_idxs: List[int],
+                 concepts: List[str], cat_ids: List[int], tmp_dir: str,
+                 model_id: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.detector = detector
+        self.frame_index = frame_index
+        self.frame_idxs = frame_idxs
+        self.concepts = concepts
+        self.cat_ids = cat_ids
+        self.tmp_dir = tmp_dir
+        self.model_id = model_id
+        self.device = device
+        self.conf = conf
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Ask the worker to stop after the current frame."""
+        self._cancel_requested = True
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        cat_by_name = dict(zip(self.concepts, self.cat_ids))
+        state: Dict[str, Any] = {}  # cached model + device fallback
+        total_dets = 0
+        for n, frame_idx in enumerate(self.frame_idxs):
+            if self._cancel_requested:
+                self.cancelled_signal.emit()
+                return
+            frame = self.frame_index.frame_at(frame_idx)
+            img_path = frame.get("file_path")
+            if not img_path or not os.path.exists(img_path):
+                arr = self.frame_index.decode_image(frame_idx)
+                img_path = os.path.join(self.tmp_dir,
+                                        f"{self.detector}_{frame_idx:06d}.png")
+                Image.fromarray(arr).save(img_path)
+            try:
+                dets = _generic_detect(self.detector, img_path, self.concepts,
+                                       self.model_id, self.device, self.conf,
+                                       state)
+            except Exception as e:
+                self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
+                return
+            for d in dets:
+                d["cat_id"] = cat_by_name.get(d["label"])
+            total_dets += len(dets)
+            self.frame_done_signal.emit(frame_idx, dets)
+            self.progress_signal.emit(n + 1, len(self.frame_idxs))
+        self.finished_signal.emit(total_dets)
+
+
+class Owlv2ExemplarWorker(QThread):
+    """Single-frame OWLv2 exemplar (1-shot image-guided) autolabel.
+
+    ``exemplar`` is an RGB numpy crop of an annotated object; every
+    detection in the frame that visually matches it gets the exemplar's
+    label/cat_id. Emits finished_signal(image_id, detections).
+    """
+
+    finished_signal = pyqtSignal(int, list)  # image_id, detections
+    failed_signal = pyqtSignal(str)
+
+    def __init__(self, image_path: str, exemplar, label: str, cat_id: int,
+                 image_id: int, model_id: Optional[str], device: str,
+                 conf: float, parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.exemplar = exemplar
+        self.label = label
+        self.cat_id = cat_id
+        self.image_id = image_id
+        self.model_id = model_id
+        self.device = device
+        self.conf = conf
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _OWLV2_AVAILABLE:
+            self.failed_signal.emit("OWLv2 (core.owlv2_detector) is not "
+                                    "importable.")
+            return
+        from core.owlv2_detector import owlv2_detect_exemplar
+        try:
+            dets = owlv2_detect_exemplar(
+                self.image_path, self.exemplar, self.label,
+                model_id=self.model_id, device=self.device, conf=self.conf)
+        except Exception as e:
+            self.failed_signal.emit(str(e))
+            return
+        for d in dets:
+            d["cat_id"] = self.cat_id
+        self.finished_signal.emit(self.image_id, dets)
+
+
+class Owlv2ExemplarBatchWorker(QThread):
+    """OWLv2 exemplar autolabel over many frames ("Autolabel ALL frames").
+
+    Same signals / cooperative cancel as Owlv2AutolabelBatchWorker; the
+    model state dict is reused across frames.
+    """
+
+    frame_done_signal = pyqtSignal(int, list)  # frame_idx, detections
+    progress_signal = pyqtSignal(int, int)     # frames done, total frames
+    finished_signal = pyqtSignal(int)          # total detections
+    failed_signal = pyqtSignal(str)
+    cancelled_signal = pyqtSignal()
+
+    def __init__(self, frame_index, frame_idxs: List[int], exemplar,
+                 label: str, cat_id: int, tmp_dir: str,
+                 model_id: Optional[str], device: str, conf: float,
+                 parent=None):
+        super().__init__(parent)
+        self.frame_index = frame_index
+        self.frame_idxs = frame_idxs
+        self.exemplar = exemplar
+        self.label = label
+        self.cat_id = cat_id
+        self.tmp_dir = tmp_dir
+        self.model_id = model_id
+        self.device = device
+        self.conf = conf
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Ask the worker to stop after the current frame."""
+        self._cancel_requested = True
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _OWLV2_AVAILABLE:
+            self.failed_signal.emit("OWLv2 (core.owlv2_detector) is not "
+                                    "importable.")
+            return
+        from core.owlv2_detector import owlv2_detect_exemplar
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        state: Dict[str, Any] = {}  # cached model + device fallback
+        total_dets = 0
+        for n, frame_idx in enumerate(self.frame_idxs):
+            if self._cancel_requested:
+                self.cancelled_signal.emit()
+                return
+            frame = self.frame_index.frame_at(frame_idx)
+            img_path = frame.get("file_path")
+            if not img_path or not os.path.exists(img_path):
+                arr = self.frame_index.decode_image(frame_idx)
+                img_path = os.path.join(self.tmp_dir,
+                                        f"owlv2_ex_{frame_idx:06d}.png")
+                Image.fromarray(arr).save(img_path)
+            try:
+                dets = owlv2_detect_exemplar(
+                    img_path, self.exemplar, self.label,
+                    model_id=self.model_id, device=self.device,
+                    conf=self.conf, _state=state)
+            except Exception as e:
+                self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
+                return
+            for d in dets:
+                d["cat_id"] = self.cat_id
+            total_dets += len(dets)
+            self.frame_done_signal.emit(frame_idx, dets)
+            self.progress_signal.emit(n + 1, len(self.frame_idxs))
+        self.finished_signal.emit(total_dets)
