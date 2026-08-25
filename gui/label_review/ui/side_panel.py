@@ -12,6 +12,22 @@ from typing import Any, Dict, List, Optional
 from ..state.coco_state import CocoState  # noqa: F401  (type annotations)
 
 
+# Display names for the autolabel detector backends (config
+# "autolabel": {"detector": ...}). Used for the side-panel header, button
+# tooltips and confirmation dialogs.
+DETECTOR_LABELS = {
+    "sam3": "SAM3",
+    "owlv2": "OWLv2",
+    "owlv2_exemplar": "OWLv2 exemplar",
+    "grounding_dino": "Grounding DINO",
+    "florence2": "Florence-2",
+    "falcon": "Falcon Perception",
+}
+
+# Detectors whose detections carry segmentation masks.
+DETECTORS_WITH_MASKS = ("sam3", "falcon")
+
+
 # ---------------------------------------------------------------------------
 # Side panel: category list + buttons + frame slider
 # ---------------------------------------------------------------------------
@@ -38,6 +54,7 @@ class SidePanel(QWidget):
     propagate_clicked = pyqtSignal()           # "Propagate →" button
     toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
     toggle_annotated_clicked = pyqtSignal()  # "✔ Mark as annotated" button
+    toggle_discard_clicked = pyqtSignal()    # "🚫 Discard image" button
     interpolate_clicked = pyqtSignal()       # "Interpolate" button (I)
     cancel_interp_clicked = pyqtSignal()     # "Stop" button (running interp)
     track_id_selected = pyqtSignal(object)   # new track id (int) or None
@@ -56,13 +73,13 @@ class SidePanel(QWidget):
             "Current frame source (image file / folder).")
         layout.addWidget(self.source_label)
 
-        self.cat_label = QLabel("Categories (click to preselect for next draw, or press 0-9 when drawing):")
+        self.cat_label = QLabel("Categories (click = preselect for next draw / 0-9; multi-select = autolabel only these):")
         layout.addWidget(self.cat_label)
 
         self.cat_list = QListWidget()
-        # Multi-select (Ctrl/Shift+click) picks the categories an autolabel
-        # run is restricted to; a plain click still preselects the category
-        # for the next drawn box.
+        # Highlighting 2+ rows (any multi-select) restricts an autolabel run
+        # to those categories; a plain single click just preselects the
+        # category for the next drawn box.
         self.cat_list.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
         layout.addWidget(self.cat_list, 1)
@@ -70,8 +87,9 @@ class SidePanel(QWidget):
         self._rebuild_cat_list()
         self._preselected_cat_id: Optional[int] = None
         # True only while the highlight came from an explicit Ctrl/Shift
-        # multi-select. A plain single-click preselects a category for the
-        # next drawn box but must NOT restrict an autolabel run to it.
+        # click. A plain single-click preselects a category for the next
+        # drawn box but must NOT restrict an autolabel run to it (a 2+-row
+        # highlight always restricts, however it was made).
         self._restrict_selection: bool = False
 
         # Add a new category: type a name, press Enter or click Add.
@@ -190,6 +208,19 @@ class SidePanel(QWidget):
             self.toggle_annotated_clicked.emit)
         layout.addWidget(self.btn_mark_annotated)
 
+        # Discard the current frame (both sides in stereo): its image
+        # record(s) and annotations are excluded from the FINAL output
+        # JSON. Toggle again to restore — reversible until the final save.
+        self.btn_discard_image = QPushButton("🚫 Discard image")
+        self.btn_discard_image.setCheckable(True)
+        self.btn_discard_image.setToolTip(
+            "Exclude this frame's image(s) and boxes from the FINAL "
+            "output JSON (the _tmp progress file keeps everything, so "
+            "toggling again restores it). Use for bad/misaligned frames.")
+        self.btn_discard_image.clicked.connect(
+            self.toggle_discard_clicked.emit)
+        layout.addWidget(self.btn_discard_image)
+
         layout.addSpacing(12)
 
         # Interpolation controls.
@@ -264,32 +295,26 @@ class SidePanel(QWidget):
 
         layout.addSpacing(8)
 
-        self.autolabel_header = QLabel("SAM3 Autolabel:")
+        self.autolabel_header = QLabel("Autolabel:")
         f = self.autolabel_header.font()
         f.setBold(True)
         self.autolabel_header.setFont(f)
         layout.addWidget(self.autolabel_header)
 
-        # Text-prompt autolabel: SAM3 finds objects by category name, no
-        # drawn boxes needed; detections become editable boxes with masks.
-        # When categories are highlighted in the list above (Ctrl/Shift),
-        # only those are detected — otherwise every category.
+        # Text-prompt autolabel: the detector finds objects by category name,
+        # no drawn boxes needed; detections become editable boxes (with masks
+        # for SAM3/Falcon). When categories are highlighted in the list above
+        # (Ctrl/Shift, or any multi-select), only those are detected —
+        # otherwise every category. set_autolabel_detector() rewrites the
+        # header/tooltips with the active backend's name.
         self.btn_autolabel_frame = QPushButton("Autolabel frame")
-        self.btn_autolabel_frame.setToolTip(
-            "SAM3 text-prompt detection on this frame; detections are "
-            "added as editable boxes with masks (NMS-deduplicated). "
-            "Prompts with the categories highlighted in the list above, or "
-            "ALL categories when none are highlighted.")
         self.btn_autolabel_frame.clicked.connect(
             self.autolabel_frame_clicked.emit)
         layout.addWidget(self.btn_autolabel_frame)
         self.btn_autolabel_all = QPushButton("Autolabel ALL frames")
-        self.btn_autolabel_all.setToolTip(
-            "Background text-prompt autolabel on every frame, for the "
-            "categories highlighted in the list above (or ALL categories "
-            "when none are highlighted). Cancel anytime.")
         self.btn_autolabel_all.clicked.connect(self.autolabel_all_clicked.emit)
         layout.addWidget(self.btn_autolabel_all)
+        self.set_autolabel_detector("sam3")
 
         self.btn_masks = QPushButton("Masks: ON")
         self.btn_masks.setCheckable(True)
@@ -535,16 +560,38 @@ class SidePanel(QWidget):
     def get_preselected_cat_id(self) -> Optional[int]:
         return self._preselected_cat_id
 
-    def get_selected_cat_ids(self) -> List[int]:
-        """All highlighted categories (Ctrl/Shift multi-select), sorted.
+    def set_autolabel_detector(self, detector: str) -> None:
+        """Retitle the autolabel section for the active backend."""
+        label = DETECTOR_LABELS.get(detector, detector)
+        if detector == "owlv2_exemplar":
+            how = ("1-shot exemplar detection — the box selected on the "
+                   "canvas is the visual query")
+        else:
+            how = "text-prompt detection"
+        masks = (" with masks" if detector in DETECTORS_WITH_MASKS else "")
+        self.autolabel_header.setText(f"{label} Autolabel:")
+        self.btn_autolabel_frame.setToolTip(
+            f"{label} {how} on this frame; detections are added as editable "
+            f"boxes{masks} (NMS-deduplicated). Prompts with the categories "
+            "highlighted in the list above (multi-select), or ALL categories "
+            "when none are highlighted.")
+        self.btn_autolabel_all.setToolTip(
+            f"Background {label} autolabel on every frame, for the "
+            "categories highlighted in the list above (or ALL categories "
+            "when none are highlighted). Cancel anytime.")
 
-        Empty unless the highlight came from an explicit Ctrl/Shift click —
-        a plain single-click preselects a category for drawing but must not
-        silently restrict an autolabel run to it."""
-        if not self._restrict_selection:
+    def get_selected_cat_ids(self) -> List[int]:
+        """All highlighted categories, sorted.
+
+        Empty unless the highlight is an explicit restriction: a Ctrl/Shift
+        click, or ANY multi-selection (2+ rows). A plain single-click just
+        preselects a category for drawing and must not silently restrict an
+        autolabel run to it."""
+        items = self.cat_list.selectedItems()
+        if not self._restrict_selection and len(items) < 2:
             return []
         ids = []
-        for item in self.cat_list.selectedItems():
+        for item in items:
             cid = item.data(Qt.UserRole)
             if cid is not None:
                 ids.append(int(cid))

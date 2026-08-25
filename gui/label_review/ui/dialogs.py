@@ -175,6 +175,85 @@ class ConfigDialog(QtWidgets.QDialog):
                          self.spin_propagate_seed_iou)
         body.addWidget(sam3_box)
 
+        # --- Autolabel detector ------------------------------------------
+        al_box = QtWidgets.QGroupBox("Autolabel detector")
+        al_form = QtWidgets.QFormLayout(al_box)
+        self.combo_autolabel_detector = QtWidgets.QComboBox()
+        self.combo_autolabel_detector.addItem(
+            "SAM3 (text-prompt boxes + masks)", "sam3")
+        self.combo_autolabel_detector.addItem(
+            "OWLv2 (zero-shot boxes)", "owlv2")
+        self.combo_autolabel_detector.addItem(
+            "OWLv2 exemplar (1-shot, uses selected box)", "owlv2_exemplar")
+        self.combo_autolabel_detector.addItem(
+            "Grounding DINO (zero-shot boxes)", "grounding_dino")
+        self.combo_autolabel_detector.addItem(
+            "Florence-2 (phrase-grounding boxes)", "florence2")
+        self.combo_autolabel_detector.addItem(
+            "Falcon Perception (boxes + masks)", "falcon")
+        self.combo_autolabel_detector.setToolTip(
+            "Which model the 'Autolabel frame' / 'Autolabel ALL frames'\n"
+            "buttons use.\n"
+            "- SAM3: text-prompt detection with segmentation masks.\n"
+            "- OWLv2: zero-shot text-prompt box detection (faster, no\n"
+            "  masks). Default checkpoint: google/owlv2-large-patch14-\n"
+            "  ensemble.\n"
+            "- OWLv2 exemplar: 1-shot image-guided detection — the\n"
+            "  currently selected box is cropped out and used as the\n"
+            "  visual query; matching objects get its category.\n"
+            "- Grounding DINO: zero-shot text-prompt boxes (no masks).\n"
+            "  Default checkpoint: IDEA-Research/grounding-dino-base.\n"
+            "- Florence-2: phrase-grounding boxes, one prompt per\n"
+            "  category (no masks, no confidence scores).\n"
+            "  Default checkpoint: microsoft/Florence-2-large.\n"
+            "- Falcon Perception: open-vocabulary grounding with real\n"
+            "  instance masks (no confidence scores).\n"
+            "  Default checkpoint: tiiuae/Falcon-Perception.")
+        al_form.addRow("Detector", self.combo_autolabel_detector)
+        self.edit_owlv2_model = QtWidgets.QLineEdit()
+        self.edit_owlv2_model.setPlaceholderText(
+            "default: google/owlv2-large-patch14-ensemble")
+        self.edit_owlv2_model.setToolTip(
+            "OWLv2 checkpoint (HuggingFace model id or local path).\n"
+            "Takes effect on the next autolabel run.")
+        al_form.addRow("OWLv2 model", self.edit_owlv2_model)
+        self.spin_owlv2_conf = QtWidgets.QDoubleSpinBox()
+        self.spin_owlv2_conf.setRange(0.0, 1.0)
+        self.spin_owlv2_conf.setSingleStep(0.05)
+        self.spin_owlv2_conf.setDecimals(2)
+        self.spin_owlv2_conf.setToolTip(
+            "OWLv2 detection confidence threshold.")
+        al_form.addRow("OWLv2 confidence", self.spin_owlv2_conf)
+        self.edit_gdino_model = QtWidgets.QLineEdit()
+        self.edit_gdino_model.setPlaceholderText(
+            "default: IDEA-Research/grounding-dino-base")
+        self.edit_gdino_model.setToolTip(
+            "Grounding DINO checkpoint (HuggingFace model id or local\n"
+            "path). Takes effect on the next autolabel run.")
+        al_form.addRow("Grounding DINO model", self.edit_gdino_model)
+        self.spin_gdino_conf = QtWidgets.QDoubleSpinBox()
+        self.spin_gdino_conf.setRange(0.0, 1.0)
+        self.spin_gdino_conf.setSingleStep(0.05)
+        self.spin_gdino_conf.setDecimals(2)
+        self.spin_gdino_conf.setToolTip(
+            "Grounding DINO box threshold (detection confidence).")
+        al_form.addRow("Grounding DINO confidence", self.spin_gdino_conf)
+        self.edit_florence2_model = QtWidgets.QLineEdit()
+        self.edit_florence2_model.setPlaceholderText(
+            "default: microsoft/Florence-2-large")
+        self.edit_florence2_model.setToolTip(
+            "Florence-2 checkpoint (HuggingFace model id or local path).\n"
+            "Takes effect on the next autolabel run.")
+        al_form.addRow("Florence-2 model", self.edit_florence2_model)
+        self.edit_falcon_model = QtWidgets.QLineEdit()
+        self.edit_falcon_model.setPlaceholderText(
+            "default: tiiuae/Falcon-Perception")
+        self.edit_falcon_model.setToolTip(
+            "Falcon Perception checkpoint (HuggingFace model id or local\n"
+            "path). Takes effect on the next autolabel run.")
+        al_form.addRow("Falcon model", self.edit_falcon_model)
+        body.addWidget(al_box)
+
         # --- Mask opacity --------------------------------------------------
         mask_box = QtWidgets.QGroupBox("Masks")
         mask_form = QtWidgets.QFormLayout(mask_box)
@@ -289,6 +368,21 @@ class ConfigDialog(QtWidgets.QDialog):
         self.check_auto_segment.setChecked(win.auto_segment)
         self.spin_min_poly_area.setValue(int(win.coco.min_polygon_area))
         self.spin_nms_iou.setValue(win.sam3_nms_iou)
+        idx = self.combo_autolabel_detector.findData(
+            getattr(win, "autolabel_detector", "sam3"))
+        self.combo_autolabel_detector.setCurrentIndex(max(0, idx))
+        self.edit_owlv2_model.setText(
+            getattr(win, "owlv2_model", "") or "")
+        self.spin_owlv2_conf.setValue(
+            getattr(win, "owlv2_conf", 0.3))
+        self.edit_gdino_model.setText(
+            getattr(win, "gdino_model", "") or "")
+        self.spin_gdino_conf.setValue(
+            getattr(win, "gdino_conf", 0.35))
+        self.edit_florence2_model.setText(
+            getattr(win, "florence2_model", "") or "")
+        self.edit_falcon_model.setText(
+            getattr(win, "falcon_model", "") or "")
         idx = self.combo_propagate_method.findData(
             getattr(win, "propagate_method", "memory"))
         self.combo_propagate_method.setCurrentIndex(max(0, idx))
@@ -337,6 +431,28 @@ class ConfigDialog(QtWidgets.QDialog):
         if "propagate_min_seed_iou" in sam3:
             self.spin_propagate_seed_iou.setValue(
                 max(0.0, min(1.0, float(sam3["propagate_min_seed_iou"]))))
+        autolabel = cfg.get("autolabel", {})
+        if autolabel.get("detector") in ("sam3", "owlv2", "owlv2_exemplar",
+                                         "grounding_dino", "florence2",
+                                         "falcon"):
+            self.combo_autolabel_detector.setCurrentIndex(
+                self.combo_autolabel_detector.findData(
+                    autolabel["detector"]))
+        if autolabel.get("owlv2_model"):
+            self.edit_owlv2_model.setText(str(autolabel["owlv2_model"]))
+        if "owlv2_conf" in autolabel:
+            self.spin_owlv2_conf.setValue(
+                max(0.0, min(1.0, float(autolabel["owlv2_conf"]))))
+        if autolabel.get("gdino_model"):
+            self.edit_gdino_model.setText(str(autolabel["gdino_model"]))
+        if "gdino_conf" in autolabel:
+            self.spin_gdino_conf.setValue(
+                max(0.0, min(1.0, float(autolabel["gdino_conf"]))))
+        if autolabel.get("florence2_model"):
+            self.edit_florence2_model.setText(
+                str(autolabel["florence2_model"]))
+        if autolabel.get("falcon_model"):
+            self.edit_falcon_model.setText(str(autolabel["falcon_model"]))
         ui = cfg.get("ui", {})
         if "advanced" in ui:
             self.check_advanced.setChecked(bool(ui["advanced"]))
@@ -386,6 +502,16 @@ class ConfigDialog(QtWidgets.QDialog):
                 "propagate_min_iou": self.spin_propagate_min_iou.value(),
                 "propagate_min_seed_iou":
                     self.spin_propagate_seed_iou.value(),
+            },
+            "autolabel": {
+                "detector": self.combo_autolabel_detector.currentData(),
+                "owlv2_model": self.edit_owlv2_model.text().strip() or None,
+                "owlv2_conf": self.spin_owlv2_conf.value(),
+                "gdino_model": self.edit_gdino_model.text().strip() or None,
+                "gdino_conf": self.spin_gdino_conf.value(),
+                "florence2_model":
+                    self.edit_florence2_model.text().strip() or None,
+                "falcon_model": self.edit_falcon_model.text().strip() or None,
             },
             "ui": {
                 "advanced": advanced,

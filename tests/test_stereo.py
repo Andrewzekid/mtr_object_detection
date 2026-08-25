@@ -50,6 +50,34 @@ def test_stereo_index_uneven_lengths_warns(lr, tmp_path, capsys):
     assert "differ in length" in capsys.readouterr().out
 
 
+def test_stereo_index_pairs_by_timestamp_skipping_unmatched(lr, tmp_path,
+                                                            capsys):
+    """Timestamp-named folders are paired by EXACT timestamp; images with
+    no counterpart on the other side are skipped (a dropped frame on one
+    camera must not shift every later pair)."""
+    left = make_image_folder(tmp_path / "Lts",
+                             ["100.png", "200.png", "300.png", "400.png"])
+    right = make_image_folder(tmp_path / "Rts",
+                              ["200.png", "300.png", "400.png", "500.png"])
+    idx = lr.StereoIndex([str(left)], [str(right)])
+    assert idx.timestamps_real
+    assert len(idx) == 3  # 100 left-only, 500 right-only — both skipped
+    for i, ts in enumerate((200, 300, 400)):
+        assert idx.frame_at(i, "left")["timestamp_ns"] == ts
+        assert idx.frame_at(i, "right")["timestamp_ns"] == ts
+    assert "skipped" in idx.pairing_warning
+    assert "1 left-only" in idx.pairing_warning
+    # timestamp lookup lands on the PAIR index
+    assert idx.find_idx_by_timestamp(300) == 1
+    assert idx.find_idx_by_timestamp(0) == 0  # snaps to nearest pair
+    # the worker-facing side view follows the same pairing
+    sv = idx.side_index("right")
+    assert len(sv) == 3
+    assert sv.frame_at(0)["timestamp_ns"] == 200
+    assert sv.files[0].endswith(os.path.join("Rts", "200.png"))
+    capsys.readouterr()
+
+
 def test_stereo_side_index_worker_interface(lr, tmp_path):
     left = make_image_folder(tmp_path / "L3", [("a.png", 30)])
     right = make_image_folder(tmp_path / "R3", [("a.png", 220)])
@@ -141,10 +169,11 @@ def test_import_coco_matches_by_basename_and_side(lr, tmp_path):
     for side, files in (("left", idx.files_left), ("right", idx.files_right)):
         for i, fp in enumerate(files):
             file_to_frame[(os.path.basename(fp), side)] = i
-    n_frames, n_ok, n_skip = coco.import_coco(src, file_to_frame, idx)
+    n_frames, n_ok, n_skip, n_merged = coco.import_coco(src, file_to_frame,
+                                                        idx)
     # frames_matched counts distinct frame indices — both annotations land
     # on frame 0 (one per side)
-    assert (n_frames, n_ok, n_skip) == (1, 2, 0)
+    assert (n_frames, n_ok, n_skip, n_merged) == (1, 2, 0, 0)
     by_key = {(img["frame_idx"], img["side"]): img["id"]
               for img in coco.images}
     assert {a["image_id"] for a in coco.annotations} == {
@@ -366,3 +395,128 @@ def test_propagate_multiselect_both_sides(lr, make_coco, make_window,
     assert [s["track_id"] for s in
             win._sam3_queue[0]["seeds"]] == [right_tid]
     win._sam3_queue.clear()
+
+
+# ---------------------------------------------------------------------------
+# Synced-only save (stereo)
+# ---------------------------------------------------------------------------
+
+def _stereo_ts_index(lr, tmp_path, left_names, right_names, tag):
+    left = make_image_folder(tmp_path / f"L_{tag}", left_names)
+    right = make_image_folder(tmp_path / f"R_{tag}", right_names)
+    return lr.StereoIndex([str(left)], [str(right)])
+
+
+def test_paired_timestamps_sorted(lr, tmp_path):
+    idx = _stereo_ts_index(lr, tmp_path,
+                           ["300.png", "100.png", "200.png"],
+                           ["400.png", "200.png", "300.png"], "pts")
+    assert idx.paired_timestamps == [200, 300]
+
+
+def test_save_excludes_unsynced_images_and_sorts(lr, make_coco, tmp_path):
+    """Only timestamps present in BOTH folders are written to the JSON;
+    the images list is sorted by timestamp (left before right)."""
+    idx = _stereo_ts_index(lr, tmp_path,
+                           ["300.png", "100.png", "200.png"],
+                           ["400.png", "200.png", "300.png"], "save")
+    coco = make_coco()
+    coco.set_synced_timestamps(idx.paired_timestamps)
+    # Visit the synced frames out of order.
+    id300l = coco.ensure_image(idx.frame_at(1, "left"), 12, 10, side="left")
+    id200l = coco.ensure_image(idx.frame_at(0, "left"), 12, 10, side="left")
+    id300r = coco.ensure_image(idx.frame_at(1, "right"), 12, 10, side="right")
+    # Stale unsynced record (e.g. loaded from an older save file): ts 100
+    # exists on the left only.
+    unsynced_id = coco.ensure_image(_mkframe(99, ts=100, name="100.png"),
+                                    12, 10, side="left")
+    coco.add_box(unsynced_id, 1, 1, 2, 2, 0)
+    coco.add_box(id200l, 1, 1, 2, 2, 0)
+
+    coco.save(is_final=True)
+    data = json.loads(open(coco.output_json).read())
+    saved = [(i["timestamp_ns"], i.get("side")) for i in data["images"]]
+    assert saved == [(200, "left"), (300, "left"), (300, "right")]
+    saved_ids = {i["id"] for i in data["images"]}
+    assert saved_ids == {id200l, id300l, id300r}
+    assert all(a["image_id"] in saved_ids for a in data["annotations"])
+
+    # The _tmp progress save excludes unsynced records too (they are never
+    # wanted, unlike discards which stay reversible).
+    coco.dirty = True
+    coco.save(is_final=False)
+    tmp = json.loads(
+        open(coco.output_json.replace(".json", "_tmp.json")).read())
+    assert all(i["timestamp_ns"] in (200, 300) for i in tmp["images"])
+
+
+def test_save_unfiltered_without_synced_timestamps(make_coco):
+    """Mono sessions (no set_synced_timestamps call) keep every image."""
+    coco = make_coco()
+    id_b = coco.ensure_image(_mkframe(0, ts=200, name="b.png"), 12, 10)
+    id_a = coco.ensure_image(_mkframe(1, ts=100, name="a.png"), 12, 10)
+    coco.add_box(id_b, 1, 1, 2, 2, 0)
+    coco.save(is_final=True)
+    data = json.loads(open(coco.output_json).read())
+    # both kept; sorted by timestamp even without the filter
+    assert [i["timestamp_ns"] for i in data["images"]] == [100, 200]
+    assert {i["id"] for i in data["images"]} == {id_a, id_b}
+
+
+def test_frame_at_reports_pair_index(lr, tmp_path):
+    """With leading unpaired frames, frame_idx is the PAIR index (not the
+    side folder's own position) so discard marks / lookups stay aligned."""
+    idx = _stereo_ts_index(lr, tmp_path,
+                           ["100.png", "200.png", "300.png"],
+                           ["200.png", "300.png"], "pairidx")
+    assert len(idx) == 2  # 100 is left-only
+    fr = idx.frame_at(0, "left")
+    assert fr["timestamp_ns"] == 200
+    assert fr["frame_idx"] == 0  # pair idx, not folder position 1
+    assert idx.frame_at(0, "right")["frame_idx"] == 0
+
+
+def test_register_all_frames_saves_all_synced(lr, make_coco, tmp_path):
+    """Saving without visiting a single frame still writes every synced
+    image (both sides), sorted by timestamp, and no unsynced ones."""
+    idx = _stereo_ts_index(lr, tmp_path,
+                           ["100.png", "200.png", "300.png"],
+                           ["200.png", "300.png", "400.png"], "regall")
+    coco = make_coco()
+    coco.set_synced_timestamps(idx.paired_timestamps)
+    created = coco.register_all_frames(idx)
+    assert created == 4  # 2 pairs x 2 sides
+
+    coco.save(is_final=True)
+    data = json.loads(open(coco.output_json).read())
+    saved = [(i["timestamp_ns"], i.get("side")) for i in data["images"]]
+    assert saved == [(200, "left"), (200, "right"),
+                     (300, "left"), (300, "right")]
+
+    # Re-registering is idempotent (no duplicate records).
+    assert coco.register_all_frames(idx) == 0
+    assert len(coco.images) == 4
+
+
+def test_discard_drops_both_sides_despite_skips(lr, make_coco, tmp_path):
+    """Discard marks pair indices; with leading unpaired frames the image
+    records' frame_idx must match them (pair index, not folder position)."""
+    idx = _stereo_ts_index(lr, tmp_path,
+                           ["100.png", "200.png", "300.png"],
+                           ["200.png", "300.png"], "disc")
+    coco = make_coco()
+    coco.set_synced_timestamps(idx.paired_timestamps)
+    coco.register_all_frames(idx)
+    coco.discarded_frames.add(0)  # pair 0 = ts 200 on both sides
+
+    coco.save(is_final=True)
+    data = json.loads(open(coco.output_json).read())
+    assert [i["timestamp_ns"] for i in data["images"]] == [300, 300]
+
+    # _tmp keeps the discarded pair (reversible until final save)
+    coco.dirty = True
+    coco.save(is_final=False)
+    tmp = json.loads(
+        open(coco.output_json.replace(".json", "_tmp.json")).read())
+    assert sorted(i["timestamp_ns"] for i in tmp["images"]) == \
+        [200, 200, 300, 300]

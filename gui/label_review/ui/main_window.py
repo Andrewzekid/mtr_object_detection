@@ -22,11 +22,17 @@ from ..state.index import ImageFolderIndex, StereoIndex
 from ..workers.label_review_workers import (  # noqa: F401
     SAM3Worker, SAM3BatchWorker, InterpBatchWorker,
     SAM3AutolabelWorker, SAM3AutolabelBatchWorker, SAM3PropagateWorker,
+    Owlv2AutolabelWorker, Owlv2AutolabelBatchWorker, _OWLV2_AVAILABLE,
+    GenericAutolabelWorker, GenericAutolabelBatchWorker, GENERIC_DETECTORS,
+    Owlv2ExemplarWorker, Owlv2ExemplarBatchWorker,
     _get_interp13, _SAM3_AVAILABLE, run_sam3, _iou_xyxy,
 )
 
+# Valid values for the autolabel detector setting (config: autolabel.detector).
+AUTOLABEL_DETECTORS = ("sam3", "owlv2", "owlv2_exemplar") + GENERIC_DETECTORS
+
 from .canvas import CanvasWidget
-from .side_panel import SidePanel
+from .side_panel import SidePanel, DETECTOR_LABELS
 from .dialogs import ConfigDialog
 
 
@@ -83,6 +89,13 @@ class ReviewWindow(QMainWindow):
                    display_max_dim: int = 0,
                    rerun_logger=None,
                    pose_db=None,
+                   autolabel_detector: str = "sam3",
+                   owlv2_model: Optional[str] = None,
+                   owlv2_conf: float = 0.3,
+                   gdino_model: Optional[str] = None,
+                   gdino_conf: float = 0.35,
+                   florence2_model: Optional[str] = None,
+                   falcon_model: Optional[str] = None,
                    parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -131,6 +144,24 @@ class ReviewWindow(QMainWindow):
         # Optional pose DB (Clio inspection SQLite) used to place marked
         # frames on the point-cloud map (see map_view.py).
         self._pose_db = pose_db
+        # Autolabel detector: "sam3" (text-prompt SAM3, boxes+masks),
+        # "owlv2" (zero-shot OWLv2 boxes), "owlv2_exemplar" (1-shot
+        # image-guided OWLv2 using the selected box as the visual query),
+        # or a generic open-set backend: "grounding_dino" / "florence2"
+        # (boxes) / "falcon" (boxes + real masks).
+        # Config: autolabel.detector / autolabel.owlv2_model /
+        # autolabel.owlv2_conf / autolabel.gdino_model /
+        # autolabel.gdino_conf / autolabel.florence2_model /
+        # autolabel.falcon_model.
+        self.autolabel_detector: str = (
+            autolabel_detector if autolabel_detector in AUTOLABEL_DETECTORS
+            else "sam3")
+        self.owlv2_model = owlv2_model
+        self.owlv2_conf = float(owlv2_conf)
+        self.gdino_model = gdino_model
+        self.gdino_conf = float(gdino_conf)
+        self.florence2_model = florence2_model
+        self.falcon_model = falcon_model
 
         self.setWindowTitle("Computer Vision Label Review Tool")
         self.resize(1600, 900)
@@ -195,6 +226,7 @@ class ReviewWindow(QMainWindow):
         self._stereo: bool = bool(getattr(frame_index, "stereo", False))
         self._splitter = QSplitter(_QT_HORZ)
         self.side = SidePanel(coco)
+        self.side.set_autolabel_detector(self.autolabel_detector)
         # One canvas per side; `self.canvas` stays the left/mono canvas
         # (compat attr — mono sessions have exactly this one).
         self.canvases: Dict[str, CanvasWidget] = {}
@@ -276,6 +308,7 @@ class ReviewWindow(QMainWindow):
         self.side.propagate_clicked.connect(self._on_propagate_track)
         self.side.toggle_keyframe_clicked.connect(self._on_toggle_keyframe)
         self.side.toggle_annotated_clicked.connect(self._on_toggle_annotated)
+        self.side.toggle_discard_clicked.connect(self._on_toggle_discard)
         self.side.interpolate_clicked.connect(self._on_interpolate)
         self.side.cancel_interp_clicked.connect(self._on_cancel_interp)
         self.side.track_id_selected.connect(self._on_track_selected)
@@ -629,6 +662,13 @@ class ReviewWindow(QMainWindow):
         self.coco.sticky_track_ids = sticky
         self.coco.min_polygon_area = min_poly
         self.coco.load_existing()
+        # Stereo: only timestamps present in BOTH folders may be saved.
+        if getattr(new_index, "stereo", False) and \
+                getattr(new_index, "timestamps_real", False):
+            self.coco.set_synced_timestamps(new_index.paired_timestamps)
+        # Register every frame up front so the saved JSON lists ALL synced
+        # images, not just the ones visited/annotated this session.
+        self.coco.register_all_frames(new_index)
         self._update_source_label()
         self.side.coco = self.coco  # side panel keeps its own reference
         # load_existing may have merged categories saved in the project
@@ -723,7 +763,7 @@ class ReviewWindow(QMainWindow):
     def _ensure_rerun(self):
         """The active RerunLogger, creating one on demand (recording next
         to the COCO output) when the session wasn't started with --rrd."""
-        if self.rerun is None:
+        if self.rerun is None or not self.rerun.enabled:
             from ..rerun_logger import RerunLogger
             out = Path(self.coco.output_json)
             self.rerun = RerunLogger(str(out.with_suffix(".rrd")))
@@ -759,15 +799,17 @@ class ReviewWindow(QMainWindow):
                 os.path.basename(fp): i
                 for i, fp in enumerate(getattr(self.frame_index, "files", []))
             }
-        n_frames, n_ok, n_skip = self.coco.import_coco(
+        n_frames, n_ok, n_skip, n_merged = self.coco.import_coco(
             data, file_to_frame, self.frame_index)
         self.side._rebuild_cat_list()  # import may have added categories
         self._refresh_boxes()
         self._update_progress()
         self.coco.save(is_final=False)
+        merged_txt = (f", {n_merged} mask(s) merged into existing boxes"
+                      if n_merged else "")
         self.statusBar().showMessage(
             f"Imported {n_ok} annotation(s) on {n_frames} frame(s) from "
-            f"{os.path.basename(path)} ({n_skip} skipped)", 6000)
+            f"{os.path.basename(path)} ({n_skip} skipped{merged_txt})", 6000)
 
     def _load_config_dialog(self) -> None:
         """Open the settings dialog (⚙ Config button / File → Config…).
@@ -793,6 +835,24 @@ class ReviewWindow(QMainWindow):
         if "confirm_mismatch" in interp_cfg:
             self.interp_confirm_mismatch = bool(
                 interp_cfg["confirm_mismatch"])
+        autolabel_cfg = cfg.get("autolabel", {})
+        if autolabel_cfg.get("detector") in AUTOLABEL_DETECTORS:
+            self.autolabel_detector = autolabel_cfg["detector"]
+            self.side.set_autolabel_detector(self.autolabel_detector)
+        if autolabel_cfg.get("owlv2_model"):
+            self.owlv2_model = str(autolabel_cfg["owlv2_model"])
+        if "owlv2_conf" in autolabel_cfg:
+            self.owlv2_conf = max(
+                0.0, min(1.0, float(autolabel_cfg["owlv2_conf"])))
+        if autolabel_cfg.get("gdino_model"):
+            self.gdino_model = str(autolabel_cfg["gdino_model"])
+        if "gdino_conf" in autolabel_cfg:
+            self.gdino_conf = max(
+                0.0, min(1.0, float(autolabel_cfg["gdino_conf"])))
+        if autolabel_cfg.get("florence2_model"):
+            self.florence2_model = str(autolabel_cfg["florence2_model"])
+        if autolabel_cfg.get("falcon_model"):
+            self.falcon_model = str(autolabel_cfg["falcon_model"])
         sam3_cfg = cfg.get("sam3", {})
         dev = sam3_cfg.get("device")
         if dev in ("auto", "cuda", "cpu"):
@@ -1034,7 +1094,10 @@ class ReviewWindow(QMainWindow):
             boxes = self._boxes_for_image(image_id)
             pos = (f"ts={frame['timestamp_ns']}" if ts_real else f"index={idx}")
             tag = f"{side.upper()}  |  " if self._stereo else ""
-            info = (f"{tag}Frame {idx + 1}/{len(self.frame_index)}  |  {pos}")
+            dropped = ("  |  🚫 DISCARDED"
+                       if idx in self.coco.discarded_frames else "")
+            info = (f"{tag}Frame {idx + 1}/{len(self.frame_index)}  |  "
+                    f"{pos}{dropped}")
             canvas.load_frame(arr, boxes, info, image_id)
         # The compat attribute tracks the ACTIVE side's image id (identical
         # to the only canvas's in mono).
@@ -1075,10 +1138,12 @@ class ReviewWindow(QMainWindow):
             if self._play_tick_count & 7 == 0:
                 self._sync_keyframe_button()
                 self._sync_annotated_button()
+                self._sync_discard_button()
                 self._update_progress()
         else:
             self._sync_keyframe_button()
             self._sync_annotated_button()
+            self._sync_discard_button()
             self._update_progress()
 
     # ----------------------- event handlers ---------------------------- #
@@ -1192,6 +1257,33 @@ class ReviewWindow(QMainWindow):
         self.side.btn_mark_annotated.setChecked(
             self._current_idx in self.coco.annotated_marks)
         self.side.btn_mark_annotated.blockSignals(False)
+
+    def _sync_discard_button(self) -> None:
+        """Reflect whether the current frame is discarded from the output."""
+        self.side.btn_discard_image.blockSignals(True)
+        self.side.btn_discard_image.setChecked(
+            self._current_idx in self.coco.discarded_frames)
+        self.side.btn_discard_image.blockSignals(False)
+
+    def _on_toggle_discard(self) -> None:
+        """'🚫 Discard image' button: exclude this frame's image(s) — both
+        sides in stereo — and their boxes from the FINAL output JSON.
+        Reversible until the final save (the _tmp file keeps everything)."""
+        idx = self._current_idx
+        if idx in self.coco.discarded_frames:
+            self.coco.discarded_frames.discard(idx)
+            msg = f"Discard removed (frame {idx + 1})"
+        else:
+            self.coco.discarded_frames.add(idx)
+            msg = (f"Frame {idx + 1} discarded — excluded from the final "
+                   f"JSON (toggle again to undo)")
+        # The discard set changes the final JSON, so force a full write on
+        # the next save (not just the progress sidecar).
+        self.coco.dirty = True
+        self._sync_discard_button()
+        self.coco.save(is_final=False)
+        self._load_current()  # refresh the 🚫 DISCARDED HUD marker
+        self.statusBar().showMessage(msg, 3000)
 
     def _on_toggle_annotated(self) -> None:
         """'✔ Mark as annotated' button: count this frame as annotated
@@ -1994,7 +2086,9 @@ class ReviewWindow(QMainWindow):
         job = self._sam3_queue.pop(0)
         if job.get("kind") == "autolabel":
             self._start_autolabel_worker(job["img_path"], job["concepts"],
-                                         job["cat_ids"], job["image_id"])
+                                         job["cat_ids"], job["image_id"],
+                                         detector=job.get("detector"),
+                                         exemplar=job.get("exemplar"))
         elif job.get("kind") == "propagate":
             self._start_propagate_worker(
                 job["start_frame_idx"], job["seeds"], side=job.get("side"))
@@ -2272,9 +2366,9 @@ class ReviewWindow(QMainWindow):
         """(concepts, cat_ids) for an autolabel run; None (+ a status
         message) when there is nothing to prompt with.
 
-        Categories highlighted in the side list (Ctrl/Shift multi-select)
-        restrict the run to those; with no highlight every category is
-        prompted."""
+        Categories highlighted in the side list (any multi-select of 2+
+        rows, or an explicit Ctrl/Shift click) restrict the run to those;
+        with no highlight every category is prompted."""
         selected = [cid for cid in self.side.get_selected_cat_ids()
                     if cid in self.coco.cat_map]
         if selected:
@@ -2287,27 +2381,90 @@ class ReviewWindow(QMainWindow):
         cats = sorted(self.coco.categories, key=lambda c: c["id"])
         return [c["name"] for c in cats], [c["id"] for c in cats]
 
+    def _autolabel_model_id(self, detector: str) -> Optional[str]:
+        """The configured checkpoint for one autolabel backend."""
+        return {"grounding_dino": self.gdino_model,
+                "florence2": self.florence2_model,
+                "falcon": self.falcon_model}.get(detector, self.owlv2_model)
+
+    def _autolabel_conf(self, detector: str) -> float:
+        """The configured threshold for one autolabel backend (Florence-2 /
+        Falcon emit no scores — the value is ignored there)."""
+        return self.gdino_conf if detector == "grounding_dino" \
+            else self.owlv2_conf
+
+    def _exemplar_from_selection(self):
+        """(crop_rgb, label, cat_id) from the selected box on the ACTIVE
+        canvas — the visual query for OWLv2 exemplar autolabel. None (plus
+        a status message) when there is no usable selection."""
+        box = self._selected_single_box()
+        if box is None:
+            self.statusBar().showMessage(
+                "OWLv2 exemplar: select exactly one box first — it becomes "
+                "the visual query", 4000)
+            return None
+        # Canvas box dicts carry cat_id/cat_name; coco anns carry
+        # category_id — accept both.
+        cat_id = box.get("cat_id", box.get("category_id"))
+        label = self.coco.cat_map.get(cat_id) or box.get("cat_name")
+        if not label:
+            self.statusBar().showMessage(
+                "OWLv2 exemplar: the selected box has no category", 3000)
+            return None
+        arr = self._decode_side(self._current_idx, self._active_canvas.side)
+        h, w = arr.shape[:2]
+        x, y, bw, bh = box["bbox"]
+        x1 = max(0, int(round(x)))
+        y1 = max(0, int(round(y)))
+        x2 = min(w, int(round(x + bw)))
+        y2 = min(h, int(round(y + bh)))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            self.statusBar().showMessage(
+                "OWLv2 exemplar: selected box is too small to be a query",
+                3000)
+            return None
+        return arr[y1:y2, x1:x2].copy(), label, cat_id
+
     def _on_autolabel_frame(self) -> None:
         """Autolabel the current frame (highlighted categories, or all)."""
-        if not _SAM3_AVAILABLE:
+        detector = self.autolabel_detector
+        if detector in ("owlv2", "owlv2_exemplar"):
+            if not _OWLV2_AVAILABLE:
+                QMessageBox.warning(
+                    self, "OWLv2 unavailable",
+                    "OWLv2 (core/owlv2_detector) is not importable - "
+                    "check that transformers is installed.")
+                return
+        elif detector == "sam3" and not _SAM3_AVAILABLE:
             QMessageBox.warning(self, "SAM3 unavailable",
                                 "SAM3 (ultralytics) is not importable.")
             return
         if self._current_image_id is None:
             return
-        pair = self._autolabel_concepts()
-        if pair is None:
-            return
-        concepts, cat_ids = pair
+        exemplar = None
+        if detector == "owlv2_exemplar":
+            exemplar = self._exemplar_from_selection()
+            if exemplar is None:
+                return
+            concepts, cat_ids = [exemplar[1]], [exemplar[2]]
+        else:
+            pair = self._autolabel_concepts()
+            if pair is None:
+                return
+            concepts, cat_ids = pair
         img_path = self._write_tmp_image()
         if img_path is None:
             self._set_sam3_status("autolabel failed — no image for frame")
             return
         self._start_autolabel_worker(img_path, concepts, cat_ids,
-                                     self._current_image_id)
+                                     self._current_image_id,
+                                     exemplar=exemplar)
 
     def _start_autolabel_worker(self, img_path: str, concepts: list,
-                                cat_ids: list, image_id: int) -> None:
+                                cat_ids: list, image_id: int,
+                                detector: Optional[str] = None,
+                                exemplar: Optional[tuple] = None) -> None:
+        detector = detector or self.autolabel_detector
         if self._sam3_busy():
             # Busy — queue the job; it starts when the current run ends.
             self._sam3_queue.append({
@@ -2316,6 +2473,8 @@ class ReviewWindow(QMainWindow):
                 "concepts": concepts,
                 "cat_ids": cat_ids,
                 "image_id": image_id,
+                "detector": detector,
+                "exemplar": exemplar,
             })
             self._refresh_sam3_status()
             self.statusBar().showMessage(
@@ -2323,21 +2482,67 @@ class ReviewWindow(QMainWindow):
                 f"({len(self._sam3_queue)} in queue)", 2500)
             return
         self._set_sam3_status(
-            f"autolabel: detecting {len(concepts)} categor"
+            f"autolabel ({detector}): detecting {len(concepts)} categor"
             f"{'y' if len(concepts) == 1 else 'ies'}…")
         self.side.set_sam3_running(True)
         # Canvas stays enabled: results apply by image_id, so the user can
         # keep working on other frames while SAM3 runs.
-        self._sam3_autolabel_worker = SAM3AutolabelWorker(
-            image_path=img_path,
-            concepts=concepts,
-            cat_ids=cat_ids,
-            image_id=image_id,
-            model_path=self.sam3_model,
-            device=self.sam3_device,
-            conf=self.sam3_conf,
-            parent=self,
-        )
+        if detector == "owlv2":
+            # Same signal shape as the SAM3 autolabel worker; detections
+            # carry mask=None and apply through the same box path.
+            self._sam3_autolabel_worker = Owlv2AutolabelWorker(
+                image_path=img_path,
+                concepts=concepts,
+                cat_ids=cat_ids,
+                image_id=image_id,
+                model_id=self.owlv2_model,
+                device=self.sam3_device,
+                conf=self.owlv2_conf,
+                parent=self,
+            )
+        elif detector == "owlv2_exemplar":
+            if exemplar is None:
+                self.side.set_sam3_running(False)
+                self._set_sam3_status(
+                    "autolabel (owlv2_exemplar): no exemplar box selected")
+                return
+            crop, label, cat_id = exemplar
+            self._sam3_autolabel_worker = Owlv2ExemplarWorker(
+                image_path=img_path,
+                exemplar=crop,
+                label=label,
+                cat_id=cat_id,
+                image_id=image_id,
+                model_id=self.owlv2_model,
+                device=self.sam3_device,
+                conf=self.owlv2_conf,
+                parent=self,
+            )
+        elif detector in GENERIC_DETECTORS:
+            # Grounding DINO / Florence-2 / Falcon — same signal shape;
+            # Falcon detections carry real masks.
+            self._sam3_autolabel_worker = GenericAutolabelWorker(
+                detector=detector,
+                image_path=img_path,
+                concepts=concepts,
+                cat_ids=cat_ids,
+                image_id=image_id,
+                model_id=self._autolabel_model_id(detector),
+                device=self.sam3_device,
+                conf=self._autolabel_conf(detector),
+                parent=self,
+            )
+        else:
+            self._sam3_autolabel_worker = SAM3AutolabelWorker(
+                image_path=img_path,
+                concepts=concepts,
+                cat_ids=cat_ids,
+                image_id=image_id,
+                model_path=self.sam3_model,
+                device=self.sam3_device,
+                conf=self.sam3_conf,
+                parent=self,
+            )
         self._sam3_autolabel_worker.finished_signal.connect(
             self._on_autolabel_finished)
         self._sam3_autolabel_worker.failed_signal.connect(self._on_sam3_failed)
@@ -2411,7 +2616,15 @@ class ReviewWindow(QMainWindow):
     def _on_autolabel_all(self) -> None:
         """Background text-prompt autolabel over every frame — on the
         ACTIVE side only (in stereo)."""
-        if not _SAM3_AVAILABLE:
+        detector = self.autolabel_detector
+        if detector in ("owlv2", "owlv2_exemplar"):
+            if not _OWLV2_AVAILABLE:
+                QMessageBox.warning(
+                    self, "OWLv2 unavailable",
+                    "OWLv2 (core/owlv2_detector) is not importable - "
+                    "check that transformers is installed.")
+                return
+        elif detector == "sam3" and not _SAM3_AVAILABLE:
             QMessageBox.warning(self, "SAM3 unavailable",
                                 "SAM3 (ultralytics) is not importable.")
             return
@@ -2422,22 +2635,35 @@ class ReviewWindow(QMainWindow):
             self.statusBar().showMessage("SAM3 already running", 2500)
             return
         side = self._active_canvas.side
-        pair = self._autolabel_concepts()
-        if pair is None:
-            return
-        concepts, cat_ids = pair
+        exemplar = None
+        if detector == "owlv2_exemplar":
+            exemplar = self._exemplar_from_selection()
+            if exemplar is None:
+                return
+            concepts, cat_ids = [exemplar[1]], [exemplar[2]]
+        else:
+            pair = self._autolabel_concepts()
+            if pair is None:
+                return
+            concepts, cat_ids = pair
         selected_note = (f" — restricted to the {len(concepts)} highlighted "
                          f"categor{'y' if len(concepts) == 1 else 'ies'}"
-                         if self.side.get_selected_cat_ids() else "")
+                         if detector != "owlv2_exemplar"
+                         and self.side.get_selected_cat_ids() else "")
+        det_label = DETECTOR_LABELS.get(detector, detector)
+        exemplar_note = ("\nThe currently selected box is the visual query "
+                         "(1-shot exemplar)." if detector == "owlv2_exemplar"
+                         else "")
         ret = QMessageBox.question(
-            self, "Autolabel all frames with SAM3?",
+            self, f"Autolabel all frames with {det_label}?",
             f"Run text-prompt detection on all {n} frame(s) for "
             f"{len(concepts)} categor{'y' if len(concepts) == 1 else 'ies'} "
             f"({', '.join(concepts[:5])}{'…' if len(concepts) > 5 else ''})"
-            f"{selected_note}?\n"
+            f"{selected_note}?{exemplar_note}\n"
             f"Runs in the background (device: {self.sam3_device}, CPU "
-            f"fallback on CUDA OOM). Detections become editable boxes with "
-            f"masks; duplicates of existing boxes are skipped. "
+            f"fallback on CUDA OOM). Detections become editable boxes"
+            + (" with masks" if detector in ("sam3", "falcon") else "")
+            + "; duplicates of existing boxes are skipped. "
             f"You can cancel anytime.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes)
@@ -2449,14 +2675,47 @@ class ReviewWindow(QMainWindow):
         self._batch_added = 0
         self._set_sam3_status(f"autolabel all: 0/{n} frames…")
         self.side.set_sam3_running(True)
-        self._sam3_autolabel_batch_worker = SAM3AutolabelBatchWorker(
-            self._side_worker_index(side), list(range(n)), concepts, cat_ids,
-            tmp_dir,
-            model_path=self.sam3_model,
-            device=self.sam3_device,
-            conf=self.sam3_conf,
-            parent=self,
-        )
+        if detector == "owlv2":
+            # Same signal shape as the SAM3 batch worker; detections carry
+            # mask=None and apply through the same box path.
+            self._sam3_autolabel_batch_worker = Owlv2AutolabelBatchWorker(
+                self._side_worker_index(side), list(range(n)),
+                concepts, cat_ids, tmp_dir,
+                model_id=self.owlv2_model,
+                device=self.sam3_device,
+                conf=self.owlv2_conf,
+                parent=self,
+            )
+        elif detector == "owlv2_exemplar":
+            crop, label, cat_id = exemplar
+            self._sam3_autolabel_batch_worker = Owlv2ExemplarBatchWorker(
+                self._side_worker_index(side), list(range(n)),
+                crop, label, cat_id, tmp_dir,
+                model_id=self.owlv2_model,
+                device=self.sam3_device,
+                conf=self.owlv2_conf,
+                parent=self,
+            )
+        elif detector in GENERIC_DETECTORS:
+            # Grounding DINO / Florence-2 / Falcon — same signal shape;
+            # Falcon detections carry real masks.
+            self._sam3_autolabel_batch_worker = GenericAutolabelBatchWorker(
+                detector, self._side_worker_index(side), list(range(n)),
+                concepts, cat_ids, tmp_dir,
+                model_id=self._autolabel_model_id(detector),
+                device=self.sam3_device,
+                conf=self._autolabel_conf(detector),
+                parent=self,
+            )
+        else:
+            self._sam3_autolabel_batch_worker = SAM3AutolabelBatchWorker(
+                self._side_worker_index(side), list(range(n)),
+                concepts, cat_ids, tmp_dir,
+                model_path=self.sam3_model,
+                device=self.sam3_device,
+                conf=self.sam3_conf,
+                parent=self,
+            )
         self._sam3_autolabel_batch_worker.frame_done_signal.connect(
             self._on_autolabel_batch_frame_done)
         self._sam3_autolabel_batch_worker.progress_signal.connect(

@@ -33,17 +33,20 @@ OUTPUT:
         └── ...
 
 AVAILABLE AUGMENTATIONS:
-    - flip_horizontal: Mirror image horizontally (updates bbox x_center)
-    - flip_vertical: Mirror image vertically (updates bbox y_center)
+    - flip_horizontal: Mirror image horizontally (mirrors bbox/polygon coords)
+    - flip_vertical: Mirror image vertically (mirrors bbox/polygon coords)
     - rotate: Rotate image and bounding boxes/polygons by a random angle
     - brightness: Adjust image brightness
     - contrast: Adjust image contrast
-    - mosaic: Combine 4 images into a 2x2 grid
+    - hue: Shift image hue (HSV) by a random amount
+    - blur: Gaussian blur with a random odd kernel size
+    - resize: Resize image to a fixed target size (normalized labels carry over)
+    - mosaic: Combine 4 images into a 2x2 grid (bbox/polygon aware)
 
 NOTE:
-    The ``rotate`` augmentation rotates the image using the same affine matrix
-    for all bounding-box corners, then computes a new axis-aligned bbox. Polygon
-    segmentation labels are also rotated point-by-point.
+    Geometric augmentations (flip/rotate/mosaic) transform BOTH bounding-box
+    and polygon (segmentation) labels; photometric ones (brightness, contrast,
+    hue, blur) and resize leave the normalized labels unchanged.
 """
 
 import argparse
@@ -87,11 +90,14 @@ Examples:
         --augmentations flip_horizontal flip_vertical rotate brightness contrast mosaic
 
 Available Augmentations:
-    flip_horizontal   - Mirror image horizontally (adjusts bbox accordingly)
+    flip_horizontal   - Mirror image horizontally (adjusts bbox/polygon coords)
     flip_vertical     - Mirror image vertically
     rotate            - Random rotation within specified range (rotates bboxes/polygons)
     brightness        - Random brightness adjustment
     contrast          - Random contrast adjustment
+    hue               - Random hue shift (--hue-range, degrees)
+    blur              - Random Gaussian blur (--blur-range, kernel size)
+    resize            - Resize to fixed target (--resize WIDTH HEIGHT)
     mosaic            - Combine 4 random images into 2x2 grid
 
 Input Directory Structure:
@@ -122,7 +128,8 @@ Input Directory Structure:
         type=str,
         nargs="+",
         default=["flip_horizontal", "rotate", "brightness"],
-        choices=["flip_horizontal", "flip_vertical", "rotate", "brightness", "contrast", "mosaic"],
+        choices=["flip_horizontal", "flip_vertical", "rotate", "brightness",
+                 "contrast", "hue", "blur", "resize", "mosaic"],
         help="Augmentation types to apply (default: flip_horizontal rotate brightness)",
     )
     parser.add_argument(
@@ -146,6 +153,30 @@ Input Directory Structure:
         default=[0.8, 1.2],
         metavar=("MIN", "MAX"),
         help="Brightness/contrast factor range (default: 0.8 1.2)",
+    )
+    parser.add_argument(
+        "--hue-range",
+        type=float,
+        nargs=2,
+        default=[-15, 15],
+        metavar=("MIN", "MAX"),
+        help="Hue shift range in degrees (default: -15 15)",
+    )
+    parser.add_argument(
+        "--blur-range",
+        type=int,
+        nargs=2,
+        default=[3, 9],
+        metavar=("MIN", "MAX"),
+        help="Gaussian blur kernel range (rounded to odd, default: 3 9)",
+    )
+    parser.add_argument(
+        "--resize",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("WIDTH", "HEIGHT"),
+        help="Target size for the 'resize' augmentation (e.g. --resize 640 640)",
     )
     parser.add_argument(
         "--images-subdir",
@@ -195,6 +226,11 @@ def main():
             print(f"Error: --rotation-range must be min max, got {args.rotation_range}")
             sys.exit(1)
 
+    # Validate resize when requested
+    if "resize" in args.augmentations and not args.resize:
+        print("Error: --resize WIDTH HEIGHT is required when using the 'resize' augmentation")
+        sys.exit(1)
+
     print("=" * 60)
     print("DATASET AUGMENTATION")
     print("=" * 60)
@@ -213,6 +249,9 @@ def main():
         "multiplier": args.multiplier,
         "rotation_range": tuple(args.rotation_range),
         "brightness_range": tuple(args.brightness_range),
+        "hue_range": tuple(args.hue_range),
+        "blur_range": tuple(args.blur_range),
+        "resize": tuple(args.resize) if args.resize else None,
     }
     
     # Create processor and run augmentation

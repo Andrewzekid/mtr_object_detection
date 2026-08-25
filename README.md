@@ -9,7 +9,10 @@ training and inference, built with PyQt6 and Ultralytics YOLO.
 Label review and segmentation:
 ```
 python -m gui.label_review.main
-# stereo dual-view (left/right folders, frames paired positionally):
+# stereo dual-view (left/right folders, frames paired by timestamp filename;
+# frames without a matching timestamp on the other side are skipped).
+# The saved COCO JSON lists every timestamp-synced image (sorted earliest
+# first) — not just the frames you viewed or annotated.
 python -m gui.label_review.main --images /path/to/left --images-right /path/to/right
 ```
 Launches interactive GUI for complete label review and segmentation. Point it
@@ -19,6 +22,33 @@ at the keyframe folder of a pipeline run to review the combined Qwen output
 ```bash
 python -m gui.label_review.main --images output/<run>/keyframes/left
 ```
+
+### Autolabel backends
+
+The GUI can pre-fill boxes/masks for the session categories
+(**Autolabel frame** / **Autolabel ALL frames**). Pick the backend under
+Settings → Autolabel (persisted as `autolabel.detector` in the GUI config):
+
+| Backend | Output | Notes |
+|---|---|---|
+| `sam3` | boxes + masks | text prompts, local Ultralytics SAM3 checkpoint |
+| `owlv2` | boxes | zero-shot, `google/owlv2-large-patch14-ensemble` (HF) |
+| `owlv2_exemplar` | boxes | 1-shot: select an existing box first — its crop becomes the visual query (`image_guided_detection`) |
+| `grounding_dino` | boxes | zero-shot; default `IDEA-Research/grounding-dino-base` (the `-large` checkpoint is not published in transformers format) |
+| `florence2` | boxes | phrase grounding per category via `microsoft/Florence-2-large`; no confidence scores (all 1.0) |
+| `falcon` | boxes + masks | `tiiuae/Falcon-Perception`; free-form text query per category |
+
+Per-backend config keys (Settings dialog or config JSON): `owlv2_model` /
+`owlv2_conf` (default 0.3), `gdino_model` / `gdino_conf` (0.35, maps to the
+box threshold), `florence2_model`, `falcon_model`. First use downloads the
+checkpoint from Hugging Face; models are cached per session.
+
+Two compatibility notes for the HF backends (handled automatically in
+`core/`): Falcon's pre-compiled flex-attention kernels exceed the shared
+memory of consumer GPUs (RTX 4090), so they are recompiled with smaller
+blocks at load; Florence-2 runs its 2023-era remote code under
+transformers 5.x via shims plus a local beam search (`model.generate` is
+unusable there — see `core/florence2_detector.py`).
 
 End-to-end pipeline that takes **raw images** and produces a **trained YOLO
 detection/segmentation model** plus **tracking results**, with a
@@ -52,6 +82,18 @@ Nth frame, interpolate the rest.):
    → 13 interpolation to all frames → 08 review all
    → 09 SAM3 segmentation dataset → Review the masks on roboflow and augment data → 04 YOLO train → 05 evaluate → 11 tracking on raw frames
 ```
+
+**GUI segmentation pipeline** (annotate + segment in the label-review GUI, no
+Roboflow round-trip — masks come from SAM3 in the GUI):
+
+```
+GUI annotate (SAM3 masks) → COCO labels_coco.json (discard unwanted frames
+   in the GUI) → 01b COCO→YOLO-seg → 02 augment → 03 train/test/val split
+   → 04 YOLO seg train
+```
+
+See "Segmentation dataset pipeline (GUI → YOLO seg)" below for commands, or
+run all post-GUI steps at once with `scripts/run_seg_dataset_pipeline.py`.
 
 **Orchestrated rosbag pipeline** — run the whole keyframe workflow with one
 command, including fisheye undistortion and a time-based train/val/test split:
@@ -322,7 +364,20 @@ Trained weights are written to
 python scripts/05_evaluate_model.py \
   --model runs/segment/output/training/yolo_training/weights/best.pt \
   --data output/MTR_new_1k/reviewed/yolo_seg/data.yaml \
-  --split val --conf 0.5 --iou 0.5
+  --split test train --conf 0.5 --iou 0.5 \
+  --csv output/evaluation/per_class_metrics.csv
+```
+
+Evaluates each split (default: `test train`) and reports per-class
+precision / recall / F1 / AP50 / AP50-95 (box and mask for seg models);
+`--csv` writes one row per split × class plus an `all` summary row.
+For dataset statistics (images, per-class instance counts and
+percentages) use `scripts/01a_dataset_statistics.py`:
+
+```bash
+python scripts/01a_dataset_statistics.py \
+  --input-dir output/MTR_new_1k/reviewed/yolo_seg \
+  --csv dataset_statistics.csv
 ```
 
 ### 8. Run tracking on the original images
@@ -415,6 +470,94 @@ Speed options for benchmark mode:
 
 ---
 
+## Segmentation dataset pipeline (GUI → YOLO seg)
+
+Post-annotation chain that turns the label-review GUI's COCO output into a
+YOLO segmentation dataset ready for training — no Roboflow round-trip:
+
+```
+GUI annotate (SAM3 masks on every frame, discard bad frames with the
+   discard button) → labels_coco.json
+   → 01b_coco_to_yolo_seg.py   COCO → flat YOLO-seg (images/ + labels/ + classes.txt)
+   → 02_augment_data.py        augmented flat YOLO-seg dataset
+   → 03_split_dataset.py       train/test/val split + dataset.yaml
+   → 04_train_model.py --task segment
+```
+
+### One-command runner
+
+Runs all three post-GUI steps and validates the dataset format after each
+step (image/label pairing, label syntax, coordinate range, class ids), so a
+format mismatch fails at the step that introduced it:
+
+```bash
+python scripts/run_seg_dataset_pipeline.py \
+  --coco-json /data/run/labels_coco.json \
+  --images-dir /data/run/camera \
+  --output-dir output/my_dataset \
+  --augmentations flip_horizontal rotate brightness hue blur \
+  --multiplier 2 --ratios 0.7 0.15 0.15 --seed 42
+
+# skip augmentation entirely:
+python scripts/run_seg_dataset_pipeline.py \
+  --coco-json /data/run/labels_coco.json --images-dir /data/run/camera \
+  --output-dir output/my_dataset --skip-augment
+```
+
+`--images-dir` is the plain image folder for mono sessions, or the parent
+folder containing `left/` + `right/` for stereo sessions (the GUI writes a
+`side` field per image; output filenames get `left_`/`right_` prefixes so the
+identical timestamp names don't collide). The runner prints the exact
+`04_train_model.py --config .../dataset.yaml --task segment` command at the end.
+
+Output layout:
+
+```
+output/my_dataset/
+├── yolo_flat/      # images/ + labels/ + classes.txt + conversion_summary.json
+├── augmented/      # same layout, originals + augmented copies
+└── dataset/        # train/ test/ val/ (each images/ + labels/) + dataset.yaml
+```
+
+### Step by step
+
+```bash
+# 1. COCO → flat YOLO-seg (mask-less boxes are skipped by default;
+#    --bbox-as-rect emits them as rectangle polygons)
+python scripts/01b_coco_to_yolo_seg.py \
+  --coco-json /data/run/labels_coco.json \
+  --images-dir /data/run/camera \
+  --output-dir output/my_dataset/yolo_flat
+
+# 2. Augment (masks are transformed with the image: flip/rotate/mosaic move
+#    every polygon point; brightness/contrast/hue/blur/resize leave the
+#    normalized labels untouched; classes.txt is passed through)
+python scripts/02_augment_data.py \
+  --input-dir output/my_dataset/yolo_flat \
+  --output-dir output/my_dataset/augmented \
+  --augmentations flip_horizontal rotate brightness hue blur \
+  --multiplier 2 --hue-range -15 15 --blur-range 3 9
+# add the 'resize' augmentation with: --resize WIDTH HEIGHT
+
+# 3. Split + dataset.yaml (class names are read from classes.txt when
+#    --class-names is not given)
+python scripts/03_split_dataset.py \
+  --input-dir output/my_dataset/augmented \
+  --output-dir output/my_dataset/dataset \
+  --ratios 0.7 0.15 0.15 --seed 42 --generate-yaml
+
+# 4. Train
+python scripts/04_train_model.py \
+  --config output/my_dataset/dataset/dataset.yaml --task segment \
+  --epochs 100 --device 0
+```
+
+> Caveat: because augmentation runs before the split, augmented copies of one
+> source image can land in both train and val. Use `--skip-augment` (or split
+> first and augment the splits separately) if you need strict separation.
+
+---
+
 ## Script reference
 
 Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
@@ -430,7 +573,7 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | `08b_split_reviewed_dataset.py` | Split `08`'s flat `yolo_reviewed/` into train/val/test for `09`. | `--input-dir`, `--output-dir`, `--ratios`, `--seed`, `--symlink-images` | `images/labels/{train,val,test}/`, `data.yaml` |
 | `09_create_seg_dataset.py` | Convert detection boxes → SAM3 masks → YOLO seg polygons, per class. | `--input-dir` (split), `--output-dir`, `--model` (sam3), `--conf`, `--device` | YOLO seg dataset + `creation_summary.json` |
 | `04_train_model.py` | Train a YOLO detect/segment model (Ultralytics). | `--config` (data.yaml), `--model-type`, `--task`, `--epochs`, `--batch-size`, `--device`, `--loss-type` | `runs/.../weights/best.pt` |
-| `05_evaluate_model.py` | Evaluate a trained model on a split, or compare pred vs GT COCO JSON. | `--model`, `--data`, `--split`, `--conf`, `--iou` (or `--pred-json`/`--gt-json`) | Metrics report (stdout) |
+| `05_evaluate_model.py` | Evaluate a trained model on one or more splits (default `test train`) with per-class precision/recall/F1/AP50/AP50-95 (box + mask), or compare pred vs GT COCO JSON. | `--model`, `--data`, `--split`, `--conf`, `--iou`, `--csv` (or `--pred-json`/`--gt-json`) | Metrics report (stdout) + per-class CSV |
 | `11_run_tracking.py` | YOLO tracking (ByteTrack / BoT-SORT / detect-then-SAM3) + a no-output benchmark mode. | `--tracker`, `--model`, `--data`, `--output`, `--conf`, `--device`, `--warmup-frames` | `tracked_*.jpg`, `results.json`, `tracking_result.mp4` |
 | `orchestrate_pipeline.py` | End-to-end rosbag pipeline: undistort -> split -> keyframes -> Qwen -> COCO combine -> review -> propagate -> YOLO export. Stage markers make it resumable. | `--rosbag`, `--camera`, `--stage`, `--skip-stage`, `--force`, `--resume-from` | `<rosbag>_pipeline/` output tree |
 | `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`LLAMACPP_URL`, `QWEN_MODEL`, `QWEN_MMPROJ`, `SAM3_MODEL`). | `<rosbag_path>` + any orchestrator args | same as orchestrator |
@@ -448,8 +591,11 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | Script | Purpose | Key inputs | Outputs |
 |-------|---------|------------|---------|
 | `01_verify_labels.py` | Validate YOLO labels: missing files, bad formats, class stats. | `--input-dir`, `--images-subdir`, `--labels-subdir`, `--class-names`, `--fix` | Report (stdout / `--output`); optional in-place fixes |
-| `02_augment_data.py` | Augment a labeled YOLO dataset (flip/rotate/brightness/contrast/mosaic). | `--input-dir`, `--output-dir`, `--augmentations`, `--multiplier` | Augmented images + labels |
-| `03_split_dataset.py` | Split a labeled YOLO dataset into train/val/test + `data.yaml`. | `--input-dir`, `--output-dir`, `--ratios`, `--generate-yaml` | `images/labels/{train,val,test}/`, `data.yaml` |
+| `01a_dataset_statistics.py` | Dataset statistics for a YOLO dataset (single `images/`+`labels/`, `<split>/{images,labels}` or `images/<split>`+`labels/<split>` layouts): image/label/background counts, per-class instances, % of instances, % of images, avg instances/img. Class names from `classes.txt` or `dataset.yaml`. | `--input-dir`, `--csv` | Report (stdout) + optional per-class CSV |
+| `01b_coco_to_yolo_seg.py` | Convert label-review GUI COCO output into a flat YOLO segmentation dataset (input for `02`). Stereo-aware (`left_`/`right_` prefixes); mask-less boxes skipped unless `--bbox-as-rect`. | `--coco-json`, `--images-dir`, `--output-dir`, `--bbox-as-rect`, `--symlink` | `images/`, `labels/`, `classes.txt`, `conversion_summary.json` |
+| `02_augment_data.py` | Augment a labeled YOLO dataset (flip/rotate/brightness/contrast/hue/blur/resize/mosaic); polygon labels are transformed with the image. | `--input-dir`, `--output-dir`, `--augmentations`, `--multiplier`, `--hue-range`, `--blur-range`, `--resize` | Augmented images + labels (+ `classes.txt` passthrough) |
+| `03_split_dataset.py` | Split a labeled YOLO dataset into train/val/test + `data.yaml`. Class names fall back to `classes.txt` when `--class-names` is omitted. | `--input-dir`, `--output-dir`, `--ratios`, `--generate-yaml` | `images/labels/{train,val,test}/`, `data.yaml` |
+| `run_seg_dataset_pipeline.py` | One-command chain: GUI COCO → `01b` convert → `02` augment → `03` split, with dataset-format validation after each step. | `--coco-json`, `--images-dir`, `--output-dir`, `--augmentations`, `--ratios`, `--skip-augment` | `<out>/{yolo_flat,augmented,dataset}/` + `dataset.yaml` |
 | `10_qwen_json_to_yolo.py` | Convert `07 --split-by-class` JSON into a YOLO detection dataset. | `--annotations-dir`, `--image-folder`, `--output-dir`, `--data-yaml` | YOLO detect dataset (`images/`, `labels/`, `data.yaml`) |
 
 ### Standalone tools

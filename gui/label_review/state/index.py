@@ -185,25 +185,28 @@ class EmptyIndex:
 
 
 # ---------------------------------------------------------------------------
-# Stereo index — two image folders (left/right) paired positionally.
+# Stereo index — two image folders (left/right) paired by timestamp.
 # ---------------------------------------------------------------------------
 
 class StereoIndex:
     """Frame index over a stereo pair of image folders.
 
-    Wraps two ``ImageFolderIndex`` instances; frame ``i`` is the pair
-    ``(left[i], right[i])`` — pairing is positional, so the folders are
-    expected to hold matching filenames in the same order (mismatches are
-    tolerated, since lookup is purely positional). When the folders differ
-    in length the shorter one wins and a warning is printed.
+    Wraps two ``ImageFolderIndex`` instances. When both folders have
+    timestamp filenames (every stem a bare integer), frame ``i`` is the
+    pair ``(left[j], right[k])`` where both sides share the SAME timestamp
+    — images without a matching timestamp on the other side are SKIPPED,
+    so dropped frames on one camera never shift the pairing. When the
+    filenames are not timestamps, pairing falls back to positional
+    (``(left[i], right[i])``, shorter side wins, mismatched basenames
+    reported via ``pairing_warning``).
 
     Interface mirrors ``ImageFolderIndex`` with an added ``side`` keyword
     (``"left"`` / ``"right"``): ``__len__``, ``frame_at(idx, side)``,
-    ``decode_image(idx, side)``, ``find_idx_by_timestamp`` (delegates to the
-    left side), ``.files`` / ``.files_left`` / ``.files_right``,
-    ``.timestamps_real``. ``side_index(side)`` returns a single-side view
-    with the plain mono interface so existing workers run on one side
-    unchanged.
+    ``decode_image(idx, side)``, ``find_idx_by_timestamp`` (the paired
+    timeline, keyed on the left side's timestamps), ``.files`` /
+    ``.files_left`` / ``.files_right``, ``.timestamps_real``.
+    ``side_index(side)`` returns a single-side view with the plain mono
+    interface so existing workers run on one side unchanged.
     """
 
     stereo = True
@@ -211,23 +214,63 @@ class StereoIndex:
     def __init__(self, left_paths: List[str], right_paths: List[str]):
         self.left = ImageFolderIndex(left_paths)
         self.right = ImageFolderIndex(right_paths)
+        self.timestamps_real = (self.left.timestamps_real
+                                and self.right.timestamps_real)
+        self.pairing_warning: Optional[str] = None
+        if self.timestamps_real:
+            self._pair_by_timestamp()
+        else:
+            self._pair_positionally()
+        # `.files` (left side) keeps mono call sites (source label, YOLO
+        # export) working unchanged.
+        self.files = self.files_left
+
+    def _pair_by_timestamp(self) -> None:
+        """Pair frames whose timestamps match exactly; skip the rest."""
+        def ts_map(side: ImageFolderIndex) -> Dict[int, int]:
+            # First occurrence wins on duplicate timestamps (the extras
+            # count as unpaired below).
+            m: Dict[int, int] = {}
+            for i, fr in enumerate(side.frames):
+                m.setdefault(fr["timestamp_ns"], i)
+            return m
+        lmap, rmap = ts_map(self.left), ts_map(self.right)
+        common = sorted(set(lmap) & set(rmap))
+        self._pair_ts = common
+        self._pair_map = {"left": [lmap[ts] for ts in common],
+                          "right": [rmap[ts] for ts in common]}
+        self._len = len(common)
+        n_skip_l = len(self.left) - self._len
+        n_skip_r = len(self.right) - self._len
+        if n_skip_l or n_skip_r:
+            print(f"⚠️ Stereo timestamp pairing: skipping "
+                  f"{n_skip_l} left-only / {n_skip_r} right-only "
+                  f"image(s) with no matching timestamp")
+            self.pairing_warning = (
+                f"Stereo: {n_skip_l} left-only / {n_skip_r} right-only "
+                f"image(s) skipped — no matching timestamp on the other "
+                f"side.")
+        self.files_left = [self.left.files[i] for i in self._pair_map["left"]]
+        self.files_right = [self.right.files[i]
+                            for i in self._pair_map["right"]]
+
+    def _pair_positionally(self) -> None:
+        """Fallback for non-timestamp filenames: pair by sorted position."""
         if len(self.left) != len(self.right):
             print(f"⚠️ Stereo folders differ in length "
                   f"(left={len(self.left)}, right={len(self.right)}) — "
                   f"using the first {min(len(self.left), len(self.right))} "
                   "pair(s)")
         self._len = min(len(self.left), len(self.right))
-        self.timestamps_real = (self.left.timestamps_real
-                                and self.right.timestamps_real)
+        self._pair_ts = [self.left.frames[i]["timestamp_ns"]
+                         for i in range(self._len)]
+        self._pair_map = {"left": list(range(self._len)),
+                          "right": list(range(self._len))}
         self.files_left = self.left.files[:self._len]
         self.files_right = self.right.files[:self._len]
-        # `.files` (left side) keeps mono call sites (source label, YOLO
-        # export) working unchanged.
-        self.files = self.files_left
         # Filename-equality guard: pairing is positional, but if the
         # basenames don't match the user has almost certainly loaded
         # mismatched folders and all downstream labels will be shifted.
-        self.pairing_warning: Optional[str] = None
         if self._len > 0:
             mismatches = [
                 (i, os.path.basename(l), os.path.basename(r))
@@ -247,20 +290,50 @@ class StereoIndex:
     def __len__(self) -> int:
         return self._len
 
+    @property
+    def paired_timestamps(self) -> List[int]:
+        """The paired timeline: timestamps present on both sides, sorted
+        earliest-first (synthetic 1 ms steps in positional fallback mode)."""
+        return list(self._pair_ts)
+
     def _side(self, side: str) -> ImageFolderIndex:
         if side not in ("left", "right"):
             raise ValueError(f"side must be 'left' or 'right', got {side!r}")
         return self.left if side == "left" else self.right
 
     def frame_at(self, idx: int, side: str = "left") -> Dict[str, Any]:
-        return self._side(side).frame_at(idx)
+        # Report the PAIR index as frame_idx (not the side folder's own
+        # position — those diverge once unpaired frames are skipped), so
+        # COCO image records, discard marks and (frame_idx, side) lookups
+        # all speak the paired-timeline indexing the UI uses.
+        frame = dict(self._side(side).frame_at(self._pair_map[side][idx]))
+        frame["frame_idx"] = idx
+        return frame
 
     def decode_image(self, idx: int, side: str = "left") -> np.ndarray:
-        return self._side(side).decode_image(idx)
+        return self._side(side).decode_image(self._pair_map[side][idx])
 
     def find_idx_by_timestamp(self, ts_ns: int) -> int:
-        # Pairs share a timeline — the left side's lookup is authoritative.
-        return self.left.find_idx_by_timestamp(ts_ns)
+        # Both sides share the paired timeline; binary search the paired
+        # timestamps and snap to the nearest pair.
+        if not self._pair_ts:
+            return -1
+        lo, hi = 0, len(self._pair_ts) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            v = self._pair_ts[mid]
+            if v == ts_ns:
+                return mid
+            elif v < ts_ns:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if lo >= len(self._pair_ts):
+            return len(self._pair_ts) - 1
+        if hi < 0:
+            return 0
+        return lo if abs(self._pair_ts[lo] - ts_ns) < \
+                    abs(self._pair_ts[hi] - ts_ns) else hi
 
     def side_index(self, side: str) -> "StereoSideIndex":
         """A single-side view with the worker-facing mono interface."""

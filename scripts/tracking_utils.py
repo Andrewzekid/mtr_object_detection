@@ -220,6 +220,7 @@ def build_runtime_tracker_yaml(
     delta_t: int | None = None,
     proximity_thresh: float | None = None,
     appearance_thresh: float | None = None,
+    use_byte: bool | None = None,
 ) -> Path:
     """Merge CLI overrides into a copy of a tracker YAML for this run.
 
@@ -266,6 +267,8 @@ def build_runtime_tracker_yaml(
         cfg["proximity_thresh"] = float(proximity_thresh)
     if appearance_thresh is not None:
         cfg["appearance_thresh"] = float(appearance_thresh)
+    if use_byte is not None:
+        cfg["use_byte"] = bool(use_byte)
 
     with open(runtime_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)

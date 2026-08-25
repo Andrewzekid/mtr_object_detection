@@ -25,10 +25,14 @@
 #        input_dir           - source directory (with images/ and labels/ subdirs)
 #        output_dir          - destination for augmented images + labels
 #        augmentation_types  - list of: flip_horizontal, flip_vertical, rotate,
-#                              brightness, contrast, mosaic
+#                              brightness, contrast, hue, blur, resize, mosaic
 #        multiplier          - how many augmented copies per image (1-10)
 #        rotation_range      - (min_degrees, max_degrees) for rotate
 #        brightness_range    - (min_factor, max_factor) for brightness/contrast
+#        hue_range           - (min_degrees, max_degrees) hue shift for hue
+#        blur_range          - (min_kernel, max_kernel) odd ints for blur
+#        resize              - (width, height) target size for resize; labels
+#                              are normalized so they carry over unchanged
 #
 #    REQUIREMENTS:
 #        pip install opencv-python-headless numpy
@@ -65,6 +69,16 @@ class DataProcessor:
         self.multiplier = self.config.get("multiplier", 3)
         self.rotation_range = self.config.get("rotation_range", (-15, 15))
         self.brightness_range = self.config.get("brightness_range", (0.7, 1.3))
+        self.hue_range = self.config.get("hue_range", (-15, 15))
+        self.blur_range = self.config.get("blur_range", (3, 9))
+        self.resize = self.config.get("resize")  # (width, height) or None
+
+    @staticmethod
+    def _is_seg_label(label: List) -> bool:
+        """True for YOLO segmentation labels (class_id x1 y1 x2 y2 ...),
+        False for detection labels (class_id xc yc w h)."""
+        n = len(label) - 1
+        return n >= 6 and n % 2 == 0
     
     def get_image_files(self, directory: Optional[Path] = None) -> List[Path]:
         """Get all image files in a directory.
@@ -107,9 +121,11 @@ class DataProcessor:
         
         image_files = self.get_image_files()
         total = len(image_files)
-        
+
         if total == 0:
             return {"success": False, "error": "No images found in input directory"}
+
+        self._passthrough_aux_files()
         
         total_augmented = 0
         errors = []
@@ -182,6 +198,14 @@ class DataProcessor:
             "errors": errors,
             "output_dir": str(self.output_dir),
         }
+
+    def _passthrough_aux_files(self) -> None:
+        """Copy dataset-level sidecar files (currently ``classes.txt``)
+        unchanged into the output dir so downstream steps (split / yaml
+        generation) find them next to the augmented images."""
+        src = self.input_dir / "classes.txt"
+        if src.exists():
+            shutil.copy2(src, self.output_dir / "classes.txt")
     
     def _read_labels(self, img_file: Path, base_dir: Path) -> List[List]:
         """Read labels for an image file."""
@@ -322,22 +346,37 @@ class DataProcessor:
         rotation_range: Optional[Tuple[float, float]] = None,
         brightness_range: Optional[Tuple[float, float]] = None,
     ) -> Tuple[np.ndarray, List[List]]:
-        """Apply a single augmentation type to image and labels."""
+        """Apply a single augmentation type to image and labels.
+
+        Segmentation (polygon) labels are transformed point-by-point for
+        geometric augmentations (flip/rotate are mask-aware); photometric
+        ones (brightness/contrast/hue/blur) and resize leave the normalized
+        labels untouched."""
         rot_range = rotation_range or self.rotation_range
         bright_range = brightness_range or self.brightness_range
-        
+
         h, w = img.shape[:2]
         aug_img = img.copy()
         aug_labels = [label.copy() for label in labels]
-        
+
         if aug_type == "flip_horizontal":
             aug_img = cv2.flip(img, 1)
             for label in aug_labels:
-                label[1] = 1.0 - float(label[1])
+                if self._is_seg_label(label):
+                    # polygon: mirror every x coordinate
+                    for i in range(1, len(label), 2):
+                        label[i] = 1.0 - float(label[i])
+                else:
+                    label[1] = 1.0 - float(label[1])
         elif aug_type == "flip_vertical":
             aug_img = cv2.flip(img, 0)
             for label in aug_labels:
-                label[2] = 1.0 - float(label[2])
+                if self._is_seg_label(label):
+                    # polygon: mirror every y coordinate
+                    for i in range(2, len(label), 2):
+                        label[i] = 1.0 - float(label[i])
+                else:
+                    label[2] = 1.0 - float(label[2])
         elif aug_type == "rotate":
             angle = random.uniform(*rot_range)
             # Use true center (floating point) instead of integer division
@@ -353,7 +392,24 @@ class DataProcessor:
             factor = random.uniform(*bright_range)
             mean = np.mean(img, axis=(0, 1), keepdims=True)
             aug_img = np.clip(mean + factor * (img - mean), 0, 255).astype(np.uint8)
-        
+        elif aug_type == "hue":
+            # OpenCV hue channel is 0-179 (degrees / 2); wrap around.
+            shift = int(round(random.uniform(*self.hue_range) / 2))
+            if shift % 180:
+                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                hsv[:, :, 0] = (hsv[:, :, 0].astype(np.int16) + shift) % 180
+                aug_img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        elif aug_type == "blur":
+            kmin, kmax = int(self.blur_range[0]), int(self.blur_range[1])
+            k = random.randint(max(1, kmin), max(1, kmax)) | 1  # odd kernel
+            if k > 1:
+                aug_img = cv2.GaussianBlur(img, (k, k), 0)
+        elif aug_type == "resize":
+            if self.resize:
+                aug_img = cv2.resize(img, (int(self.resize[0]),
+                                           int(self.resize[1])))
+            # normalized labels are scale-invariant — nothing to update
+
         return aug_img, aug_labels
     
     def apply_mosaic(
@@ -375,45 +431,31 @@ class DataProcessor:
         mosaic[h:mosaic_h, 0:w] = images[2]
         mosaic[h:mosaic_h, w:mosaic_w] = images[3]
         
-        # Combine and adjust labels
+        # Combine and adjust labels. Quadrant transform (normalized coords):
+        # x' = x/2 + dx, y' = y/2 + dy — applied per point for polygons,
+        # or to (xc, yc, w, h) for detection boxes.
+        def _quadrant_labels(labels: List[List], dx: float, dy: float):
+            out = []
+            for label in labels:
+                new_label = label.copy()
+                if self._is_seg_label(label):
+                    for i in range(1, len(new_label), 2):
+                        new_label[i] = float(label[i]) / 2.0 + dx
+                        new_label[i + 1] = float(label[i + 1]) / 2.0 + dy
+                else:
+                    new_label[1] = float(label[1]) / 2.0 + dx  # x_center
+                    new_label[2] = float(label[2]) / 2.0 + dy  # y_center
+                    new_label[3] = float(label[3]) / 2.0       # width
+                    new_label[4] = float(label[4]) / 2.0       # height
+                out.append(new_label)
+            return out
+
         combined_labels = []
-        
-        # Top-left quadrant (image 0) - labels stay the same
-        for label in labels_list[0]:
-            new_label = label.copy()
-            new_label[1] = float(label[1]) / 2.0  # x_center / 2
-            new_label[2] = float(label[2]) / 2.0  # y_center / 2
-            new_label[3] = float(label[3]) / 2.0  # width / 2
-            new_label[4] = float(label[4]) / 2.0  # height / 2
-            combined_labels.append(new_label)
-        
-        # Top-right quadrant (image 1)
-        for label in labels_list[1]:
-            new_label = label.copy()
-            new_label[1] = 0.5 + float(label[1]) / 2.0
-            new_label[2] = float(label[2]) / 2.0
-            new_label[3] = float(label[3]) / 2.0
-            new_label[4] = float(label[4]) / 2.0
-            combined_labels.append(new_label)
-        
-        # Bottom-left quadrant (image 2)
-        for label in labels_list[2]:
-            new_label = label.copy()
-            new_label[1] = float(label[1]) / 2.0
-            new_label[2] = 0.5 + float(label[2]) / 2.0
-            new_label[3] = float(label[3]) / 2.0
-            new_label[4] = float(label[4]) / 2.0
-            combined_labels.append(new_label)
-        
-        # Bottom-right quadrant (image 3)
-        for label in labels_list[3]:
-            new_label = label.copy()
-            new_label[1] = 0.5 + float(label[1]) / 2.0
-            new_label[2] = 0.5 + float(label[2]) / 2.0
-            new_label[3] = float(label[3]) / 2.0
-            new_label[4] = float(label[4]) / 2.0
-            combined_labels.append(new_label)
-        
+        combined_labels += _quadrant_labels(labels_list[0], 0.0, 0.0)
+        combined_labels += _quadrant_labels(labels_list[1], 0.5, 0.0)
+        combined_labels += _quadrant_labels(labels_list[2], 0.0, 0.5)
+        combined_labels += _quadrant_labels(labels_list[3], 0.5, 0.5)
+
         return mosaic, combined_labels
     
     def get_statistics(

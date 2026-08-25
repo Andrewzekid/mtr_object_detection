@@ -50,6 +50,14 @@ from collections import defaultdict
 import json
 
 
+def _at(arr, i) -> float:
+    """float(arr[i]) or 0.0 when the array/element is unavailable."""
+    try:
+        return float(arr[i])
+    except (TypeError, IndexError, ValueError, KeyError):
+        return 0.0
+
+
 class ModelEvaluator:
     """Class for evaluating trained models (detection and segmentation)."""
 
@@ -207,45 +215,58 @@ class ModelEvaluator:
         # Get class names
         class_names = self._extract_class_names(results, self.model)
 
-        # Extract per-class metrics
+        # Extract per-class box metrics (precision / recall / F1 / AP50 / AP50-95)
         per_class = {}
-        if hasattr(results.box, 'ap50_values') and results.box.ap50_values:
-            for i, ap50 in enumerate(results.box.ap50_values):
+        box = results.box if hasattr(results, 'box') else None
+        if box is not None:
+            box_arrays = [getattr(box, a, None) for a in ('p', 'r', 'f1', 'ap50', 'ap')]
+            n_box = max([len(a) for a in box_arrays
+                         if a is not None and hasattr(a, '__len__')] or [0])
+            for i in range(max(n_box, len(class_names))):
                 class_name = class_names.get(i, f"class_{i}")
+                prec = _at(getattr(box, 'p', None), i)
+                rec = _at(getattr(box, 'r', None), i)
+                f1 = _at(getattr(box, 'f1', None), i)
+                if f1 == 0 and (prec + rec) > 0:
+                    f1 = 2 * prec * rec / (prec + rec)
+                ap50 = _at(getattr(box, 'ap50', None), i)
                 per_class[class_name] = {
-                    "AP50": float(ap50) if ap50 is not None else 0,
-                    "mAP50": float(ap50) if ap50 is not None else 0,
+                    "precision": prec,
+                    "recall": rec,
+                    "f1": f1,
+                    "AP50": ap50,
+                    "mAP50": ap50,  # backward-compat key
+                    "AP50_95": _at(getattr(box, 'ap', None), i),
                 }
-        elif hasattr(results.box, 'ap50') and results.box.ap50:
-            for cls_idx, ap_val in results.box.ap50.items():
-                class_name = class_names.get(int(cls_idx), f"class_{cls_idx}")
-                per_class[class_name] = {
-                    "AP50": float(ap_val) if ap_val is not None else 0,
-                    "mAP50": float(ap_val) if ap_val is not None else 0,
-                }
-        else:
-            for cls_idx, class_name in class_names.items():
-                per_class[class_name] = {"AP50": 0.0, "mAP50": 0.0}
 
-        # For segmentation, also extract per-class mask AP50
-        if self.task_type == 'segment':
+        # For segmentation, also extract per-class mask metrics
+        if self.task_type == 'segment' and hasattr(results, 'seg') and results.seg is not None:
             seg = results.seg
-            if hasattr(seg, 'ap50_values') and seg.ap50_values:
-                for i, ap50 in enumerate(seg.ap50_values):
-                    class_name = class_names.get(i, f"class_{i}")
-                    if class_name in per_class:
-                        per_class[class_name]["mask_AP50"] = float(ap50) if ap50 is not None else 0
-                    else:
-                        per_class[class_name] = {
-                            "AP50": 0,
-                            "mAP50": 0,
-                            "mask_AP50": float(ap50) if ap50 is not None else 0,
-                        }
+            seg_arrays = [getattr(seg, a, None) for a in ('p', 'r', 'f1', 'ap50', 'ap')]
+            n_seg = max([len(a) for a in seg_arrays
+                         if a is not None and hasattr(a, '__len__')] or [0])
+            for i in range(max(n_seg, len(per_class))):
+                class_name = class_names.get(i, f"class_{i}")
+                entry = per_class.setdefault(class_name, {
+                    "precision": 0.0, "recall": 0.0, "f1": 0.0,
+                    "AP50": 0.0, "mAP50": 0.0, "AP50_95": 0.0,
+                })
+                mp = _at(getattr(seg, 'p', None), i)
+                mr = _at(getattr(seg, 'r', None), i)
+                mf1 = _at(getattr(seg, 'f1', None), i)
+                if mf1 == 0 and (mp + mr) > 0:
+                    mf1 = 2 * mp * mr / (mp + mr)
+                entry["mask_precision"] = mp
+                entry["mask_recall"] = mr
+                entry["mask_f1"] = mf1
+                entry["mask_AP50"] = _at(getattr(seg, 'ap50', None), i)
+                entry["mask_AP50_95"] = _at(getattr(seg, 'ap', None), i)
 
         return {
             "success": True,
             "metrics": metrics,
             "per_class": per_class,
+            "class_names": class_names,
             "task_type": self.task_type,
             "results": results,
         }

@@ -35,6 +35,13 @@ USAGE:
         --yolo-model runs/detect/.../weights/best.pt \\
         --sam3-model core/sam3/models/sam3-model/sam3.pt \\
         --data MTR_dataset --output output/tracking/detect_then_sam3
+
+    # Per-class confidence: 0.4 for all classes except Sprinkler (floor 0.1)
+    python scripts/11_run_tracking.py --tracker deepocsort \\
+        --model runs/segment/.../weights/best.pt \\
+        --data HKU_GH_left --output output/tracking/hku_gh_left \\
+        --conf 0.4 --conf-exempt-class 'Sprinkler -on the ceiling-' \\
+        --conf-exempt-min 0.1 --imgsz 768
 """
 
 import argparse
@@ -157,6 +164,38 @@ def process_frame(result, img_h, img_w, image_id, annotation_id, class_names):
     return annotated_frame, annotations, annotation_id
 
 
+def _install_per_class_conf_filter(model, exempt_ids, conf_default):
+    """Filter detections per class BEFORE the tracker sees them.
+
+    Inserts a callback at the front of ``on_predict_postprocess_end`` (i.e.
+    before ultralytics' tracker update) that drops detections with
+    conf < conf_default unless their class is in ``exempt_ids`` — those are
+    kept down to the model-level confidence floor. Boxes and masks are
+    filtered together so indices stay aligned.
+    """
+    import torch
+    from ultralytics.engine.results import Masks
+
+    exempt = torch.tensor(sorted(exempt_ids), dtype=torch.float32)
+
+    def _filter(predictor):
+        for r in predictor.results:
+            if r.boxes is None or len(r.boxes) == 0:
+                continue
+            keep = r.boxes.conf >= conf_default
+            if len(exempt_ids):
+                keep = keep | torch.isin(r.boxes.cls, exempt.to(r.boxes.cls.device))
+            if bool(keep.all()):
+                continue
+            r.boxes = r.boxes[keep]
+            if r.masks is not None and len(r.masks.data):
+                r.masks = Masks(r.masks.data[keep], r.orig_shape)
+
+    model.callbacks["on_predict_postprocess_end"].insert(0, _filter)
+    print(f"Per-class conf filter: conf>={conf_default} for all classes except "
+          f"ids {sorted(exempt_ids)} (kept down to model floor)")
+
+
 def _build_tracker_yaml(args, output_dir: Path):
     """Return the path to a runtime tracker YAML for the requested tracker.
 
@@ -194,6 +233,7 @@ def _build_tracker_yaml(args, output_dir: Path):
         delta_t=getattr(args, "delta_t", None),
         proximity_thresh=getattr(args, "proximity_thresh", None),
         appearance_thresh=getattr(args, "appearance_thresh", None),
+        use_byte=getattr(args, "use_byte", None) or None,
     )
     reid_str = f", reid={args.with_reid}" if args.tracker in ("botsort", "deepocsort") else ""
     print(f"{args.tracker.upper()}: cmc={args.with_cmc} ({args.cmc_method}), buffer={args.track_buffer}{reid_str}")
@@ -282,17 +322,36 @@ def run_standard_tracking(args):
     print(f"Output:    {output_dir}")
     print(f"conf={args.conf}, iou={args.iou}, imgsz={args.imgsz}")
 
+    # Load model
+    model = YOLO(str(model_path))
+    class_names = model.names if hasattr(model, "names") else {}
+    categories = [{"id": int(cid), "name": name} for cid, name in class_names.items()]
+
+    # Per-class confidence exemption: keep low-confidence detections of one
+    # class (e.g. Sprinkler) down to --conf-exempt-min while all other classes
+    # need conf >= --conf. Tracker spawn/association thresholds are dropped to
+    # the floor so exempted low-conf detections can also start new tracks.
+    if args.conf_exempt_class:
+        exempt_ids = {i for i, n in class_names.items() if n == args.conf_exempt_class}
+        if not exempt_ids:
+            print(f"WARNING: class {args.conf_exempt_class!r} not in model names "
+                  f"{list(class_names.values())} — exemption ignored")
+        else:
+            conf_default = args.conf
+            args.conf = min(args.conf, args.conf_exempt_min)
+            args.track_high_thresh = min(args.track_high_thresh, args.conf)
+            args.new_track_thresh = min(args.new_track_thresh, args.conf)
+            _install_per_class_conf_filter(model, exempt_ids, conf_default)
+            print(f"Exempt class {args.conf_exempt_class!r}: floor {args.conf}, "
+                  f"others conf>={conf_default}; "
+                  f"tracker track_high/new_track thresh -> {args.conf}")
+
     # Resolve tracker configuration
     tracker_yaml = _build_tracker_yaml(args, output_dir)
 
     # If a DINO ReID model was requested, patch ultralytics' build_encoder so
     # BoT-SORT picks up our DinoReIDEncoder. Must happen before model.track().
     _install_dino_reid(args)
-
-    # Load model
-    model = YOLO(str(model_path))
-    class_names = model.names if hasattr(model, "names") else {}
-    categories = [{"id": int(cid), "name": name} for cid, name in class_names.items()]
 
     image_files = find_image_files(data_path)
     if args.max_frames is not None:
@@ -894,6 +953,20 @@ def parse_args():
         help="Directory to save tracking results",
     )
     parser.add_argument("--conf", type=float, default=0.5, help="Detection confidence threshold")
+    parser.add_argument(
+        "--conf-exempt-class",
+        type=str,
+        default=None,
+        help="Class name exempt from --conf: its detections are kept down to "
+             "--conf-exempt-min and can spawn tracks at any confidence. "
+             "E.g. --conf 0.4 --conf-exempt-class 'Sprinkler -on the ceiling-'",
+    )
+    parser.add_argument(
+        "--conf-exempt-min",
+        type=float,
+        default=0.1,
+        help="Confidence floor for --conf-exempt-class detections (default: 0.1)",
+    )
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold")
     parser.add_argument("--imgsz", type=int, default=640, help="Inference image size")
     parser.add_argument("--fps", type=int, default=10, help="Output video FPS")
@@ -929,6 +1002,16 @@ def parse_args():
     parser.add_argument("--track-buffer", type=int, default=30, help="Lost-track buffer (frames to keep lost tracks alive)")
     parser.add_argument("--track-high-thresh", type=float, default=0.5, help="First-stage association threshold")
     parser.add_argument("--with-reid", action="store_true", default=False, help="Enable ReID (BoT-SORT / Deep OC-SORT)")
+    parser.add_argument(
+        "--use-byte",
+        action="store_true",
+        default=False,
+        help="Enable ByteTrack-style second association pass so detections "
+             "between track_low_thresh and track_high_thresh can extend "
+             "existing tracks (OC-SORT / Deep OC-SORT). Useful with a low "
+             "--conf floor: new tracks still spawn only from "
+             ">= --track-high-thresh detections.",
+    )
     # Deep OC-SORT specific knobs
     parser.add_argument(
         "--match-thresh",
