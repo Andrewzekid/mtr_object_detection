@@ -362,6 +362,10 @@ def main():
                              "cpu).")
     parser.add_argument("--sam3-conf", type=float, default=0.25,
                         help="SAM3 confidence threshold (default: 0.25).")
+    parser.add_argument("--propagate-model", default=None,
+                        help="Path to SAM3 weights used only by 'Propagate →' "
+                             "(e.g. core/sam3/models/sam3.1-model/"
+                             "sam3.1_multiplex.pt). Defaults to --sam3-model.")
     parser.add_argument("--auto-segment", action="store_true",
                         help="Automatically run SAM3 after each new bbox is drawn.")
     # Interpolation options (I key / Interpolate button)
@@ -424,6 +428,9 @@ def main():
         print(f"⚠️ config sam3.propagate_method {propagate_method!r} "
               "invalid; using 'memory'")
         propagate_method = "memory"
+    propagate_model = (sam3_cfg.get("propagate_model") or args.propagate_model)
+    if propagate_model:
+        print(f"🚀 Propagate model: {propagate_model}")
 
     # ---------- 1. Index the frame source ----------
     if args.images_right and not args.images:
@@ -515,6 +522,8 @@ def main():
                        sam3_model=sam3_cfg.get("model") or args.sam3_model,
                        sam3_device=sam3_device,
                        sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),
+                       propagate_model=(sam3_cfg.get("propagate_model")
+                                        or args.propagate_model),
                        propagate_method=propagate_method,
                        propagate_min_iou=float(sam3_cfg.get(
                            "propagate_min_iou", 0.3)),

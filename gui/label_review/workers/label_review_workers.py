@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 
+import numpy as np
+
 
 # SAM3 (optional — core.models_inference.run_sam3)
 _SAM3_AVAILABLE = False
@@ -102,6 +104,97 @@ class SAM3Worker(QThread):
             self.cancelled_signal.emit()
             return
         self.finished_signal.emit(results)
+
+
+class SAM3PointWorker(QThread):
+    """One-shot SAM2-style point-prompt segmentation (single object).
+
+    Prompts SAM3 with positive/negative points and emits the resulting
+    mask + tight bbox. When `text` (the category name) is given, SAM3's
+    text-prompted semantic detection runs first and the points select which
+    instance to keep (falling back to pure point prompting when the text
+    run finds nothing there). Single predict call — no cooperative cancel
+    (like the single-frame autolabel worker, it finishes on its own).
+
+    Emits:
+      finished_signal(dict): {"bbox_xyxy": [x1,y1,x2,y2]|None,
+                              "mask": HxW bool array|None,
+                              "success": bool, "error": str|None}
+      failed_signal(str) on hard failure (SAM3 unavailable / exception).
+    """
+
+    finished_signal = pyqtSignal(dict)
+    failed_signal = pyqtSignal(str)
+
+    def __init__(self, image_path: str, points: list, labels: list,
+                 model_path: Optional[str], device: str, conf: float,
+                 text: Optional[str] = None, parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.points = points      # [[x, y], ...]
+        self.labels = labels      # 1 = positive, 0 = negative
+        self.model_path = model_path
+        self.device = device
+        self.conf = conf
+        self.text = text          # category name → text-guided instance pick
+
+    def run(self) -> None:  # noqa: D401 (QThread override)
+        if not _SAM3_AVAILABLE:
+            self.failed_signal.emit(
+                "SAM3 is not installed. Install ultralytics + segment-anything "
+                "and place model weights under core/sam3/models/sam3-model/sam3.pt"
+            )
+            return
+        pts = [list(p) for p in self.points]
+        device = self.device
+        try:
+            res = run_sam3(image_path=self.image_path, points=pts,
+                           point_labels=list(self.labels), text=self.text,
+                           model_path=self.model_path, device=device,
+                           conf=self.conf)
+        except Exception as e:
+            res = {"success": False, "error": str(e)}
+        # CUDA OOM → retry once on CPU (same policy as _segment_concepts).
+        if (not res.get("success") and device != "cpu"
+                and "out of memory" in str(res.get("error", "")).lower()):
+            print("⚠️ SAM3 CUDA OOM — retrying point segment on CPU")
+            device = "cpu"
+            try:
+                res = run_sam3(image_path=self.image_path, points=pts,
+                               point_labels=list(self.labels), text=self.text,
+                               model_path=self.model_path, device=device,
+                               conf=self.conf)
+            except Exception as e2:
+                res = {"success": False, "error": str(e2)}
+
+        if not res.get("success"):
+            self.finished_signal.emit({
+                "bbox_xyxy": None, "mask": None, "success": False,
+                "error": res.get("error", "SAM3 failed"),
+            })
+            return
+
+        masks = res.get("masks", []) or []
+        dets = res.get("detections", []) or []
+        if not masks:
+            self.finished_signal.emit({
+                "bbox_xyxy": None, "mask": None, "success": False,
+                "error": "no mask returned for this point",
+            })
+            return
+        mask = masks[0]
+        bbox_xyxy = None
+        if dets and dets[0].get("bbox") is not None:
+            bbox_xyxy = [float(v) for v in dets[0]["bbox"]]
+        else:
+            ys, xs = np.where(mask)
+            if len(xs):
+                bbox_xyxy = [float(xs.min()), float(ys.min()),
+                             float(xs.max()), float(ys.max())]
+        self.finished_signal.emit({
+            "bbox_xyxy": bbox_xyxy, "mask": mask, "success": True,
+            "error": None,
+        })
 
 
 def _iou_xyxy(a: List[float], b: List[float]) -> float:
@@ -671,41 +764,68 @@ class SAM3PropagateWorker(QThread):
         video source (a frames folder loads as mode="image" and fails
         init_state's assert), so the range is materialized as an mp4 — the
         same thing scripts/track_sam3_video.py does.
+
+        Decoding runs in a small thread pool so JPEG/PNG decode of upcoming
+        frames overlaps the mp4 encode of the current one (the pool map is
+        ordered and bounded, so frame order and memory stay bounded) — on
+        4K frames this roughly halves the clip-build phase.
         """
         import cv2  # lazy: only needed on this path
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _read_bgr(frame_idx: int):
+            frame = self.frame_index.frame_at(frame_idx)
+            img_path = frame.get("file_path")
+            bgr = (cv2.imread(str(img_path))
+                   if img_path and os.path.exists(img_path) else None)
+            if bgr is None:
+                arr = self.frame_index.decode_image(frame_idx)  # RGB
+                bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            return frame_idx, bgr
+
         writer = None
         total = n_frames - self.start_frame_idx
         try:
-            for frame_idx in range(self.start_frame_idx, n_frames):
-                if self._cancel_requested:
-                    return False
-                frame = self.frame_index.frame_at(frame_idx)
-                img_path = frame.get("file_path")
-                bgr = (cv2.imread(str(img_path))
-                       if img_path and os.path.exists(img_path) else None)
-                if bgr is None:
-                    arr = self.frame_index.decode_image(frame_idx)  # RGB
-                    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                if writer is None:
-                    h, w = bgr.shape[:2]
-                    writer = cv2.VideoWriter(
-                        video_path, cv2.VideoWriter_fourcc(*"mp4v"), 30,
-                        (w, h))
-                    if not writer.isOpened():
-                        raise RuntimeError(
-                            f"could not open {video_path} for writing")
-                else:
-                    fh, fw = bgr.shape[:2]
-                    if (fw, fh) != (w, h):
-                        raise RuntimeError(
-                            f"frame {frame_idx} size ({fw}x{fh}) does not "
-                            f"match clip size ({w}x{h})")
-                writer.write(bgr)
-                # Building the clip is the long silent phase — report it
-                # (throttled: every 10 frames, plus first and last).
-                done = frame_idx - self.start_frame_idx + 1
-                if done == 1 or done == total or done % 10 == 0:
-                    self.stage_signal.emit(f"building clip {done}/{total}…")
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                # Bounded read-ahead window: at most 8 decoded frames in
+                # flight (4K ≈ 25MB each), consumed strictly in order.
+                pending = deque()
+                idx_iter = iter(range(self.start_frame_idx, n_frames))
+
+                def _submit_next():
+                    try:
+                        pending.append(ex.submit(_read_bgr, next(idx_iter)))
+                    except StopIteration:
+                        pass
+
+                for _ in range(8):
+                    _submit_next()
+                while pending:
+                    frame_idx, bgr = pending.popleft().result()
+                    _submit_next()
+                    if self._cancel_requested:
+                        return False
+                    if writer is None:
+                        h, w = bgr.shape[:2]
+                        writer = cv2.VideoWriter(
+                            video_path, cv2.VideoWriter_fourcc(*"mp4v"), 30,
+                            (w, h))
+                        if not writer.isOpened():
+                            raise RuntimeError(
+                                f"could not open {video_path} for writing")
+                    else:
+                        fh, fw = bgr.shape[:2]
+                        if (fw, fh) != (w, h):
+                            raise RuntimeError(
+                                f"frame {frame_idx} size ({fw}x{fh}) does not "
+                                f"match clip size ({w}x{h})")
+                    writer.write(bgr)
+                    # Building the clip is the long silent phase — report it
+                    # (throttled: every 10 frames, plus first and last).
+                    done = frame_idx - self.start_frame_idx + 1
+                    if done == 1 or done == total or done % 10 == 0:
+                        self.stage_signal.emit(f"building clip {done}/{total}…")
         finally:
             if writer is not None:
                 writer.release()
@@ -740,6 +860,10 @@ class SAM3PropagateWorker(QThread):
                     [list(s["bbox_xyxy"]) for s in self.seeds],
                     model_path=self.model_path, device=self.device,
                     conf=self.conf,
+                    # FP16 on GPU (~2x faster per frame, same policy as
+                    # scripts/11_run_tracking.py --half); FP32 on CPU where
+                    # half precision would be slower.
+                    quantize=(16 if str(self.device) != "cpu" else None),
                     is_cancelled=lambda: self._cancel_requested):
                 if self._cancel_requested:
                     self.cancelled_signal.emit()
@@ -972,7 +1096,7 @@ class InterpBatchWorker(QThread):
 
 _OWLV2_AVAILABLE = False
 try:
-    from core.owlv2_detector import owlv2_detect  # type: ignore[import-not-found]
+    from core.detectors import owlv2_detect  # type: ignore[import-not-found]
     _OWLV2_AVAILABLE = True
 except Exception as _owlv2_import_err:
     owlv2_detect = None  # type: ignore[assignment]
@@ -1005,7 +1129,7 @@ class Owlv2AutolabelWorker(QThread):
 
     def run(self) -> None:  # noqa: D401 (QThread override)
         if not _OWLV2_AVAILABLE:
-            self.failed_signal.emit("OWLv2 (core.owlv2_detector) is not "
+            self.failed_signal.emit("OWLv2 (core.detectors) is not "
                                     "importable.")
             return
         try:
@@ -1056,7 +1180,7 @@ class Owlv2AutolabelBatchWorker(QThread):
 
     def run(self) -> None:  # noqa: D401 (QThread override)
         if not _OWLV2_AVAILABLE:
-            self.failed_signal.emit("OWLv2 (core.owlv2_detector) is not "
+            self.failed_signal.emit("OWLv2 (core.detectors) is not "
                                     "importable.")
             return
         os.makedirs(self.tmp_dir, exist_ok=True)
@@ -1110,16 +1234,16 @@ def _generic_detect(detector: str, img, concepts: List[str],
     exceptions so the worker can report them via failed_signal.
     """
     if detector == "grounding_dino":
-        from core.grounding_dino_detector import grounding_dino_detect
+        from core.detectors import grounding_dino_detect
         return grounding_dino_detect(img, concepts, model_id=model_id,
                                      device=device, box_threshold=conf,
                                      _state=state)
     if detector == "florence2":
-        from core.florence2_detector import florence2_detect
+        from core.detectors import florence2_detect
         return florence2_detect(img, concepts, model_id=model_id,
                                 device=device, _state=state)
     if detector == "falcon":
-        from core.falcon_detector import falcon_detect
+        from core.detectors import falcon_detect
         return falcon_detect(img, concepts, model_id=model_id,
                              device=device, _state=state)
     raise ValueError(f"Unknown autolabel detector backend: {detector}")
@@ -1254,10 +1378,10 @@ class Owlv2ExemplarWorker(QThread):
 
     def run(self) -> None:  # noqa: D401 (QThread override)
         if not _OWLV2_AVAILABLE:
-            self.failed_signal.emit("OWLv2 (core.owlv2_detector) is not "
+            self.failed_signal.emit("OWLv2 (core.detectors) is not "
                                     "importable.")
             return
-        from core.owlv2_detector import owlv2_detect_exemplar
+        from core.detectors import owlv2_detect_exemplar
         try:
             dets = owlv2_detect_exemplar(
                 self.image_path, self.exemplar, self.label,
@@ -1305,10 +1429,10 @@ class Owlv2ExemplarBatchWorker(QThread):
 
     def run(self) -> None:  # noqa: D401 (QThread override)
         if not _OWLV2_AVAILABLE:
-            self.failed_signal.emit("OWLv2 (core.owlv2_detector) is not "
+            self.failed_signal.emit("OWLv2 (core.detectors) is not "
                                     "importable.")
             return
-        from core.owlv2_detector import owlv2_detect_exemplar
+        from core.detectors import owlv2_detect_exemplar
         os.makedirs(self.tmp_dir, exist_ok=True)
         state: Dict[str, Any] = {}  # cached model + device fallback
         total_dets = 0

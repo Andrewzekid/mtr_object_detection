@@ -10,6 +10,36 @@ Supports multiple trackers and model tasks:
 Works with both YOLO detection and segmentation models; segmentation masks are
 exported as COCO polygons when available.
 
+An extra class-agnostic NMS pass (--nms-iou, default 0.5) runs on the raw
+detections BEFORE the tracker: boxes overlapping a higher-confidence box with
+IoU above the threshold are dropped regardless of class, so the same object
+can't be tracked twice (ultralytics' own --iou NMS is class-aware and can
+leave cross-class duplicates). Pass --nms-iou 1.0 to disable.
+
+CPU post-processing (contour extraction, tracked-frame writes) runs in a
+thread pool (--postprocess-workers, default 4) overlapping the next frame's
+GPU inference; --no-masks skips polygon extraction entirely when only
+boxes/track-ids are needed.
+
+Speed knobs, in order of impact (profiled: raw GPU forward is only ~25% of
+per-frame time — ultralytics' per-call Python/pre/post overhead and CPU
+post-processing dominate):
+    --no-vis            skip plotting/frames entirely (biggest win)
+    --detect-batch N    one batched forward per N frames (4-8); tracking
+                        stays sequential/stateful, results match N=1
+    --mask-max-dim      contour resolution cap (masks are pre-scaled on the
+                        GPU before the D2H transfer; TRK_NO_GPU_PRESCALE=1
+                        reverts to CPU-side resizing)
+    --half / --trt      faster model stage
+
+--trt exports the --model .pt to a TensorRT engine once (FP16, at --imgsz)
+and tracks with the engine; the cached .engine next to the checkpoint is
+reused on later runs. It only accelerates the model-inference stage, so the
+end-to-end gain depends on how inference-bound the run is (measured on
+HKU_GH, yolo26l-seg @ 768, light scenes: ~7% wall-clock; bigger on
+detection-heavy scenes). Same settings as scripts/15_export_trt.py. Delete
+the .engine after changing --imgsz.
+
 USAGE:
     python scripts/11_run_tracking.py \\
     --tracker botsort \\
@@ -18,6 +48,12 @@ USAGE:
     --conf 0.5 --device 0 \\
     --warmup-frames 3 \\
     --output output/tracking/iw/IWrun2
+
+    # TensorRT engine (export once, reuse after)
+    python scripts/11_run_tracking.py --tracker deepocsort \\
+        --model runs/segment/.../weights/best.pt \\
+        --data HKU_GH_left --output output/tracking/hku_gh_left \\
+        --trt --imgsz 768 --no-vis
     
     # ByteTrack on segmentation model
     python scripts/11_run_tracking.py --tracker bytetrack \\
@@ -45,20 +81,18 @@ USAGE:
 """
 
 import argparse
+import os
 import json
+import queue
 import sys
+import threading
 import time
-import warnings
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
-
-# Suppress noisy Ultralytics deprecation warnings for the still-functional
-# ``half`` argument so benchmark output stays readable.
-warnings.filterwarnings("ignore", message=".*half.*deprecated.*", category=FutureWarning)
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -81,17 +115,107 @@ from scripts.tracking_utils import (
 # Standard Tracking (ByteTrack / BoT-SORT)
 # =============================================================================
 
-def process_frame(result, img_h, img_w, image_id, annotation_id, class_names):
-    """Extract COCO annotations and annotated frame from a tracking result."""
+class _FramePrefetcher:
+    """Background cv2.imread loader so JPEG decode overlaps GPU inference."""
+
+    _SENTINEL = object()
+
+    def __init__(self, paths, buffer=8):
+        self._q = queue.Queue(maxsize=buffer)
+        self._t = threading.Thread(target=self._run, args=(paths,), daemon=True)
+        self._t.start()
+
+    def _run(self, paths):
+        for p in paths:
+            self._q.put((p, cv2.imread(str(p))))
+        self._q.put(self._SENTINEL)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._q.get()
+        if item is self._SENTINEL:
+            raise StopIteration
+        return item
+
+
+def _result_is_cpu(result) -> bool:
+    """True when the result's tensors already live on the CPU."""
+    try:
+        if result.boxes is not None and result.boxes.xyxy.is_cuda:
+            return False
+        if getattr(result, "masks", None) is not None \
+                and result.masks.data.is_cuda:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _mask_scale_for(img_h: int, img_w: int, mask_max_dim: int):
+    """Shared contour-extraction downscale math: (scale, target_w, target_h).
+
+    Used both by the GPU pre-downscale fast path (_prescale_masks_on_gpu)
+    and process_frame's CPU fallback, so both agree on the target size.
+    """
+    scale = 1.0
+    if mask_max_dim and max(img_h, img_w) > mask_max_dim:
+        scale = mask_max_dim / max(img_h, img_w)
+    return (scale, max(1, round(img_w * scale)),
+            max(1, round(img_h * scale)))
+
+
+def _prescale_masks_on_gpu(result, target_w: int, target_h: int) -> bool:
+    """Downscale the result's mask stack ON THE GPU to (target_h, target_w).
+
+    The mask tensor can dominate the GPU->CPU payload in dense scenes
+    (N x orig-H x orig-W floats), so shrinking on-device before the .cpu()
+    transfer cuts both PCIe traffic and the later CPU resize by scale^2.
+    Polygon coordinates are unaffected (process_frame scales them back by
+    1/scale). Set TRK_NO_GPU_PRESCALE=1 to disable (CPU-transfer fallback).
+
+    Returns True when masks were left at (or moved to) the target size.
+    """
+    try:
+        if result is None or getattr(result, "masks", None) is None:
+            return False
+        data = result.masks.data
+        if not data.is_cuda or data.ndim != 3:
+            return False
+        if tuple(data.shape[1:]) == (target_h, target_w):
+            return True
+        import torch.nn.functional as F
+        x = data[:, None].float()  # (N,H,W) -> (N,1,H,W)
+        x = F.interpolate(x, size=(target_h, target_w),
+                          mode="bilinear", align_corners=False)
+        result.masks.data = x[:, 0]
+        return True
+    except Exception:
+        return False
+
+
+def process_frame(result, img_h, img_w, image_id, annotation_id, class_names,
+                  vis=True, mask_max_dim=1024, no_masks=False):
+    """Extract COCO annotations and annotated frame from a tracking result.
+
+    With vis=False, skip result.plot() entirely (returns annotated_frame=None).
+    mask_max_dim caps the mask resolution used for contour extraction — the
+    polygon coordinates are scaled back to full image size, so accuracy loss
+    is negligible while findContours runs far below 4K cost. 0 disables.
+    no_masks skips mask contour extraction entirely (boxes/track-ids only).
+    """
     annotated_frame = None
     annotations = []
 
-    if result is not None:
+    if result is not None and vis:
         # Move result tensors to CPU before plotting to avoid GPU OOM from
         # the mask rendering path in result.plot() (which does cumulative
         # alpha compositing on the GPU and can exhaust memory on large frames
-        # or when another process shares the GPU).
-        result = result.cpu()
+        # or when another process shares the GPU). Skip the transfer when the
+        # caller already moved the result off the GPU (postprocess-pool path).
+        if not _result_is_cpu(result):
+            result = result.cpu()
         annotated_frame = result.plot()
 
     if (
@@ -106,10 +230,44 @@ def process_frame(result, img_h, img_w, image_id, annotation_id, class_names):
         class_ids = result.boxes.cls.cpu().numpy().astype(int)
 
         has_masks = (
-            hasattr(result, "masks")
+            not no_masks
+            and hasattr(result, "masks")
             and result.masks is not None
             and len(result.masks) > 0
         )
+
+        # Contours are extracted at (img_w, img_h) scaled down so the largest
+        # side is <= mask_max_dim; polygon coords are divided back by `scale`.
+        # When the main loop already pre-scaled the masks on the GPU
+        # (_prescale_masks_on_gpu), the shape check below is a no-op.
+        scale, target_w, target_h = _mask_scale_for(img_h, img_w,
+                                                    mask_max_dim)
+
+        # Vectorized mask preparation: ONE GPU->CPU transfer for all masks,
+        # one batched resize of the full stack (cv2.resize treats trailing
+        # dims as channels), and one vectorized binarization + area sum.
+        masks_np = None
+        areas_vec = None
+        if has_masks:
+            data = result.masks.data
+            n_masks = min(len(track_ids), len(data))
+            m = data[:n_masks].cpu().numpy().astype(np.float32)
+            if m.ndim == 2:
+                m = m[None]
+            if m.shape[1:] != (target_h, target_w):
+                # (N,H,W) -> (H,W,N) channels-last for a single resize call.
+                m = cv2.resize(
+                    m.transpose(1, 2, 0), (target_w, target_h),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                if m.ndim == 2:
+                    m = m[:, :, None]
+                m = m.transpose(2, 0, 1)
+            masks_np = m
+            mask_binary_all = (masks_np > 0.5)
+            # Per-mask pixel counts in one pass; scaled back to full res.
+            areas_vec = mask_binary_all.sum(axis=(1, 2)).astype(np.float64) \
+                / (scale * scale)
 
         for i in range(len(track_ids)):
             x1, y1, x2, y2 = boxes_xyxy[i]
@@ -122,24 +280,23 @@ def process_frame(result, img_h, img_w, image_id, annotation_id, class_names):
             confidence = float(confidences[i])
 
             segmentation = []
-            if has_masks and i < len(result.masks.data):
-                mask = result.masks.data[i].cpu().numpy()
-                if mask.shape != (img_h, img_w):
-                    mask = cv2.resize(mask, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
-                mask_binary = (mask > 0.5).astype(np.uint8)
+            if masks_np is not None and i < len(masks_np):
+                mask_binary = masks_np[i] > 0.5
 
                 contours, _ = cv2.findContours(
-                    mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    mask_binary.astype(np.uint8), cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
                 )
                 segmentation_polygons = []
+                inv_scale = 1.0 / scale
                 for contour in contours:
                     if len(contour) >= 3:
-                        polygon = contour.flatten().tolist()
+                        polygon = (contour.flatten() * inv_scale).tolist()
                         segmentation_polygons.append(polygon)
 
                 if segmentation_polygons:
                     segmentation = segmentation_polygons
-                    area = float(np.sum(mask_binary))
+                    area = float(areas_vec[i])
 
             annotations.append({
                 "id": annotation_id,
@@ -154,12 +311,13 @@ def process_frame(result, img_h, img_w, image_id, annotation_id, class_names):
             })
             annotation_id += 1
 
-        unique_ids = np.unique(track_ids)
-        info_text = f"Tracker: result.boxes.id | Objects: {len(unique_ids)} | Tracks: {len(track_ids)}"
-        cv2.putText(
-            annotated_frame, info_text, (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
-        )
+        if annotated_frame is not None:
+            unique_ids = np.unique(track_ids)
+            info_text = f"Tracker: result.boxes.id | Objects: {len(unique_ids)} | Tracks: {len(track_ids)}"
+            cv2.putText(
+                annotated_frame, info_text, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
+            )
 
     return annotated_frame, annotations, annotation_id
 
@@ -196,6 +354,67 @@ def _install_per_class_conf_filter(model, exempt_ids, conf_default):
           f"ids {sorted(exempt_ids)} (kept down to model floor)")
 
 
+def _install_post_detection_nms(model, iou_thr):
+    """Extra class-agnostic NMS on raw detections BEFORE the tracker sees them.
+
+    Ultralytics' own NMS (--iou) is class-aware, so the same object can be
+    detected twice under different classes (or survive with near-duplicate
+    boxes just under the IoU cut). This pass drops any box overlapping a
+    higher-confidence box with IoU > iou_thr, regardless of class. Same
+    insertion point as the per-class conf filter: front of
+    ``on_predict_postprocess_end``, i.e. before the tracker update — so
+    duplicate detections cannot spawn duplicate tracks. Boxes and masks are
+    filtered together so indices stay aligned.
+    """
+    import torchvision
+    from ultralytics.engine.results import Masks
+
+    def _nms(predictor):
+        for r in predictor.results:
+            if r.boxes is None or len(r.boxes) < 2:
+                continue
+            keep = torchvision.ops.nms(r.boxes.xyxy, r.boxes.conf, iou_thr)
+            if len(keep) == len(r.boxes):
+                continue
+            r.boxes = r.boxes[keep]
+            if r.masks is not None and len(r.masks.data):
+                r.masks = Masks(r.masks.data[keep], r.orig_shape)
+
+    model.callbacks["on_predict_postprocess_end"].insert(0, _nms)
+    print(f"Post-detection NMS: class-agnostic, IoU > {iou_thr} keeps the "
+          f"higher-confidence box")
+
+
+def _resolve_trt_model(model_path: Path, args) -> Path:
+    """With --trt, export a .pt checkpoint to a TensorRT engine (or reuse the
+    cached one next to the checkpoint) and return the engine path.
+
+    Same export settings as scripts/15_export_trt.py: FP16, fixed --imgsz,
+    ONNX-simplified. Engines are GPU- and imgsz-specific — the cached engine
+    is reused blindly, so the user must delete it after changing --imgsz (a
+    note is printed either way).
+    """
+    if not args.trt or model_path.suffix != ".pt":
+        return model_path
+    engine = model_path.with_suffix(".engine")
+    if engine.exists():
+        print(f"TensorRT: reusing cached engine {engine}\n"
+              f"  (built for a fixed imgsz — delete it to re-export after "
+              f"changing --imgsz)")
+        return engine
+    print(f"TensorRT: exporting {model_path} -> {engine}\n"
+          f"  (FP16, imgsz={args.imgsz}, workspace={args.trt_workspace} GiB; "
+          f"one-time, a few minutes)…")
+    t0 = time.perf_counter()
+    YOLO(str(model_path)).export(
+        format="engine", half=True, imgsz=args.imgsz, device=0,
+        workspace=args.trt_workspace, simplify=True, verbose=False)
+    if not engine.exists():
+        raise RuntimeError(f"TensorRT export did not produce {engine}")
+    print(f"TensorRT: export done in {time.perf_counter() - t0:.0f}s")
+    return engine
+
+
 def _build_tracker_yaml(args, output_dir: Path):
     """Return the path to a runtime tracker YAML for the requested tracker.
 
@@ -224,6 +443,10 @@ def _build_tracker_yaml(args, output_dir: Path):
         cmc_method=args.cmc_method,
         track_buffer=args.track_buffer,
         track_high_thresh=args.track_high_thresh,
+        track_low_thresh=(args.conf_exempt_min
+                          if getattr(args, "use_byte", False)
+                          and getattr(args, "conf_exempt_class", None)
+                          else None),
         with_reid=args.with_reid,
         output_dir=output_dir,
         reid_model=getattr(args, "reid_model", None),
@@ -302,6 +525,11 @@ def _install_dino_reid(args):
     print(f"[ReID] Patched build_encoder to use DINO model '{args.reid_model}'")
 
 
+def _use_fp16(args) -> bool:
+    """FP16 (quantize=16) is a CUDA-only win; keep FP32 on CPU."""
+    return bool(args.half) and str(args.device) not in ("cpu",)
+
+
 def run_standard_tracking(args):
     """Run ByteTrack or BoT-SORT tracking."""
     model_path = Path(args.model)
@@ -315,6 +543,7 @@ def run_standard_tracking(args):
     if not data_path.exists():
         print(f"Error: Training data not found at {data_path}")
         sys.exit(1)
+    model_path = _resolve_trt_model(model_path, args)
 
     print(f"Tracker:   {args.tracker}")
     print(f"Model:     {model_path}")
@@ -326,6 +555,13 @@ def run_standard_tracking(args):
     model = YOLO(str(model_path))
     class_names = model.names if hasattr(model, "names") else {}
     categories = [{"id": int(cid), "name": name} for cid, name in class_names.items()]
+
+    # Extra class-agnostic NMS on raw detections before the tracker, so
+    # duplicate boxes of the same object can't spawn duplicate tracks.
+    # Installed before the conf filter so the conf filter lands at index 0
+    # and runs first (fewer boxes for NMS).
+    if args.nms_iou < 1.0:
+        _install_post_detection_nms(model, args.nms_iou)
 
     # Per-class confidence exemption: keep low-confidence detections of one
     # class (e.g. Sprinkler) down to --conf-exempt-min while all other classes
@@ -339,12 +575,25 @@ def run_standard_tracking(args):
         else:
             conf_default = args.conf
             args.conf = min(args.conf, args.conf_exempt_min)
-            args.track_high_thresh = min(args.track_high_thresh, args.conf)
-            args.new_track_thresh = min(args.new_track_thresh, args.conf)
+            if args.use_byte:
+                # BYTE second association: exempt low-conf detections extend
+                # EXISTING tracks (track_high_thresh..track_low_thresh band)
+                # but never spawn new ones — keeps flickery small objects
+                # (e.g. sprinklers) on one stable ID instead of churning.
+                args.track_high_thresh = conf_default
+                args.new_track_thresh = conf_default
+                byte_low = args.conf_exempt_min
+            else:
+                byte_low = None
+                args.track_high_thresh = min(args.track_high_thresh, args.conf)
+                args.new_track_thresh = min(args.new_track_thresh, args.conf)
             _install_per_class_conf_filter(model, exempt_ids, conf_default)
             print(f"Exempt class {args.conf_exempt_class!r}: floor {args.conf}, "
                   f"others conf>={conf_default}; "
-                  f"tracker track_high/new_track thresh -> {args.conf}")
+                  f"tracker track_high/new_track thresh -> "
+                  f"{args.track_high_thresh}/{args.new_track_thresh}"
+                  + (f" (BYTE band {args.track_high_thresh}-{byte_low})"
+                     if byte_low else ""))
 
     # Resolve tracker configuration
     tracker_yaml = _build_tracker_yaml(args, output_dir)
@@ -363,13 +612,108 @@ def run_standard_tracking(args):
     annotation_id = 1
     valid_paths = []
 
-    for idx, image_path in enumerate(image_files):
-        frame = cv2.imread(str(image_path))
+    def _process_and_write(result, frame, img_h, img_w, image_id, image_path):
+        """CPU-side post-processing (contour extraction + tracked_*.jpg
+        write). Runs in a worker thread so it overlaps the NEXT frame's GPU
+        inference. Annotation ids are local (0-based); the drain loop
+        reassigns them sequentially, in frame order."""
+        annotated_frame, annotations, _ = process_frame(
+            result, img_h, img_w, image_id, 0, class_names,
+            vis=not args.no_vis, mask_max_dim=args.mask_max_dim,
+            no_masks=args.no_masks,
+        )
+        if not args.no_vis:
+            if annotated_frame is None:
+                annotated_frame = frame
+            cv2.imwrite(str(output_dir / f"tracked_{image_path.name}"),
+                        annotated_frame)
+        return annotations
+
+    # Post-processing pool: with N > 0, contour extraction and image writes
+    # of previous frames run while the GPU tracks the current one. The
+    # window is bounded (2×N in flight) and drained strictly in order.
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    pp_pool = (ThreadPoolExecutor(max_workers=args.postprocess_workers)
+               if args.postprocess_workers > 0 else None)
+    pending = deque()
+
+    def _collect(annotations):
+        nonlocal annotation_id
+        for ann in annotations:
+            ann["id"] = annotation_id
+            annotation_id += 1
+            coco_annotations.append(ann)
+
+    def _handle_result(result, frame, img_h, img_w, image_id, image_path):
+        """GPU-prescale + hand off one tracked frame to the postprocess
+        pool (or run it inline when the pool is disabled)."""
+        if result is not None and not args.no_masks \
+                and not os.environ.get("TRK_NO_GPU_PRESCALE"):
+            # Shrink the D2H payload while the masks are still on the GPU:
+            # the transfer is the main thread's only GPU-adjacent work, so
+            # this keeps PCIe (not compute) from gating the loop.
+            _, tw, th = _mask_scale_for(img_h, img_w, args.mask_max_dim)
+            _prescale_masks_on_gpu(result, tw, th)
+        if pp_pool is not None:
+            # Move tensors off the GPU in the main thread so worker threads
+            # never touch CUDA objects.
+            result = result.cpu() if result is not None else None
+            pending.append(pp_pool.submit(_process_and_write, result, frame,
+                                          img_h, img_w, image_id, image_path))
+            if len(pending) > 2 * args.postprocess_workers:
+                _collect(pending.popleft().result())
+        else:
+            _collect(_process_and_write(result, frame, img_h, img_w,
+                                        image_id, image_path))
+        if args.no_vis:
+            if image_id % 50 == 0 or image_id == len(image_files):
+                print(f"  Processed frame {image_id}/{len(image_files)}")
+        else:
+            print(f"  Saved frame {image_id}/{len(image_files)}: "
+                  f"tracked_{image_path.name}")
+
+    track_kwargs = {
+        "persist": True,
+        "conf": args.conf,
+        "iou": args.iou,
+        "imgsz": args.imgsz,
+        "verbose": False,
+        "device": args.device,
+        "quantize": 16 if _use_fp16(args) else None,
+    }
+    if tracker_yaml is not None:
+        track_kwargs["tracker"] = str(tracker_yaml)
+
+    detect_batch = max(1, getattr(args, "detect_batch", None) or 1)
+
+    def _track_batch(buf):
+        """Track a list of [(image_path, frame, image_id)] in ONE model call.
+
+        A list source goes through LoadPilAndNumpy, which yields all frames
+        at once -> a single batched forward pass (amortizing ultralytics'
+        fixed per-call Python/pre/post overhead). Tracking stays sequential
+        and stateful: ultralytics' postprocess callback updates the SAME
+        tracker instance over the batch's results in order.
+        """
+        frames = [f for _, f, _ in buf]
+        track_kwargs["source"] = frames[0] if len(frames) == 1 else frames
+        results = model.track(**track_kwargs)
+        if results is None or len(results) != len(buf):
+            raise RuntimeError(
+                f"tracker returned {0 if not results else len(results)} "
+                f"results for {len(buf)} frames")
+        for (image_path, frame, image_id), res in zip(buf, results):
+            img_h, img_w = frame.shape[:2]
+            _handle_result(res, frame, img_h, img_w, image_id, image_path)
+
+    batch_buf = []
+    prefetcher = _FramePrefetcher(image_files)
+    for idx, (image_path, frame) in enumerate(prefetcher):
         if frame is None:
             print(f"  Warning: Could not read {image_path}, skipping")
             continue
         valid_paths.append(image_path)
-
         image_id = idx + 1
         img_h, img_w = frame.shape[:2]
         coco_images.append({
@@ -378,32 +722,18 @@ def run_standard_tracking(args):
             "width": img_w,
             "height": img_h,
         })
+        batch_buf.append((image_path, frame, image_id))
+        if len(batch_buf) >= detect_batch:
+            _track_batch(batch_buf)
+            batch_buf = []
+    if batch_buf:
+        _track_batch(batch_buf)
 
-        track_kwargs = {
-            "source": frame,
-            "persist": True,
-            "conf": args.conf,
-            "iou": args.iou,
-            "imgsz": args.imgsz,
-            "verbose": False,
-            "device": args.device,
-        }
-        if tracker_yaml is not None:
-            track_kwargs["tracker"] = str(tracker_yaml)
-
-        results = model.track(**track_kwargs)
-        result = results[0] if results and len(results) > 0 else None
-
-        annotated_frame, annotations, annotation_id = process_frame(
-            result, img_h, img_w, image_id, annotation_id, class_names
-        )
-        coco_annotations.extend(annotations)
-
-        if annotated_frame is None:
-            annotated_frame = frame
-        output_path = output_dir / f"tracked_{image_path.name}"
-        cv2.imwrite(str(output_path), annotated_frame)
-        print(f"  Saved frame {image_id}/{len(image_files)}: {output_path.name}")
+    # Drain remaining in-flight post-processing, in order.
+    while pending:
+        _collect(pending.popleft().result())
+    if pp_pool is not None:
+        pp_pool.shutdown(wait=True)
 
     # Save COCO JSON
     coco_output = {
@@ -431,7 +761,8 @@ def run_standard_tracking(args):
         print(f"Unique track IDs: {len(unique_track_ids)}")
 
     # Summary video
-    create_tracking_video(output_dir, valid_paths, args.fps)
+    if not args.no_vis:
+        create_tracking_video(output_dir, valid_paths, args.fps)
 
 
 # =============================================================================
@@ -454,6 +785,7 @@ def run_benchmark_tracking(args):
     if not data_path.exists():
         print(f"Error: Data directory not found at {data_path}")
         sys.exit(1)
+    model_path = _resolve_trt_model(model_path, args)
 
     print("=" * 60)
     print("TRACKING + SEGMENTATION BENCHMARK")
@@ -471,6 +803,9 @@ def run_benchmark_tracking(args):
     print("Note: no images, videos, or JSON will be saved.\n")
 
     model = YOLO(str(model_path))
+
+    if args.nms_iou < 1.0:
+        _install_post_detection_nms(model, args.nms_iou)
 
     image_files = find_image_files(data_path)
     if args.max_frames is not None:
@@ -501,7 +836,7 @@ def run_benchmark_tracking(args):
             "imgsz": args.imgsz,
             "verbose": False,
             "device": args.device,
-            "half": args.half,
+            "quantize": 16 if _use_fp16(args) else None,
         }
         if tracker_yaml is not None:
             track_kwargs["tracker"] = str(tracker_yaml)
@@ -697,6 +1032,7 @@ def run_detect_then_sam3(args):
     if not yolo_model_path.exists():
         print(f"Error: YOLO model not found at {yolo_model_path}")
         sys.exit(1)
+    yolo_model_path = _resolve_trt_model(yolo_model_path, args)
     if not sam3_model_path.exists():
         print(f"Error: SAM3 model not found at {sam3_model_path}")
         sys.exit(1)
@@ -724,6 +1060,10 @@ def run_detect_then_sam3(args):
         cmc_method=args.cmc_method,
         track_buffer=args.track_buffer,
         track_high_thresh=args.track_high_thresh,
+        track_low_thresh=(args.conf_exempt_min
+                          if getattr(args, "use_byte", False)
+                          and getattr(args, "conf_exempt_class", None)
+                          else None),
         with_reid=args.with_reid,
         output_dir=output_dir,
         reid_model=getattr(args, "reid_model", None),
@@ -739,6 +1079,9 @@ def run_detect_then_sam3(args):
     # Load models
     print("Loading YOLO detection model...")
     yolo_model = YOLO(str(yolo_model_path))
+
+    if args.nms_iou < 1.0:
+        _install_post_detection_nms(yolo_model, args.nms_iou)
 
     print("Loading SAM3 model...")
     sam_model = SAM(str(sam3_model_path))
@@ -850,10 +1193,15 @@ def run_detect_then_sam3(args):
             coco_annotations.append(annotation)
             annotation_id += 1
 
-        output_path = output_dir / f"tracked_{image_path.name}"
-        cv2.imwrite(str(output_path), overlay)
-        print(f"  Frame {image_id}/{len(image_files)}: {len(tracked_objects)} tracks, "
-              f"{sum(1 for m in masks_per_object if m is not None)} masks -> {output_path.name}")
+        if args.no_vis:
+            if image_id % 50 == 0 or image_id == len(image_files):
+                print(f"  Frame {image_id}/{len(image_files)}: {len(tracked_objects)} tracks, "
+                      f"{sum(1 for m in masks_per_object if m is not None)} masks")
+        else:
+            output_path = output_dir / f"tracked_{image_path.name}"
+            cv2.imwrite(str(output_path), overlay)
+            print(f"  Frame {image_id}/{len(image_files)}: {len(tracked_objects)} tracks, "
+                  f"{sum(1 for m in masks_per_object if m is not None)} masks -> {output_path.name}")
 
     # Save COCO JSON
     coco_output = {
@@ -882,7 +1230,8 @@ def run_detect_then_sam3(args):
         print(f"Annotations with segmentation masks: {masks_count}")
 
     # Summary video
-    create_tracking_video(output_dir, image_files, args.fps)
+    if not args.no_vis:
+        create_tracking_video(output_dir, image_files, args.fps)
 
 
 # =============================================================================
@@ -968,6 +1317,15 @@ def parse_args():
         help="Confidence floor for --conf-exempt-class detections (default: 0.1)",
     )
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold")
+    parser.add_argument(
+        "--nms-iou",
+        type=float,
+        default=0.5,
+        help="Extra class-agnostic NMS on raw detections BEFORE the tracker: "
+             "boxes overlapping with IoU above this keep only the "
+             "higher-confidence one, so the same object can't be tracked "
+             "twice (default: 0.5; >= 1.0 disables)",
+    )
     parser.add_argument("--imgsz", type=int, default=640, help="Inference image size")
     parser.add_argument("--fps", type=int, default=10, help="Output video FPS")
     parser.add_argument("--max-frames", type=int, default=None, help="Process only first N frames")
@@ -980,13 +1338,76 @@ def parse_args():
     parser.add_argument("--device", type=str, default="auto", help="Inference device: cuda, cpu, or auto")
     parser.add_argument(
         "--half",
+        dest="half",
         action="store_true",
-        help="Use FP16 half-precision inference (faster on CUDA, default: False)",
+        default=True,
+        help="Use FP16 inference (maps to quantize=16; faster on CUDA, "
+             "default: True)",
+    )
+    parser.add_argument(
+        "--no-half",
+        dest="half",
+        action="store_false",
+        help="Disable FP16 inference (use FP32).",
+    )
+    parser.add_argument(
+        "--trt",
+        action="store_true",
+        help="Export --model .pt to a TensorRT engine once (FP16, at --imgsz) "
+             "and run tracking with it; a cached .engine next to the "
+             "checkpoint is reused. Speeds up the model-inference stage "
+             "(end-to-end gain is modest when tracker/post-processing "
+             "dominate; ~7%% measured on HKU_GH yolo26l-seg @ 768). Delete "
+             "the .engine to force re-export after changing --imgsz. Also "
+             "applies to --yolo-model in detect-then-sam3 mode.",
+    )
+    parser.add_argument(
+        "--trt-workspace",
+        type=int,
+        default=4,
+        help="TensorRT build workspace in GiB (default: 4).",
     )
     parser.add_argument(
         "--no-masks",
         action="store_true",
-        help="In benchmark mode, skip reading segmentation masks from results (default: False)",
+        help="Skip segmentation-mask extraction (boxes/track-ids only in "
+             "results.json; benchmark mode also skips reading masks). "
+             "Faster when you don't need polygons.",
+    )
+    parser.add_argument(
+        "--postprocess-workers",
+        type=int,
+        default=4,
+        help="Threads for CPU post-processing (contour extraction, tracked "
+             "frame writes) so it overlaps GPU inference of the next frame "
+             "(default: 4; 0 = serial, pre-pool behavior). Only the "
+             "detection+tracking stage itself is inherently sequential.",
+    )
+    parser.add_argument(
+        "--detect-batch",
+        type=int,
+        default=1,
+        help="Frames per model.track() call (default: 1). Batching runs one "
+             "GPU forward per N frames, amortizing ultralytics' fixed "
+             "per-call Python/pre/post overhead — the dominant cost at "
+             "imgsz<=768. Tracking stays sequential and stateful (same "
+             "tracker instance, frames in order), so results match "
+             "--detect-batch 1. Try 4-8.",
+    )
+    parser.add_argument(
+        "--no-vis",
+        action="store_true",
+        help="Skip all visualization output: no per-frame tracked_*.jpg and no "
+             "tracking_result.mp4 (results.json is still written). Much faster "
+             "on large image sets.",
+    )
+    parser.add_argument(
+        "--mask-max-dim",
+        type=int,
+        default=1024,
+        help="Max mask resolution (largest side) used for polygon contour "
+             "extraction; coords are scaled back to full size (default: 1024, "
+             "0 = full resolution, slower).",
     )
 
     # BoT-SORT / Deep OC-SORT knobs
@@ -999,7 +1420,7 @@ def parse_args():
         choices=["sparseOptFlow", "orb", "sift", "ecc", "none"],
         help="Global motion compensation method (BoT-SORT / Deep OC-SORT)",
     )
-    parser.add_argument("--track-buffer", type=int, default=30, help="Lost-track buffer (frames to keep lost tracks alive)")
+    parser.add_argument("--track-buffer", type=int, default=60, help="Lost-track buffer (frames to keep lost tracks alive)")
     parser.add_argument("--track-high-thresh", type=float, default=0.5, help="First-stage association threshold")
     parser.add_argument("--with-reid", action="store_true", default=False, help="Enable ReID (BoT-SORT / Deep OC-SORT)")
     parser.add_argument(

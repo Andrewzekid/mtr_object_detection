@@ -1,8 +1,27 @@
 """
-Undistort Fisheye Images from a Normal Image Folder
+Pipeline stage "undistort" — fisheye-undistort a folder of camera frames.
 
-This script processes a folder of images, applies fisheye undistortion
-using calibration parameters, and saves the undistorted images to an output folder.
+First stage of the keyframe pipeline when the input is a Metacam rosbag
+extract (orchestrator: scripts/orchestrate_pipeline.py):
+
+    rosbag extract -> [undistort] -> 00 sample -> 12 keyframes -> ...
+
+Reads the intrinsics (camera matrix + distortion coefficients) from a
+calibration JSON (``<rosbag>/info/calibration.json``), remaps every image in
+``--images-root`` (typically ``<rosbag>/camera/<camera-name>``) with
+cv2.fisheye, and writes the result to ``--output-root``. Filenames are
+preserved so downstream stages (sampling, stereo sync, tracking) can pair
+frames by timestamp.
+
+USAGE:
+    python scripts/undistort_rosbag.py \\
+        --images-root <rosbag>/camera/left \\
+        --output-root output/<run>/undistorted/left \\
+        --calibration <rosbag>/info/calibration.json \\
+        --camera-name left
+
+Undistortion is parallelized across a thread pool; a progress bar tracks
+completion and output writes are lock-protected.
 """
 
 import argparse

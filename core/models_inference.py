@@ -98,6 +98,111 @@ def _get_sam_predictor(model_path, device: str, quantize=None):
     return model
 
 
+_SAM3_SEMANTIC_CACHE: Dict[Tuple, Any] = {}
+
+
+def _get_sam3_semantic_predictor(model_path, device: str, quantize=None):
+    """Cached Ultralytics SAM3SemanticPredictor (text-prompted SAM3).
+
+    Same cache rationale as _get_sam_predictor. Text embeddings are cached
+    inside the predictor per query string, so repeated clicks with the same
+    category skip the text-encoder forward pass.
+    """
+    from ultralytics.models.sam import SAM3SemanticPredictor
+    key = (str(model_path), str(device), quantize)
+    predictor = _SAM3_SEMANTIC_CACHE.get(key)
+    if predictor is None:
+        overrides = dict(task="segment", mode="predict",
+                         model=str(model_path), device=device, save=False,
+                         verbose=False)
+        if quantize is not None:
+            overrides["quantize"] = quantize
+        predictor = SAM3SemanticPredictor(overrides=overrides)
+        _SAM3_SEMANTIC_CACHE[key] = predictor
+    return predictor
+
+
+def _select_masks_at_points(masks: List[np.ndarray],
+                            points: List[List[float]],
+                            point_labels: Optional[List[int]] = None
+                            ) -> List[np.ndarray]:
+    """Keep instance masks containing >=1 positive point and no negative point.
+
+    Used by the text-guided point flow: the category text detects all
+    instances of the concept, the clicked points pick which instance(s) the
+    user meant. Returns the selected masks (empty list when none match).
+    """
+    lbls = point_labels if point_labels is not None else [1] * len(points)
+    pos = [p for p, l in zip(points, lbls) if l == 1]
+    neg = [p for p, l in zip(points, lbls) if l == 0]
+    if not pos:
+        # No explicit positive point (defensive — the GUI always clicks a
+        # positive first): treat every point as positive, exclude nothing.
+        pos, neg = list(points), []
+
+    def _inside(m, pt):
+        x = min(max(int(round(pt[0])), 0), m.shape[1] - 1)
+        y = min(max(int(round(pt[1])), 0), m.shape[0] - 1)
+        return bool(m[y, x])
+
+    return [m for m in masks
+            if any(_inside(m, p) for p in pos)
+            and not any(_inside(m, p) for p in neg)]
+
+
+def _sam3_text_guided_point_masks(image, image_file, points, point_labels,
+                                  text, model_path, device, conf, quantize,
+                                  log_callback=None):
+    """Category + point segmentation: run SAM3 semantic detection with the
+    category name as the text prompt, then keep only the instance mask(s)
+    under the clicked point(s).
+
+    Returns (detections, masks) on success, None when the text run found
+    nothing at the points (caller falls back to pure point prompting).
+    """
+    try:
+        predictor = _get_sam3_semantic_predictor(model_path, device, quantize)
+        predictor.args.conf = conf  # per-call threshold (predictor is cached)
+        results = predictor(source=str(image_file), text=[text])
+    except Exception as e:
+        if log_callback:
+            log_callback(f"Text-guided SAM3 run failed ({e}) — "
+                         "falling back to point prompts only.")
+        return None
+    if not results:
+        return None
+    res = results[0]
+    masks = getattr(res, "masks", None)
+    if masks is None or len(masks) == 0:
+        return None
+    mask_data = masks.data
+    if hasattr(mask_data, "cpu"):
+        mask_data = mask_data.cpu().numpy()
+    all_masks = []
+    for i in range(mask_data.shape[0]):
+        m = mask_data[i].astype(bool)
+        if m.shape != image.shape[:2]:
+            m = cv2.resize(m.astype(np.uint8), (image.shape[1], image.shape[0]),
+                           interpolation=cv2.INTER_NEAREST).astype(bool)
+        all_masks.append(m)
+    picked = _select_masks_at_points(all_masks, points, point_labels)
+    if not picked:
+        return None
+    final_mask = np.logical_or.reduce(picked)
+    ys, xs = np.where(final_mask)
+    if not len(xs):
+        return None
+    detections = [{
+        "bbox": [float(xs.min()), float(ys.min()),
+                 float(xs.max()), float(ys.max())],
+        "label": text,
+        "confidence": 1.0,
+        "area": float(final_mask.sum()),
+        "center": [float(xs.mean()), float(ys.mean())],
+    }]
+    return detections, [final_mask]
+
+
 def run_sam3(
     image_path: str | Path,
     bboxes: Optional[List[List[float]]] = None,
@@ -107,6 +212,9 @@ def run_sam3(
     conf: float = 0.25,
     quantize: Optional[int] = None,
     save: bool = False,
+    points: Optional[List[List[float]]] = None,
+    point_labels: Optional[List[int]] = None,
+    text: Optional[str] = None,
     progress_callback: Optional[Callable[[int], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
@@ -134,6 +242,19 @@ def run_sam3(
         conf         : Confidence threshold for segmentation mask.
         quantize     : INT8 / INT16 quantization (None to disable).
         save         : Whether Ultralytics should save annotated images.
+        points       : Optional list of [x, y] pixel coordinates used as
+                       SAM2-style positive point prompts (ignored when bboxes
+                       are given). Segments only the specific object at the
+                       point(s), unlike bbox exemplars which segment all
+                       similar objects.
+        point_labels : Optional 1/0 per point (1 = positive, 0 = negative);
+                       defaults to all-positive.
+        text         : Optional category/concept name (e.g. "chair"). Used
+                       together with points: SAM3's text-prompted semantic
+                       detection finds all instances of the concept and the
+                       point(s) select which instance to keep. Falls back to
+                       pure point prompting when the text run finds nothing
+                       under the point(s).
         progress_callback / status_callback / log_callback / is_cancelled
                      : Optional worker-thread callbacks.
 
@@ -186,46 +307,79 @@ def run_sam3(
         if status_callback:
             status_callback("Loading SAM3 model...")
 
-        # Build kwargs for model.predict
-        predict_kwargs = {
-            "source": str(image_file),
-            "task": "segment",
-            "verbose": False,
-            "conf": conf,
-            "device": device,
-            "save": save,
-        }
-        if bboxes is not None:
-            predict_kwargs["bboxes"] = bboxes
-            # All bboxes belong to the same class (class 0) when provided as exemplars for a single concept
-            # This ensures SAM3 treats all bboxes as the same class and returns them with consistent class_ids
-            predict_kwargs["labels"] = [0] * len(bboxes)
-        # Note: SAM3 does not support 'text' parameter - it uses bboxes as exemplars only
-        if quantize is not None:
-            predict_kwargs["quantize"] = quantize
-
-        model = _get_sam_predictor(model_path, device, quantize)
-
-        if progress_callback:
-            progress_callback(40)
-
-        if status_callback:
-            status_callback("Segmenting...")
-
-        print(f"Running SAM3 with concepts: {concepts} and bboxes: {bboxes}")
-        results = model.predict(**predict_kwargs)
-        print(f"SAM3 results: {results}")
-        if progress_callback:
-            progress_callback(70)
-
-        # Handle both list and single result formats
-        if not isinstance(results, list):
-            results = [results]
-
-        # Extract detections from results
+        # Category-guided point segmentation: when a category name comes
+        # with the points, run SAM3's text-prompted semantic detection and
+        # keep only the instance(s) under the clicked point(s). This uses
+        # BOTH the category (text) and the point; if the text run finds
+        # nothing at the point(s), fall back to pure point prompting below.
         detections = []  # List of {bbox, label, confidence}
         masks_array = []
+        results = []
+        text_guided = False
+        if points is not None and text:
+            guided = _sam3_text_guided_point_masks(
+                image, image_file, points, point_labels, text,
+                model_path, device, conf, quantize, log_callback)
+            if guided is not None:
+                detections, masks_array = guided
+                text_guided = True
+                if log_callback:
+                    log_callback(
+                        f"Text-guided segmentation: picked instance of "
+                        f"{text!r} under the clicked point(s).")
 
+        if not text_guided:
+            # Build kwargs for model.predict
+            predict_kwargs = {
+                "source": str(image_file),
+                "task": "segment",
+                "verbose": False,
+                "conf": conf,
+                "device": device,
+                "save": save,
+            }
+            if bboxes is not None:
+                predict_kwargs["bboxes"] = bboxes
+                # All bboxes belong to the same class (class 0) when provided as exemplars for a single concept
+                # This ensures SAM3 treats all bboxes as the same class and returns them with consistent class_ids
+                predict_kwargs["labels"] = [0] * len(bboxes)
+            elif points is not None:
+                # Point prompting: ultralytics' SAM3 interactive model degrades
+                # when several points are wrapped as one object, so each point is
+                # sent as its OWN object prompt (all positive) and the per-point
+                # masks are combined below: union of positive-point masks minus
+                # the connected component at each negative point.
+                predict_kwargs["points"] = points
+                predict_kwargs["labels"] = [1] * len(points)
+            # Note: SAM3 does not support 'text' parameter - it uses bboxes as exemplars only
+            if quantize is not None:
+                predict_kwargs["quantize"] = quantize
+
+            model = _get_sam_predictor(model_path, device, quantize)
+
+            if progress_callback:
+                progress_callback(40)
+
+            if status_callback:
+                status_callback("Segmenting...")
+
+            print(f"Running SAM3 with concepts: {concepts} and bboxes: {bboxes}")
+            results = model.predict(**predict_kwargs)
+            # Compact debug summary — printing the raw Results dumps the full
+            # orig_img array; and SAM3 exposes no keypoints (always None).
+            for r in (results if isinstance(results, list) else [results]):
+                n_masks = len(getattr(r, "masks", None) or [])
+                n_boxes = len(getattr(r, "boxes", None) or [])
+                print(f"SAM3 results: {n_boxes} box(es), {n_masks} mask(s)")
+            if progress_callback:
+                progress_callback(70)
+
+            # Handle both list and single result formats
+            if not isinstance(results, list):
+                results = [results]
+
+        # Extract detections from results (skipped when the text-guided
+        # path already produced detections/masks above)
         for result in results:
             # Extract bounding boxes (primary detection output)
             if hasattr(result, 'boxes') and result.boxes is not None and len(result.boxes) > 0:
@@ -250,7 +404,7 @@ def run_sam3(
                 primary_concept = concepts[0] if concepts else "object"
                 for j, (box, class_id, conf) in enumerate(zip(boxes, class_ids, confidences)):
                     # Use primary concept for all detections when bboxes are provided
-                    concept = primary_concept if bboxes is not None else (concepts[class_id] if class_id < len(concepts) else f"class_{class_id}")
+                    concept = primary_concept if (bboxes is not None or not concepts) else (concepts[class_id] if class_id < len(concepts) else f"class_{class_id}")
                     detections.append({
                         "bbox": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
                         "label": concept,
@@ -278,6 +432,57 @@ def run_sam3(
 
         if progress_callback:
             progress_callback(85)
+
+        # Point-prompt mode: combine the per-point object masks into a single
+        # mask that refines as points are added — union of masks under
+        # positive points (grows to cover clicked parts), minus the connected
+        # component containing each negative point (carves out "not this"
+        # regions); afterwards, mask fragments containing no positive point
+        # are dropped so a subtraction can't leave orphaned islands.
+        # (Skipped when the text-guided path already produced the final mask.)
+        if points is not None and masks_array and not text_guided:
+            lbls = (point_labels if point_labels is not None
+                    else [1] * len(points))
+            pos_masks = [m for m, l in zip(masks_array, lbls) if l == 1]
+            if not pos_masks:
+                pos_masks = masks_array[:1]
+            final_mask = np.logical_or.reduce(pos_masks)
+            for m, l, pt in zip(masks_array, lbls, points):
+                if l != 0:
+                    continue
+                px_i = min(max(int(round(pt[0])), 0), m.shape[1] - 1)
+                py_i = min(max(int(round(pt[1])), 0), m.shape[0] - 1)
+                _n, lab = cv2.connectedComponents(m.astype(np.uint8))
+                cid = lab[py_i, px_i]
+                if cid > 0:
+                    final_mask &= ~(lab == cid)
+            # Keep only fragments anchored by a positive point.
+            if final_mask.any():
+                _n, lab = cv2.connectedComponents(final_mask.astype(np.uint8))
+                anchored = np.zeros_like(final_mask)
+                for (px, py), l in zip(points, lbls):
+                    if l != 1:
+                        continue
+                    px_i = min(max(int(round(px)), 0), lab.shape[1] - 1)
+                    py_i = min(max(int(round(py)), 0), lab.shape[0] - 1)
+                    cid = lab[py_i, px_i]
+                    if cid > 0:
+                        anchored |= lab == cid
+                if anchored.any():
+                    final_mask = anchored
+            masks_array = [final_mask]
+            ys, xs = np.where(final_mask)
+            if len(xs):
+                detections = [{
+                    "bbox": [float(xs.min()), float(ys.min()),
+                             float(xs.max()), float(ys.max())],
+                    "label": concepts[0] if concepts else "object",
+                    "confidence": 1.0,
+                    "area": float(final_mask.sum()),
+                    "center": [float(xs.mean()), float(ys.mean())],
+                }]
+            else:
+                detections = []
 
         # Build segmented_regions from detections (primary source)
         segmented_regions = []
@@ -350,13 +555,38 @@ def run_sam3(
         }
 
 
+_SAM3_VIDEO_PREDICTOR_CACHE: Dict[Tuple, Any] = {}
+
+
+def _get_sam3_video_predictor(model_path, device: str, imgsz: int,
+                              conf: float, quantize=None):
+    """Cached Ultralytics SAM3VideoPredictor for the given config.
+
+    Building the predictor reloads the multi-GB checkpoint, which dominated
+    short propagate runs in the GUI (every "Propagate →" click paid it).
+    The cached predictor keeps the model resident; each run still calls
+    setup_source + init_state, so video state never leaks between runs.
+    """
+    from ultralytics.models.sam import SAM3VideoPredictor
+    key = (str(model_path), str(device), int(imgsz), float(conf), quantize)
+    predictor = _SAM3_VIDEO_PREDICTOR_CACHE.get(key)
+    if predictor is None:
+        overrides = dict(conf=conf, task="segment", mode="predict",
+                         model=str(model_path), device=device, imgsz=imgsz)
+        if quantize is not None:
+            overrides["quantize"] = quantize
+        predictor = SAM3VideoPredictor(overrides=overrides)
+        _SAM3_VIDEO_PREDICTOR_CACHE[key] = predictor
+    return predictor
+
+
 def sam3_video_propagate(
     video_path: str | Path,
     seed_bboxes_xyxy: List[List[float]],
     model_path: Optional[str | Path] = None,
     device: str = "cuda",
     conf: float = 0.25,
-    imgsz: int = 1024,
+    imgsz: int = 1280,
     quantize: Optional[int] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> Iterator[Tuple[int, List[Tuple[Optional[np.ndarray],
@@ -390,19 +620,18 @@ def sam3_video_propagate(
     object score logit (0..1), for the box's confidence provenance field.
     """
     import torch
-    from ultralytics.models.sam import SAM3VideoPredictor
 
     if model_path is None:
         model_path = (Path(__file__).parent / "sam3" / "models"
                       / "sam3-model" / "sam3.pt")
-    overrides = dict(conf=conf, task="segment", mode="predict",
-                     model=str(model_path), device=device, imgsz=imgsz)
-    if quantize is not None:
-        overrides["quantize"] = quantize
-    predictor = SAM3VideoPredictor(overrides=overrides)
+    predictor = _get_sam3_video_predictor(model_path, device, imgsz, conf,
+                                          quantize)
     n_seeds = len(seed_bboxes_xyxy)
     try:
-        predictor.setup_model()
+        if getattr(predictor, "model", None) is None:
+            # First use of the cached predictor — the only time the
+            # multi-GB checkpoint is loaded.
+            predictor.setup_model()
         predictor.setup_source(str(video_path))
         predictor.init_state(predictor)
         num_frames = predictor.dataset.frames
@@ -473,7 +702,8 @@ def sam3_video_propagate(
                 per_seed[oid] = (mask, bbox, score)
             yield frame_idx, per_seed
     finally:
-        del predictor
+        # The predictor stays cached (model resident for the next run);
+        # only release transient CUDA blocks.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

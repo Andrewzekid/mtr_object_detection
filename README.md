@@ -5,6 +5,91 @@ training and inference, built with PyQt6 and Ultralytics YOLO.
 
 ---
 
+## Quickstart — one complete run, start to finish
+
+Everything below is paste-able top to bottom. It takes raw footage to a
+trained segmentation model + tracking results in a single pipeline run.
+
+### Step 0 — install
+
+```bash
+pip install -r requirements.txt
+# SAM3 weights for GUI segmentation/autolabel (one-time):
+#   place sam3.pt at core/sam3/models/sam3-model/sam3.pt
+```
+
+### Step 1 — start the Qwen VLM server (seed labels)
+
+```bash
+llama-server -m Qwen3.8-27B-Q4_K_M.gguf \
+    --mmproj Qwen3.8-mmproj-F16.gguf \
+    --image-min-tokens 2048 --port 8089
+```
+
+### Step 2 — run the orchestrator (blocks at the GUI)
+
+From a Metacam rosbag, stereo:
+
+```bash
+python scripts/orchestrate_pipeline.py \
+  --rosbag 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 \
+  --camera both \
+  --sample-size 1000 --keyframe-stride 10 \
+  --llamacpp-url http://127.0.0.1:8089 \
+  --ratios 0.7 0.15 0.15 --split-seed 42 \
+  --augmentations flip_horizontal rotate brightness --multiplier 2 \
+  --epochs 100 --batch-size 16 --model-type yolo26n --task segment --imgsz 768 \
+  --eval-splits test train --tracker deepocsort --device 0
+```
+
+Or from an existing image folder (mono; for stereo point `--images` at the
+parent containing `left/` + `right/` and pass `--camera both`):
+
+```bash
+python scripts/orchestrate_pipeline.py --images Datasets/HKU_GH/HKU_GH_left
+```
+
+The pipeline runs automatically through:
+`undistort → sample → keyframes → stats → qwen → qwen_coco` and then opens
+the **label-review GUI** on the keyframes.
+
+### Step 3 — review labels in the GUI (the only human step)
+
+Fix/remove wrong boxes, segment with SAM3 (`Re-segment`, point prompt 🎯,
+Propagate), autolabel missing categories, discard bad frames, then **save**
+and close. The pipeline resumes by itself.
+
+If you closed without saving, re-run just the GUI stage:
+
+```bash
+python scripts/orchestrate_pipeline.py \
+  --rosbag .../2026-08-20_22-06-52 --camera both --stage gui
+```
+
+After a review session you can also re-run only everything downstream:
+
+```bash
+python scripts/orchestrate_pipeline.py \
+  --rosbag .../2026-08-20_22-06-52 --camera both \
+  --stage yolo --stage split --stage augment --stage assemble \
+  --stage train --stage evaluate --stage tracking
+```
+
+### Step 4 — collect the outputs
+
+Under `<input>_pipeline/`:
+
+| Path | Contents |
+|------|----------|
+| `reviewed/labels_coco.json` | human-reviewed COCO annotations |
+| `dataset/final/` (+ `dataset.yaml`) | final train/val/test dataset |
+| `dataset/dataset_statistics.csv` | per-class instance statistics |
+| `training/yolo_training/weights/best.pt` | trained model |
+| `evaluation/metrics.csv` | per-class P/R/F1/AP metrics |
+| `tracking/<cam>/` | tracked frames, `results.json`, video |
+
+---
+
 ## Overview
 Label review and segmentation:
 ```
@@ -48,7 +133,7 @@ Two compatibility notes for the HF backends (handled automatically in
 memory of consumer GPUs (RTX 4090), so they are recompiled with smaller
 blocks at load; Florence-2 runs its 2023-era remote code under
 transformers 5.x via shims plus a local beam search (`model.generate` is
-unusable there — see `core/florence2_detector.py`).
+unusable there — see `core/detectors.py`).
 
 ### Labelling assist features (when and how to use them)
 
@@ -85,6 +170,19 @@ the assistants below depending on the footage.
   later frame.
 - **Re-segment selected** — re-runs SAM3 on a box you moved/resized to get
   a fresh mask. Use after every manual box edit if masks matter.
+- **Point segment (🎯 Add points + ▶ Segment points)** — SAM2-style point
+  prompting in two steps. With **Add points** toggled ON, left-click adds a
+  positive point, right-click a negative point — clicks only accumulate,
+  nothing runs yet, so you can place as many points as you want. Press
+  **▶ Segment points** to run SAM3 once with the full point set; press it
+  again after adding more points to refine. Enter accepts the object,
+  Esc cancels it. The selected category is sent to SAM3 as a **text
+  prompt**: it detects all instances of that category and your points pick
+  which one to keep (pure point prompting is the fallback when the text
+  finds nothing there). Pick a category row first — points added before a
+  category is picked are kept and used when you press Segment. Use for
+  precise single-object masks where a drag-box would include too much
+  background.
 - **Discard image (🚫)** — drops the frame from the saved COCO entirely.
   Use for blurry/irrelevant frames so they never reach training.
 - **Stereo sync** — left/right frames pair by timestamp filename; unmatched
@@ -545,6 +643,21 @@ Speed options for benchmark mode:
 - `--no-masks` — skip reading segmentation masks from results.
 - `--no-cmc` — disable BoT-SORT camera-motion compensation.
 - `--imgsz 320` — smaller input resolution (trades accuracy for speed).
+- `--trt` — export the model to a TensorRT engine once (FP16, at `--imgsz`) and
+  track with it; the cached `.engine` next to the checkpoint is reused on later
+  runs. It only accelerates the model-inference stage, so the end-to-end gain
+  depends on how inference-bound the run is (measured ~7% wall-clock on
+  HKU_GH with yolo26l-seg @ 768 in light scenes; larger when detections are
+  dense). Requires `pip install tensorrt onnx`. Delete the `.engine`
+  after changing `--imgsz`. Also applies to standard tracking and
+  `detect-then-sam3` modes (previously a separate `15_export_trt.py` step).
+
+Other speed/accuracy knobs (all modes): `--nms-iou` (pre-tracker class-agnostic
+NMS, default 0.5; `1.0` disables), `--postprocess-workers` (CPU post-processing
+threads overlapping GPU inference, default 4), `--detect-batch N` (one batched
+GPU forward per N frames — tracking stays sequential/stateful and results match
+batch 1; try 4–8), `--mask-max-dim` (contour resolution cap; masks are
+pre-scaled on the GPU before transfer), `--no-masks`, `--no-vis`.
 
 ---
 
@@ -652,7 +765,7 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | `09_create_seg_dataset.py` | **Superseded by GUI SAM3 segmentation + `01b`** (moved to `tests/`). | — | — |
 | `04_train_model.py` | Train a YOLO detect/segment model (Ultralytics). | `--config` (data.yaml), `--model-type`, `--task`, `--epochs`, `--batch-size`, `--device`, `--loss-type` | `runs/.../weights/best.pt` |
 | `05_evaluate_model.py` | Evaluate a trained model on one or more splits (default `test train`) with per-class precision/recall/F1/AP50/AP50-95 (box + mask), or compare pred vs GT COCO JSON. | `--model`, `--data`, `--split`, `--conf`, `--iou`, `--csv` (or `--pred-json`/`--gt-json`) | Metrics report (stdout) + per-class CSV |
-| `11_run_tracking.py` | YOLO tracking (ByteTrack / BoT-SORT / detect-then-SAM3) + a no-output benchmark mode. | `--tracker`, `--model`, `--data`, `--output`, `--conf`, `--device`, `--warmup-frames` | `tracked_*.jpg`, `results.json`, `tracking_result.mp4` |
+| `11_run_tracking.py` | YOLO tracking (ByteTrack / BoT-SORT / Deep OC-SORT / detect-then-SAM3) + a no-output benchmark mode. Pre-tracker class-agnostic NMS; optional TensorRT engine export (`--trt`, replaces the standalone `15_export_trt.py` step). | `--tracker`, `--model`, `--data`, `--output`, `--conf`, `--device`, `--warmup-frames`, `--nms-iou`, `--trt`, `--no-masks`, `--no-vis`, `--postprocess-workers` | `tracked_*.jpg`, `results.json`, `tracking_result.mp4` |
 | `orchestrate_pipeline.py` | End-to-end keyframe pipeline: undistort → sample → keyframes → stats → Qwen → COCO combine → GUI review → 01b COCO→YOLO-seg → 03 split → 02 augment (train only) → assemble final dataset + stats CSV → 04 train → 05 evaluate → 11 tracking. Stage markers make it resumable. | `--rosbag`/`--images`, `--camera`, `--stage`, `--skip-stage`, `--force`, per-stage args (`--sample-size`, `--ratios`, `--augmentations`, `--epochs`, `--tracker`, ...) | `<input>_pipeline/` output tree |
 | `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`LLAMACPP_URL`, `QWEN_MODEL`, `QWEN_MMPROJ`). | `<rosbag_path>` + any orchestrator args | same as orchestrator |
 
@@ -681,7 +794,7 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | Script | Purpose | Key inputs | Outputs |
 |-------|---------|------------|---------|
 | `06_run_sam3.py` | Run SAM3 segmentation on an image/folder, optionally with bbox exemplars. | `--image`/`--image-folder`, `--bbox`/`--bbox-json`, `--concept`, `--model` | Masks / overlay images (`--output`, `--save-overlay`) |
-| `track_sam3_video.py` | SAM3VideoPredictor video segmentation (single / reseed / chunks modes). | `--mode`, `--yolo-model`, `--sam3-model`, `--data`, `--output` | Per-frame masks / video |
+| `15_export_trt.py` | Standalone TensorRT engine export from a `.pt` checkpoint (FP16, fixed imgsz; also available inline via `11_run_tracking.py --trt`). | `--model`, `--imgsz`, `--workspace`, `--device` | `<model>.engine` next to the checkpoint |
 | `undistort_rosbag.py` | Fisheye-undistort a folder of images using a calibration JSON. | `--images-root`, `--output-root`, `--calibration`, `--camera-name` | Undistorted images |
 | `visualize.py` | Visualize Qwen annotations / YOLO detect / YOLO seg / model predictions. | `--mode`, `--dataset`/`--annotations-folder`, `--output`, `--model` | Annotated images |
 | `tracking_utils.py` | Shared helpers (tracker YAML, IoU, mask→polygon, summary video). | — (library, not a CLI) | — |
@@ -705,3 +818,147 @@ These back the scripts above; not normally invoked directly.
 | `sam3_test.py` | SAM3 scratch/test harness (not a pipeline stage). |
 
 
+
+---
+
+## Label-review GUI — complete user guide
+
+The interactive review app (`gui/label_review/`) is where the human step of
+the pipeline happens: correct the seeded boxes, create masks with SAM3, and
+discard bad frames. Launch it standalone or let the orchestrator open it for
+you.
+
+### Launching
+
+```bash
+# mono session
+python -m gui.label_review.main --images /path/to/left --output_json out/coco.json
+
+# stereo dual-view (frames paired by timestamp filename; unsynced frames skipped)
+python -m gui.label_review.main \
+    --images /path/to/left --images-right /path/to/right
+
+# seed from an existing COCO (e.g. the qwen_coco stage output) + SAM3 options
+python -m gui.label_review.main --images /path/to/keyframes \
+    --json output/<run>/reviewed/labels_coco.json \
+    --sam3-model core/sam3/models/sam3-model/sam3.pt --sam3-device cuda \
+    --auto-segment
+```
+
+All flags: `--images`, `--images-right`, `--output_json`, `--json` (seed
+COCO), `--sam3-model/--sam3-device/--sam3-conf`, `--auto-segment`
+(SAM3 after every drawn box), `--interp-flow-method {dis,klt,farneback}`,
+`--interp-camera-model {none,global}`, `--output-yolo-dir` (also export YOLO
+on exit), `--rrd` (Rerun recording), `--pose-db` (Clio poses for map view),
+`--data-yaml` (class order), `--config FILE`. Omitting `--images` starts in
+idle mode — pick a source from the File menu. If a `labels_coco.json` sits
+next to the images it is auto-loaded.
+
+### File menu
+
+| Action | Shortcut | Notes |
+|---|---|---|
+| Open image file(s)… | `Ctrl+O` | |
+| Open folder… | `Ctrl+Shift+O` | |
+| Open stereo folders… | — | pick left then right folder |
+| Load annotations file… | `Ctrl+I` | import COCO JSON |
+| Save / Save as… | `Ctrl+S` / `Ctrl+Shift+S` | |
+| Config settings… | `Ctrl+G` | same as the ⚙ button |
+
+### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `N` / `B` (or `→` / `←`) | next / previous frame (forward nav marks reviewed) |
+| `U` | jump to next unlabeled frame |
+| `Space` | play/pause playback |
+| `S` | save and quit · `Q` quit (progress kept) |
+| `A` | toggle draw-box mode |
+| `D` / `Del` | delete selected box(es) |
+| `X` | discard all boxes on current frame, mark reviewed, advance |
+| `0–9` | assign category to a pending new box |
+| `R` | re-segment selected box(es) with SAM3 (fresh masks) |
+| `I` | interpolate between anchors |
+| `K` | toggle ★ keyframe on current frame |
+| `M` | show/hide mask overlays |
+| `Z` | zoom to selected box · `F` / `0` fit view · `+` / `-` zoom steps |
+| `Ctrl+A` | select all boxes on frame |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | undo / redo (every operation is undoable) |
+| `Esc` | clear selection / cancel point-segment or pending box |
+
+### Mouse on the canvas
+
+- **Left-drag in draw mode** (`A`) draws a box; release adds it if a category
+  is preselected, otherwise pick one with digit keys or a category click.
+- **Left-click** a box to select + drag-move; drag **corner handles** to
+  resize. **Shift-click** toggles multi-selection.
+- **Middle-drag** pans; **wheel** zooms around the cursor.
+- **Point-segment mode (🎯 Add points)**: left-click = positive point (+),
+  right-click = negative point (−); clicks only accumulate. Press
+  **▶ Segment points** to run SAM3 with all placed points; add more and
+  press again to refine. `Enter` accepts the object, `Esc` cancels it.
+
+### Side panel buttons
+
+| Button | What it does |
+|---|---|
+| **Add / Rename / Delete** (+ name field) | manage categories |
+| **▶ Play / ⏸ Pause** + speed combo | playback at 0.25x–10x |
+| **−10 −5 +5 +10** | jump buttons |
+| **✔ Mark as annotated** | count frame as done without boxes |
+| **🚫 Discard image** | drop the frame from the saved COCO entirely (blurry/irrelevant frames never reach training) |
+| **★ Keyframe** (`K`) | mark anchor frame for interpolation |
+| **Interpolate (I)** + **Stop** | optical-flow-fill boxes between two labeled/keyframe anchors; use for smooth, constant-direction motion |
+| **Run SAM3 (all)** / **Re-seg sel (R)** / **Cancel** | segment all boxes on the frame / re-mask the selection |
+| **SAM3 ALL frames** | background segmentation of every frame (checkpoints every 10 frames) |
+| **🎯 Add points** + **▶ Segment points** | point-prompt mode: accumulate +/− points on clicks, then run SAM3 once with all of them (see mouse section) |
+| **Propagate →** | follow the selected instance(s) forward with SAM3 video tracking, producing masks per frame (`memory` or `chain` method, Settings → SAM3); use for deformable objects / longer ranges than interpolation |
+| **Autolabel frame** / **Autolabel ALL frames** | open-vocabulary pre-labeling with the configured backend; highlight 2+ categories to restrict the run |
+| **Masks ON/OFF** + opacity slider | mask overlay visibility/transparency |
+
+The **Boxes on this frame** list selects boxes by clicking rows;
+**Cat of selected** / **Track of selected** fields reassign them by typing an
+id + Enter (`C` / `T` focus the fields). The progress bar counts annotated
+frames; the slider scrubs the sequence (progress saved on release).
+
+### Recommended labeling workflow
+
+1. Qwen seeds boxes on keyframes → GUI opens on them.
+2. Per frame: fix/remove wrong boxes (`D`), add missed ones (`A`),
+   re-segment edited boxes (`R`) so masks match the moved boxes.
+3. Sparse footage? Label every ~10th keyframe, then `I` interpolate between
+   anchors, or select a good box and `Propagate →` for masks over long gaps.
+4. Missing a whole category? Highlight it in the category list and
+   **Autolabel ALL frames** with SAM3/Falcon.
+5. 🚫 Discard blurry/broken frames; ✔ mark empty-but-checked ones.
+6. `Ctrl+S` save (or `S` save-and-quit). Discarded frames are excluded from
+   the final COCO; stereo sessions save only timestamp-synced pairs.
+
+### Settings dialog (⚙ Config / Ctrl+G)
+
+- **Hide UI elements** — hide panel groups you don't use (`ui.hide`).
+- **Advanced settings** — enables Interpolation/Tracking sections.
+  - Interpolation: flow method (`dis`/`klt`/`farneback`), camera model,
+    match distance, mismatch confirmation (`interpolation.*`).
+  - Tracking: sticky track ids, show ids (`tracking.*`).
+- **SAM3**: device, model path, confidence, auto-segment-on-add, min polygon
+  area, autolabel NMS IoU, propagate method (`memory`/`chain`) + thresholds
+  (`sam3.*`).
+- **Autolabel detector**: `sam3`, `owlv2`, `owlv2_exemplar` (1-shot — select
+  an existing box first; its crop becomes the visual query),
+  `grounding_dino`, `florence2`, `falcon`, plus per-backend model/conf keys
+  (`autolabel.*`). First use downloads HF checkpoints.
+- **Masks / Display**: overlay opacity (`ui.mask_opacity`), max image size
+  (`display.max_image_dim`, 0 = original).
+
+Load/Apply/Save buttons live at the bottom; example config:
+`scripts/config/label_review.example.json`.
+
+### Files written by the GUI
+
+- `<output_json>` — the reviewed COCO: polygon `segmentation` masks,
+  `"side"` + `timestamp_ns` per image, `annotated_image_ids`; discarded
+  frames excluded. Stereo saves only synced pairs, sorted earliest first.
+- `<output>.progress` sidecar — current index, reviewed/annotated/discard
+  marks, keyframes (so you can quit and resume anytime).
+- Optional `.rrd` Rerun recording when launched with `--rrd`.

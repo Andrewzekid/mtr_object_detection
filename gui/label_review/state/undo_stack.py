@@ -46,6 +46,11 @@ class UndoStack:
             self._undo.pop(0)
         self._redo.clear()
 
+    @property
+    def muted(self) -> bool:
+        """True while inside a mute() block (pushes are dropped)."""
+        return self._muted > 0
+
     @contextmanager
     def mute(self):
         """Drop pushes inside the block — for mutations whose undo entries
