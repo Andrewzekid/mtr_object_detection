@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 """
-Select 1000 images from `MTR_metacam_right` that are NOT already present in the
-existing YOLO dataset `train_yolo_detection`, and copy them into a new folder
-ready for labeling with `scripts/07_run_qwen.py`.
+Pipeline stage 00 — sample N unlabeled images for annotation.
 
-Matching rule
--------------
-Source images   : Datasets/MTR/MTR_metacam_right/<19-digit-id>.jpg
-Already-labeled : Datasets/MTR/detect/train_yolo_detection/images/{train,valid,test}/<id>_jpg.rf.<hash>.jpg
+Stage 1 of 2 of the frame reduction in the keyframe pipeline
+(orchestrator: scripts/orchestrate_pipeline.py, "sample" stage):
 
-The Roboflow-style filenames embed the original id as their leading digits
+    raw frames -> [00 sample] -> [12 keyframes] -> Qwen seed labels -> ...
+
+Selects ``-n`` images from ``--source-dir`` that are NOT already present in
+the labeled YOLO set(s) given via ``--labeled-dir`` (repeatable), and copies
+(or symlinks with ``--symlink``) them into ``--out-dir`` ready for labeling
+with ``scripts/07_run_qwen.py``.
+
+When a labeled set is provided, matching rule
+---------------------------------------------
+Source images   : <source>/<19-digit-id>.jpg
+Already-labeled : <labeled>/{train,valid,test}/<id>_jpg.rf.<hash>.jpg
+
+Roboflow-style filenames embed the original id as their leading digits
 (possibly followed by an augmentation suffix like `_1` before `_jpg.rf.`).
 We extract the source id as the leading digit run via ``re.match(r"(\\d+)", ...)``,
 which correctly handles the ``_1`` augmented variants (they map back to the
 original numeric id).
 
-The selection is a reproducible random sample (fixed seed) of the complement.
+Without ``--labeled-dir``, every source image is eligible.
+
+The selection is a reproducible random sample (``--seed``, default 42) of the
+complement. Use ``--dry-run`` to preview without writing anything.
 """
 
 import argparse

@@ -20,6 +20,19 @@ incremental, `--force` ignores markers.
 Stage names: undistort, sample, keyframes, stats, qwen, qwen_coco, gui,
 yolo, split, augment, assemble, train, evaluate, tracking.
 
+Output layout under `<input>_pipeline/`:
+
+    undistorted/<cam>/     full-res working frames (rosbag input only)
+    sampled/<cam>/         random sample (--sample-size)
+    keyframes/<cam>/       every Nth frame (--keyframe-stride)
+    qwen/<cam>/            per-image Qwen results + labels_coco.json
+    reviewed/labels_coco.json   human-reviewed COCO (GUI save target)
+    dataset/yolo_flat|split|train_augmented|final (+dataset.yaml,
+        dataset_statistics.csv)
+    training/yolo_training/weights/best.pt
+    evaluation/metrics.csv
+    tracking/<cam>/
+
 Examples:
 
     # From a Metacam rosbag, stereo:

@@ -22,6 +22,7 @@ from ..state.index import ImageFolderIndex, StereoIndex
 from ..workers.label_review_workers import (  # noqa: F401
     SAM3Worker, SAM3BatchWorker, InterpBatchWorker,
     SAM3AutolabelWorker, SAM3AutolabelBatchWorker, SAM3PropagateWorker,
+    SAM3PointWorker,
     Owlv2AutolabelWorker, Owlv2AutolabelBatchWorker, _OWLV2_AVAILABLE,
     GenericAutolabelWorker, GenericAutolabelBatchWorker, GENERIC_DETECTORS,
     Owlv2ExemplarWorker, Owlv2ExemplarBatchWorker,
@@ -74,7 +75,8 @@ class ReviewWindow(QMainWindow):
                  sam3_model: Optional[str] = None,
                  sam3_device: str = "cuda",
                   sam3_conf: float = 0.25,
-                  propagate_method: str = "memory",
+                 propagate_model: Optional[str] = None,
+                 propagate_method: str = "memory",
                   propagate_min_iou: float = 0.3,
                   propagate_min_seed_iou: float = 0.2,
                   auto_segment: bool = False,
@@ -103,6 +105,12 @@ class ReviewWindow(QMainWindow):
         self.sam3_model = sam3_model
         self.sam3_device = sam3_device
         self.sam3_conf = sam3_conf
+        # Optional separate weights for "Propagate →" (defaults to sam3_model
+        # when None). SAM3.1 multiplex (core/sam3/models/sam3.1-model/
+        # sam3.1_multiplex.pt) tracks better than the base SAM3 checkpoint;
+        # setting it leaves all other SAM3 runs (autolabel, re-segment, point
+        # segment) on sam3_model.
+        self.propagate_model: Optional[str] = propagate_model
         # Propagate method: "memory" (SAM3 video memory bank, one session
         # per side) or "chain" (frame-by-frame re-detection, IoU-chained,
         # permanent stop on first miss). Config: sam3.propagate_method.
@@ -177,6 +185,16 @@ class ReviewWindow(QMainWindow):
         self._sam3_autolabel_worker: Optional[SAM3AutolabelWorker] = None
         self._sam3_autolabel_batch_worker: Optional[SAM3AutolabelBatchWorker] = None
         self._sam3_propagate_worker: Optional[SAM3PropagateWorker] = None
+        # Single-object point-prompt worker (side panel "🎯 Point segment").
+        self._point_seg_worker: Optional[SAM3PointWorker] = None
+        self._point_seg_job: Optional[Dict[str, Any]] = None
+        # In-progress point-seg session: {"image_id", "ann_id", "cat_id"} —
+        # refinement clicks update this annotation instead of adding new ones.
+        self._point_seg_pending: Optional[Dict[str, Any]] = None
+        # Frame index of the last _load_current — point prompts are cleared
+        # only when the frame actually changes, not on same-frame reloads
+        # (e.g. the deferred post-construction load or HUD refreshes).
+        self._last_loaded_idx: Optional[int] = None
         # Bumped on every source switch. Workers capture the value at start
         # (`_lr_session`); result handlers drop signals from stale sessions
         # so a job started on the old source can't write masks/boxes into
@@ -309,6 +327,8 @@ class ReviewWindow(QMainWindow):
         self.side.toggle_keyframe_clicked.connect(self._on_toggle_keyframe)
         self.side.toggle_annotated_clicked.connect(self._on_toggle_annotated)
         self.side.toggle_discard_clicked.connect(self._on_toggle_discard)
+        self.side.point_seg_toggled.connect(self._on_point_seg_toggled)
+        self.side.segment_points_clicked.connect(self._on_segment_points)
         self.side.interpolate_clicked.connect(self._on_interpolate)
         self.side.cancel_interp_clicked.connect(self._on_cancel_interp)
         self.side.track_id_selected.connect(self._on_track_selected)
@@ -402,6 +422,9 @@ class ReviewWindow(QMainWindow):
         c.quit_request.connect(self._on_quit)
         c.discard_all.connect(self._on_discard_all)
         c.cat_pick_requested.connect(self._on_cat_pick_requested)
+        c.point_prompts_changed.connect(self._on_point_prompts)
+        c.point_session_accepted.connect(self._on_point_session_accepted)
+        c.point_session_cancelled.connect(self._on_point_session_cancelled)
         c.toggle_masks.connect(self._on_toggle_masks)
         c.resegment_selected.connect(self._on_resegment_selected)
         c.play_pause.connect(self._on_play_pause)
@@ -679,6 +702,7 @@ class ReviewWindow(QMainWindow):
         self._current_image_id = None
         self._last_cat_id = None
         self._pending_cat_id = None
+        self._last_loaded_idx = None  # new source → next load is a frame change
         for c in self.canvases.values():
             c._image_id = None
             c.reset_state()
@@ -874,6 +898,13 @@ class ReviewWindow(QMainWindow):
         pm = sam3_cfg.get("propagate_method")
         if pm in ("memory", "chain"):
             self.propagate_method = pm
+        # Optional separate weights for propagation (e.g. SAM3.1 multiplex).
+        # Empty string / None falls back to sam3_model.
+        prop_model = sam3_cfg.get("propagate_model")
+        if prop_model:
+            self.propagate_model = str(prop_model)
+        elif "propagate_model" in sam3_cfg:
+            self.propagate_model = None
         if "propagate_min_iou" in sam3_cfg:
             self.propagate_min_iou = max(
                 0.0, min(1.0, float(sam3_cfg["propagate_min_iou"])))
@@ -1081,6 +1112,15 @@ class ReviewWindow(QMainWindow):
         idx = self._current_idx
         if idx < 0 or idx >= len(self.frame_index):
             return
+        # Point-seg sessions are per-frame: drop pending points/session when
+        # the frame changes (the annotation already added stays). Same-frame
+        # reloads (deferred post-construction load, discard HUD refresh, …)
+        # must NOT wipe an in-progress point session.
+        if idx != self._last_loaded_idx:
+            self._point_seg_pending = None
+            for c in self.canvases.values():
+                c.clear_point_prompts()
+        self._last_loaded_idx = idx
         ts_real = getattr(self.frame_index, "timestamps_real", True)
         # Decode + fill one canvas per side (just "left" in mono). Frame
         # navigation is index-based and moves all canvases together.
@@ -1976,12 +2016,26 @@ class ReviewWindow(QMainWindow):
 
     def _on_preselect_cat(self, cat_id: int) -> None:
         """A category was clicked in the side panel — remember it for the
-        next draw so the user doesn't need to press a number key."""
+        next draw so the user doesn't need to press a number key. In point
+        mode this only sets the category; SAM3 still waits for the
+        "▶ Segment points" button."""
         self._pending_cat_id = cat_id
         name = self.coco.cat_map.get(cat_id, "?")
+        canvas = self._active_canvas
+        if getattr(canvas, "_point_mode", False):
+            n = len(canvas._point_prompts)
+            if n:
+                self.statusBar().showMessage(
+                    f"{name} selected — {n} point(s) ready, press "
+                    f"▶ Segment points", 4000)
+            else:
+                self.statusBar().showMessage(
+                    f"Point segment: {name} — left-click + point, "
+                    f"right-click − point", 4000)
+            return
         # Put the canvas in draw mode immediately so the next click-drag draws.
-        self._active_canvas._drawing = True
-        self._active_canvas.update()
+        canvas._drawing = True
+        canvas.update()
         self.statusBar().showMessage(f"Drawing: {name} — drag on the image", 4000)
 
     def _on_recat_selected(self, cat_id: int) -> None:
@@ -2092,6 +2146,8 @@ class ReviewWindow(QMainWindow):
         elif job.get("kind") == "propagate":
             self._start_propagate_worker(
                 job["start_frame_idx"], job["seeds"], side=job.get("side"))
+        elif job.get("kind") == "point":
+            self._start_point_seg_worker(job)
         else:
             self._start_sam3_worker(job["img_path"], job["bboxes_xyxy"],
                                     job["concepts"], job["ann_ids"])
@@ -2357,7 +2413,8 @@ class ReviewWindow(QMainWindow):
         for w in (self._sam3_worker, self._sam3_batch_worker,
                   self._sam3_autolabel_worker,
                   self._sam3_autolabel_batch_worker,
-                  self._sam3_propagate_worker):
+                  self._sam3_propagate_worker,
+                  self._point_seg_worker):
             if w is not None and w.isRunning():
                 return True
         return False
@@ -2432,7 +2489,7 @@ class ReviewWindow(QMainWindow):
             if not _OWLV2_AVAILABLE:
                 QMessageBox.warning(
                     self, "OWLv2 unavailable",
-                    "OWLv2 (core/owlv2_detector) is not importable - "
+                    "OWLv2 (core/detectors.py) is not importable - "
                     "check that transformers is installed.")
                 return
         elif detector == "sam3" and not _SAM3_AVAILABLE:
@@ -2621,7 +2678,7 @@ class ReviewWindow(QMainWindow):
             if not _OWLV2_AVAILABLE:
                 QMessageBox.warning(
                     self, "OWLv2 unavailable",
-                    "OWLv2 (core/owlv2_detector) is not importable - "
+                    "OWLv2 (core/detectors.py) is not importable - "
                     "check that transformers is installed.")
                 return
         elif detector == "sam3" and not _SAM3_AVAILABLE:
@@ -2962,7 +3019,7 @@ class ReviewWindow(QMainWindow):
         tmp_dir = str(Path(self.coco.output_json).parent / "_tmp_sam3_imgs")
         self._sam3_propagate_worker = SAM3PropagateWorker(
             self._side_worker_index(side), start_frame_idx, seeds, tmp_dir,
-            model_path=self.sam3_model,
+            model_path=(self.propagate_model or self.sam3_model),
             device=self.sam3_device,
             conf=self.sam3_conf,
             method=self.propagate_method,
@@ -3303,6 +3360,208 @@ class ReviewWindow(QMainWindow):
         self._set_sam3_status(f"failed — {msg}")
         QMessageBox.warning(self, "SAM3 failed", msg)
 
+    # ----------------------- point-prompt segmentation ------------------ #
+
+    def _on_point_seg_toggled(self, on: bool) -> None:
+        """Side panel "🎯 Add points" toggle — switch both canvases between
+        point-prompt clicks and normal draw/select."""
+        for c in self.canvases.values():
+            c.set_point_mode(on)
+        self._point_seg_pending = None
+        self._update_segment_points_btn()
+        if on:
+            self.statusBar().showMessage(
+                "Add points ON — left-click + point, right-click − point; "
+                "then press ▶ Segment points to run SAM3. Enter accepts, "
+                "Esc cancels (category = preselected / last-used)", 6000)
+
+    def _update_segment_points_btn(self) -> None:
+        """Enable "▶ Segment points" while any point-mode canvas holds
+        accumulated points."""
+        enabled = any(c._point_mode and c._point_prompts
+                      for c in self.canvases.values())
+        self.side.btn_segment_points.setEnabled(enabled)
+
+    def _point_seg_cat(self) -> Optional[int]:
+        """Category for a point-segmented object: preselected → last-used →
+        exactly-one highlighted category; None when ambiguous."""
+        cat_id = getattr(self, "_pending_cat_id", None)
+        if cat_id is None:
+            cat_id = getattr(self, "_last_cat_id", None)
+        if cat_id not in self.coco.cat_map:
+            cat_id = None
+        if cat_id is None:
+            highlighted = self.side.get_selected_cat_ids()
+            if len(highlighted) == 1:
+                cat_id = highlighted[0]
+        return cat_id
+
+    def _on_point_prompts(self, image_id: int, prompts: list,
+                          canvas=None) -> None:
+        """Canvas click in point mode — points only ACCUMULATE; SAM3 runs
+        when the user presses "▶ Segment points" (_on_segment_points)."""
+        self._update_segment_points_btn()
+        n_pos = sum(1 for p in prompts if p[2] == 1)
+        n_neg = len(prompts) - n_pos
+        self.statusBar().showMessage(
+            f"{len(prompts)} point(s) ({n_pos}+ {n_neg}−) — press "
+            f"▶ Segment points to run SAM3", 3000)
+
+    def _on_segment_points(self) -> None:
+        """"▶ Segment points" button: run SAM3 once with every accumulated
+        point on the canvas that holds them ([[x, y, label], ...])."""
+        if not _SAM3_AVAILABLE:
+            QMessageBox.warning(self, "SAM3 unavailable",
+                                "core.models_inference.run_sam3 not importable.")
+            return
+        canvas = self._active_canvas
+        if not (canvas._point_mode and canvas._point_prompts):
+            canvas = next((c for c in self.canvases.values()
+                           if c._point_mode and c._point_prompts), None)
+        if canvas is None or canvas._image_id is None:
+            self.statusBar().showMessage(
+                "Point segment: add points first (🎯 Add points mode)", 4000)
+            return
+        image_id = canvas._image_id
+        prompts = [list(p) for p in canvas._point_prompts]
+        side = canvas.side
+        # Category is fixed when the session's first run happens; reuse the
+        # pending session's category for refinement runs.
+        pending = getattr(self, "_point_seg_pending", None)
+        if pending and pending.get("image_id") == image_id:
+            cat_id = pending["cat_id"]
+        else:
+            cat_id = self._point_seg_cat()
+        if cat_id is None:
+            # Points stay accumulated on the canvas — picking a category row
+            # and pressing ▶ Segment points again runs with them.
+            msg = ("point segment: pick a category first — click a row in "
+                   "the category list")
+            self._set_sam3_status(msg)
+            self.statusBar().showMessage(msg, 5000)
+            return
+        img_path = self._write_tmp_image(side)
+        if img_path is None:
+            self._set_sam3_status("point segment failed — no image for frame")
+            return
+        job = {
+            "kind": "point",
+            "img_path": img_path,
+            "points": [[p[0], p[1]] for p in prompts],
+            "labels": [int(p[2]) for p in prompts],
+            "cat_id": cat_id,
+            "image_id": image_id,
+        }
+        if self._sam3_busy():
+            self._sam3_queue.append(job)
+            self._refresh_sam3_status()
+            self.statusBar().showMessage(
+                f"SAM3 busy — point segment queued "
+                f"({len(self._sam3_queue)} in queue)", 2500)
+            return
+        self._start_point_seg_worker(job)
+
+    def _start_point_seg_worker(self, job: Dict[str, Any]) -> None:
+        n_pos = sum(1 for l in job["labels"] if l == 1)
+        n_neg = len(job["labels"]) - n_pos
+        cat_name = self.coco.cat_map.get(job.get("cat_id"), "?")
+        self._set_sam3_status(
+            f"point segment running ({n_pos}+ {n_neg}−, \"{cat_name}\")…")
+        self.side.set_sam3_running(True)
+        self._point_seg_job = job
+        self._point_seg_worker = SAM3PointWorker(
+            image_path=job["img_path"],
+            points=job["points"],
+            labels=job["labels"],
+            model_path=self.sam3_model,
+            device=self.sam3_device,
+            conf=self.sam3_conf,
+            text=cat_name if cat_name != "?" else None,
+            parent=self,
+        )
+        self._point_seg_worker.finished_signal.connect(
+            self._on_point_seg_finished)
+        self._point_seg_worker.failed_signal.connect(self._on_sam3_failed)
+        self._point_seg_worker._lr_session = self._session_seq
+        self._point_seg_worker.start()
+
+    def _on_point_seg_finished(self, result: dict) -> None:
+        if self._stale_sender():
+            return
+        self.side.set_sam3_running(False)
+        job = getattr(self, "_point_seg_job", None) or {}
+        image_id = job.get("image_id")
+        cat_id = job.get("cat_id")
+        if not result.get("success"):
+            self._set_sam3_status(
+                f"point segment failed — {result.get('error', 'no mask')}")
+            QTimer.singleShot(0, self._start_next_queued_sam3)
+            return
+        bbox = result.get("bbox_xyxy")
+        mask = result.get("mask")
+        if bbox is None or image_id is None or cat_id is None:
+            self._set_sam3_status("point segment: nothing found at that point")
+            QTimer.singleShot(0, self._start_next_queued_sam3)
+            return
+        x1, y1, x2, y2 = bbox
+        w, h = x2 - x1, y2 - y1
+        if w < 2 or h < 2:
+            self._set_sam3_status("point segment: mask too small — ignored")
+            QTimer.singleShot(0, self._start_next_queued_sam3)
+            return
+        # Refinement clicks update the session's existing annotation; the
+        # first successful run of a session creates it.
+        pending = getattr(self, "_point_seg_pending", None)
+        reuse = (pending and pending.get("image_id") == image_id
+                 and self.coco.get_box(pending["ann_id"]) is not None)
+        with self.coco.undo_stack.group("point segment"):
+            if reuse:
+                ann_id = pending["ann_id"]
+                self.coco.move_box(ann_id, x1, y1, w, h)
+                if mask is not None:
+                    self.coco.set_mask(ann_id, mask)
+            else:
+                ann_id = self.coco.add_box(image_id, x1, y1, w, h, cat_id)
+                if mask is not None:
+                    self.coco.set_mask(ann_id, mask)
+                self._point_seg_pending = {"image_id": image_id,
+                                           "ann_id": ann_id, "cat_id": cat_id}
+        self._last_cat_id = cat_id
+        if image_id == self._current_image_id:
+            self._refresh_boxes()
+        self.coco.save(is_final=False)
+        verb = "updated" if reuse else "+1"
+        self._set_sam3_status(
+            f"point segment: {verb} {self.coco.cat_map.get(cat_id, '?')} "
+            f"(ann_id={ann_id})")
+        QTimer.singleShot(0, self._start_next_queued_sam3)
+
+    def _on_point_session_accepted(self) -> None:
+        """Enter in point mode: keep the annotation, start a fresh session."""
+        self._point_seg_pending = None
+        canvas = self.sender()
+        if isinstance(canvas, CanvasWidget):
+            canvas.clear_point_prompts()
+        self.statusBar().showMessage(
+            "Point segment: accepted — next click starts a new object", 2500)
+
+    def _on_point_session_cancelled(self) -> None:
+        """Esc in point mode: drop the session's annotation + points."""
+        pending = getattr(self, "_point_seg_pending", None)
+        canvas = self.sender()
+        if isinstance(canvas, CanvasWidget):
+            canvas.clear_point_prompts()
+        self._point_seg_pending = None
+        if pending and self.coco.get_box(pending["ann_id"]) is not None:
+            self.coco.remove_box(pending["ann_id"])
+            self._refresh_boxes()
+            self.statusBar().showMessage(
+                f"Point segment: cancelled — removed box "
+                f"#{pending['ann_id']}", 2500)
+        else:
+            self.statusBar().showMessage("Point segment: cancelled", 2500)
+
+
     def _on_toggle_masks(self) -> None:
         new_vis = not self._active_canvas.masks_visible()
         for c in self.canvases.values():
@@ -3350,6 +3609,7 @@ class ReviewWindow(QMainWindow):
                   self._sam3_autolabel_worker,
                   self._sam3_autolabel_batch_worker,
                   self._sam3_propagate_worker,
+                  self._point_seg_worker,
                   self._interp_worker):
             if w is None or not w.isRunning():
                 continue

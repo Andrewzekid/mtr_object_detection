@@ -360,6 +360,25 @@ def test_legacy_base64_mask_migrates_to_segmentation(lr, tmp_path):
     assert d3["annotations"][0].get("segmentation")
 
 
+def test_set_mask_muted_skips_undo_snapshot(lr, tmp_path):
+    """While the undo stack is muted (propagation runs), set_mask still
+    attaches the mask but pushes no undo entry and makes no snapshot
+    copies."""
+    path = str(tmp_path / "muted.json")
+    coco = lr.CocoState(path, [{"id": 0, "name": "a"}])
+    img = coco.ensure_image({"timestamp_ns": 0, "log_time_ns": 0,
+                            "frame_idx": 0}, 32, 32)
+    ann_id = coco.add_box(img, 1, 1, 10, 10, 0)
+    n_undo = len(coco.undo_stack._undo)
+    mask = np.zeros((32, 32), bool)
+    mask[2:8, 2:8] = True
+    with coco.undo_stack.mute():
+        coco.set_mask(ann_id, mask)
+    assert coco.get_box(ann_id)["_mask"] is mask  # attached, no copy
+    assert len(coco.undo_stack._undo) == n_undo   # nothing pushed
+    assert coco.dirty
+
+
 def test_save_honors_min_polygon_area(lr, tmp_path):
     mask = np.zeros((64, 64), dtype=bool)
     mask[10:30, 10:30] = True

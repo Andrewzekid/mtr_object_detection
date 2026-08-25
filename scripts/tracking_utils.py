@@ -221,6 +221,7 @@ def build_runtime_tracker_yaml(
     proximity_thresh: float | None = None,
     appearance_thresh: float | None = None,
     use_byte: bool | None = None,
+    track_low_thresh: float | None = None,
 ) -> Path:
     """Merge CLI overrides into a copy of a tracker YAML for this run.
 
@@ -239,6 +240,8 @@ def build_runtime_tracker_yaml(
 
     cfg["tracker_type"] = tracker_type
     cfg["track_high_thresh"] = float(track_high_thresh)
+    if track_low_thresh is not None:
+        cfg["track_low_thresh"] = float(track_low_thresh)
     cfg["track_buffer"] = int(track_buffer)
     cfg["with_reid"] = bool(with_reid)
 

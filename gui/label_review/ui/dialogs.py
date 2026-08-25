@@ -154,6 +154,26 @@ class ConfigDialog(QtWidgets.QDialog):
             "  (previous box as prompt, IoU-gated). A track stops\n"
             "  permanently at the first frame with no detection.")
         sam3_form.addRow("Propagate method", self.combo_propagate_method)
+        # Optional separate weights for "Propagate →". SAM3.1 multiplex
+        # (core/sam3/models/sam3.1-model/sam3.1_multiplex.pt) generally
+        # tracks better than the base SAM3 checkpoint; leaving this empty
+        # uses the same Model path as everything else.
+        self.edit_propagate_model = QtWidgets.QLineEdit()
+        self.edit_propagate_model.setPlaceholderText(
+            "default: same as Model path (e.g. "
+            "core/sam3/models/sam3.1-model/sam3.1_multiplex.pt)")
+        self.edit_propagate_model.setToolTip(
+            "Optional path to SAM3 weights used ONLY by 'Propagate →'\n"
+            "(the memory-bank video session). Set this to the SAM3.1\n"
+            "multiplex checkpoint for better tracking. Leave empty to use\n"
+            "the same Model path as the rest of SAM3. Takes effect on the\n"
+            "next propagate run.")
+        btn_browse_prop_model = QPushButton("Browse…")
+        btn_browse_prop_model.clicked.connect(self._browse_propagate_model)
+        prop_model_row = QHBoxLayout()
+        prop_model_row.addWidget(self.edit_propagate_model, 1)
+        prop_model_row.addWidget(btn_browse_prop_model)
+        sam3_form.addRow("Propagate model", prop_model_row)
         self.spin_propagate_min_iou = QtWidgets.QDoubleSpinBox()
         self.spin_propagate_min_iou.setRange(0.0, 1.0)
         self.spin_propagate_min_iou.setSingleStep(0.05)
@@ -386,6 +406,8 @@ class ConfigDialog(QtWidgets.QDialog):
         idx = self.combo_propagate_method.findData(
             getattr(win, "propagate_method", "memory"))
         self.combo_propagate_method.setCurrentIndex(max(0, idx))
+        self.edit_propagate_model.setText(
+            getattr(win, "propagate_model", "") or "")
         self.spin_propagate_min_iou.setValue(
             getattr(win, "propagate_min_iou", 0.3))
         self.spin_propagate_seed_iou.setValue(
@@ -425,6 +447,8 @@ class ConfigDialog(QtWidgets.QDialog):
             self.combo_propagate_method.setCurrentIndex(
                 self.combo_propagate_method.findData(
                     sam3["propagate_method"]))
+        if sam3.get("propagate_model"):
+            self.edit_propagate_model.setText(str(sam3["propagate_model"]))
         if "propagate_min_iou" in sam3:
             self.spin_propagate_min_iou.setValue(
                 max(0.0, min(1.0, float(sam3["propagate_min_iou"]))))
@@ -499,6 +523,8 @@ class ConfigDialog(QtWidgets.QDialog):
                 "autolabel_nms_iou": self.spin_nms_iou.value(),
                 "propagate_method":
                     self.combo_propagate_method.currentData(),
+                "propagate_model":
+                    self.edit_propagate_model.text().strip() or None,
                 "propagate_min_iou": self.spin_propagate_min_iou.value(),
                 "propagate_min_seed_iou":
                     self.spin_propagate_seed_iou.value(),
@@ -549,6 +575,13 @@ class ConfigDialog(QtWidgets.QDialog):
             self, "SAM3 weights", "", "PyTorch weights (*.pt);;All files (*)")
         if path:
             self.edit_sam3_model.setText(path)
+
+    def _browse_propagate_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Propagate weights (SAM3 / SAM3.1)", "",
+            "PyTorch weights (*.pt);;All files (*)")
+        if path:
+            self.edit_propagate_model.setText(path)
 
     def _on_apply(self) -> None:
         self.win._apply_runtime_config(self._collect())

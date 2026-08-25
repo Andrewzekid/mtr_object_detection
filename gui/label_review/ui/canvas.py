@@ -33,6 +33,11 @@ class CanvasWidget(QWidget):
     selection_changed = pyqtSignal(int)  # selected box index (or -1)
     zoom_to_selected = pyqtSignal()    # Z key
     next_unlabeled = pyqtSignal()      # U key
+    # Point-seg mode: the full prompt set after each click — list of
+    # [x, y, label] with label 1 = positive (left), 0 = negative (right).
+    point_prompts_changed = pyqtSignal(int, object)  # img_id, prompts
+    point_session_accepted = pyqtSignal()   # Enter in point mode
+    point_session_cancelled = pyqtSignal()  # Esc in point mode
 
     def __init__(self, parent=None, side: str = "left"):
         super().__init__(parent)
@@ -77,6 +82,12 @@ class CanvasWidget(QWidget):
         self._draw_current: Optional[Tuple[float, float]] = None
         self._waiting_cat: bool = False
         self._pending_rect: Optional[Tuple[float, float, float, float]] = None
+        # Point-segment mode: left click adds a positive point, right click a
+        # negative one; every click re-runs SAM3 with the full prompt set.
+        # Enter accepts the session, Esc cancels it. Toggled from the side
+        # panel's "Point segment" button.
+        self._point_mode: bool = False
+        self._point_prompts: List[List[float]] = []  # [x, y, label]
 
         # Box editing state. _edit_mode is one of:
         #   "idle" | "draw" | "move" | "resize_tl" | "resize_tr" |
@@ -109,6 +120,27 @@ class CanvasWidget(QWidget):
         self._info_text = ""
 
     # ----------------------- public api -------------------------------- #
+
+    def set_point_mode(self, on: bool) -> None:
+        """Toggle point-segment mode: clicks become SAM3 point prompts."""
+        self._point_mode = on
+        self._point_prompts = []
+        if on:
+            # Cancel any armed draw state so clicks can't start a rect.
+            self._drawing = False
+            self._edit_mode = "idle"
+            self._draw_start = None
+            self._draw_current = None
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.unsetCursor()
+        self.update()
+
+    def clear_point_prompts(self) -> None:
+        """Drop all accumulated point prompts (frame change / session end)."""
+        if self._point_prompts:
+            self._point_prompts = []
+            self.update()
 
     def set_image(self, arr: np.ndarray) -> None:
         h, w, _ = arr.shape
@@ -375,6 +407,20 @@ class CanvasWidget(QWidget):
             for hx, hy in handles:
                 p.drawRect(int(hx - r), int(hy - r), 2 * r, 2 * r)
 
+        # Draw accumulated point prompts (green + positive / red − negative).
+        if self._point_prompts:
+            marker_font = QFont("Sans", 10)
+            marker_font.setBold(True)
+            p.setFont(marker_font)
+            for px_, py_, label in self._point_prompts:
+                wp = self._img_to_widget(px_, py_)
+                color = QColor(60, 220, 60) if label == 1 else QColor(255, 70, 70)
+                p.setPen(QPen(color, 2))
+                p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QtCore.QPointF(wp.x(), wp.y()), 6.0, 6.0)
+                p.drawText(int(wp.x() - 4), int(wp.y() + 5),
+                           "+" if label == 1 else "−")
+
         # Draw pending rectangle while dragging.
         if self._drawing and self._draw_start and self._draw_current:
             x0, y0 = self._draw_start
@@ -406,6 +452,14 @@ class CanvasWidget(QWidget):
             if self._waiting_cat:
                 return
             px, py = ev.position().x(), ev.position().y()
+            if self._point_mode:
+                # Point-segment mode: left = positive point prompt.
+                ix, iy = self._clamp_img_pt(*self._widget_to_img(px, py))
+                self._point_prompts.append([ix, iy, 1])
+                self.point_prompts_changed.emit(
+                    self._image_id or 0, [list(p) for p in self._point_prompts])
+                self.update()
+                return
             if self._drawing:
                 ix, iy = self._clamp_img_pt(*self._widget_to_img(px, py))
                 self._draw_start = (ix, iy)
@@ -462,6 +516,16 @@ class CanvasWidget(QWidget):
                 self._multi_selected = set()
                 self.selection_changed.emit(-1)
                 self.update()
+        elif ev.button() == Qt.RightButton and self._point_mode:
+            # Point-segment mode: right click = negative point prompt.
+            if self._waiting_cat:
+                return
+            px, py = ev.position().x(), ev.position().y()
+            ix, iy = self._clamp_img_pt(*self._widget_to_img(px, py))
+            self._point_prompts.append([ix, iy, 0])
+            self.point_prompts_changed.emit(
+                self._image_id or 0, [list(p) for p in self._point_prompts])
+            self.update()
         elif ev.button() == Qt.MiddleButton:
             self._panning = True
             self._pan_start = ev.position()
@@ -588,6 +652,9 @@ class CanvasWidget(QWidget):
 
     def _update_cursor(self, px: float, py: float) -> None:
         """Set the cursor shape based on what's under it (handle / box / empty)."""
+        if self._point_mode:
+            self.setCursor(Qt.CrossCursor)
+            return
         if 0 <= self._selected_idx < len(self._boxes):
             corner = self._hit_corner(self._selected_idx, px, py)
             if corner in ("tl", "br"):
@@ -680,6 +747,14 @@ class CanvasWidget(QWidget):
                    if 0 <= i < len(self._boxes)]
             for ann_id in ids:
                 self.box_deleted.emit(ann_id)
+        elif self._point_mode and k in (Qt.Key_Return, Qt.Key_Enter):
+            # Accept the current point-seg session; next click starts a new
+            # object.
+            self.point_session_accepted.emit()
+        elif self._point_mode and k == Qt.Key_Escape and self._point_prompts:
+            # Cancel the in-progress point session (before the generic Esc
+            # handling below).
+            self.point_session_cancelled.emit()
         elif k in (Qt.Key_A,):
             self._drawing = not self._drawing
             self._draw_start = None

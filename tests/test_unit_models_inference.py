@@ -75,6 +75,8 @@ def fake_video_predictor(monkeypatch):
     _FakeVideoPredictor.instances.clear()
     import ultralytics.models.sam as sam_mod
     monkeypatch.setattr(sam_mod, "SAM3VideoPredictor", _FakeVideoPredictor)
+    from core import models_inference as mi
+    mi._SAM3_VIDEO_PREDICTOR_CACHE.clear()  # isolate tests from the cache
     return _FakeVideoPredictor
 
 
@@ -116,6 +118,21 @@ def test_video_propagate_default_model_path(fake_video_predictor):
     list(sam3_video_propagate("/tmp/clip.mp4", [[1, 1, 9, 9]], device="cpu"))
     pred = fake_video_predictor.instances[0]
     assert pred.overrides["model"].endswith("sam3.pt")
-    assert pred.overrides["imgsz"] == 1024
+    assert pred.overrides["imgsz"] == 1280
     assert pred.overrides["device"] == "cpu"
     assert pred.source == "/tmp/clip.mp4"
+
+
+def test_video_propagate_predictor_cached_across_runs(fake_video_predictor):
+    """A second run with the same config reuses the predictor (no checkpoint
+    reload), while setup_source/init_state still run per video."""
+    from core.models_inference import sam3_video_propagate
+    for _ in range(2):
+        frames = list(sam3_video_propagate("/tmp/clip.mp4", [[1, 1, 9, 9]],
+                                           model_path="m.pt", device="cpu"))
+        assert len(frames) == 4
+    assert len(fake_video_predictor.instances) == 1  # built once, reused
+    # A different config builds a new predictor.
+    list(sam3_video_propagate("/tmp/clip.mp4", [[1, 1, 9, 9]],
+                              model_path="m.pt", device="cpu", imgsz=1024))
+    assert len(fake_video_predictor.instances) == 2

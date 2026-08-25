@@ -63,7 +63,10 @@ class RerunLogger:
         try:
             rr.init("label_review", recording_id="label_review")
             self._stream = rr.get_global_data_recording()
-            self._stream.save(rrd_path)
+            # Do NOT call stream.save() here: it replaces the output sink
+            # with the file, so a live-spawned viewer would never receive
+            # any data. Persistence is handled by spawning the viewer with
+            # ``--save`` (see spawn()), which records the live gRPC stream.
             self.enabled = True
         except Exception as exc:
             print(f"WARNING: could not open Rerun recording {rrd_path}: {exc}")
@@ -166,11 +169,23 @@ class RerunLogger:
 
     def spawn(self) -> bool:
         """Open the standalone `rerun` viewer, live-connected to this
-        recording (gRPC), so later mark-as-annotated logs appear in it."""
+        recording (gRPC), so later mark-as-annotated logs appear in it.
+
+        When an .rrd path was configured the viewer is launched with
+        ``--save`` so everything it receives is persisted to that file.
+        """
         if not self.enabled or self._stream is None:
             return False
         try:
-            self._stream.spawn()
+            import subprocess
+            cmd = ["rerun"]
+            if self.path:
+                cmd += ["--save", self.path]
+            subprocess.Popen(cmd)
+            try:
+                self._stream.connect_grpc()
+            except AttributeError:  # older rerun-sdk
+                self._stream.connect()
             return True
         except Exception as exc:
             print(f"WARNING: could not spawn the rerun viewer: {exc}")

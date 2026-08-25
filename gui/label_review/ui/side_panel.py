@@ -55,6 +55,8 @@ class SidePanel(QWidget):
     toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
     toggle_annotated_clicked = pyqtSignal()  # "✔ Mark as annotated" button
     toggle_discard_clicked = pyqtSignal()    # "🚫 Discard image" button
+    point_seg_toggled = pyqtSignal(bool)     # "🎯 Add points" toggle
+    segment_points_clicked = pyqtSignal()    # "▶ Segment points" button
     interpolate_clicked = pyqtSignal()       # "Interpolate" button (I)
     cancel_interp_clicked = pyqtSignal()     # "Stop" button (running interp)
     track_id_selected = pyqtSignal(object)   # new track id (int) or None
@@ -274,6 +276,31 @@ class SidePanel(QWidget):
         self.btn_cancel_sam3.clicked.connect(self.cancel_sam3_clicked.emit)
         sam_layout.addWidget(self.btn_cancel_sam3)
         layout.addLayout(sam_layout)
+
+        point_row = QHBoxLayout()
+        self.btn_add_points = QPushButton("🎯 Add points")
+        self.btn_add_points.setCheckable(True)
+        self.btn_add_points.setToolTip(
+            "Point-prompt mode: while ON, left-click adds a positive point "
+            "and right-click a negative point on the canvas. Points only "
+            "accumulate — nothing runs until you press ▶ Segment points. "
+            "Enter accepts the segmented object (next points start a new "
+            "one), Esc cancels it. Toggle off to go back to draw/select.")
+        self.btn_add_points.toggled.connect(self.point_seg_toggled.emit)
+        point_row.addWidget(self.btn_add_points)
+        self.btn_segment_points = QPushButton("▶ Segment points")
+        self.btn_segment_points.setEnabled(False)  # needs ≥1 point
+        self.btn_segment_points.setToolTip(
+            "Run SAM3 once with ALL accumulated points (positive + "
+            "negative). The selected category is passed as a text prompt: "
+            "SAM3 detects all instances of that category and your points "
+            "pick which one to keep (falls back to pure point prompting "
+            "when nothing matches). Add more points and press again to "
+            "refine the same mask. Category = preselected / last-used.")
+        self.btn_segment_points.clicked.connect(
+            self.segment_points_clicked.emit)
+        point_row.addWidget(self.btn_segment_points)
+        layout.addLayout(point_row)
 
         self.btn_sam3_all_frames = QPushButton("SAM3 ALL frames")
         self.btn_sam3_all_frames.setToolTip(

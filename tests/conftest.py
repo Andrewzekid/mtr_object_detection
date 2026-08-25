@@ -222,6 +222,7 @@ def fake_sam3(lr, monkeypatch):
     monkeypatch.setattr(mw, "SAM3AutolabelWorker", FakeAutolabelSingle)
     monkeypatch.setattr(mw, "SAM3AutolabelBatchWorker", FakeWorker)
     monkeypatch.setattr(mw, "SAM3PropagateWorker", FakePropagateWorker)
+    monkeypatch.setattr(mw, "SAM3PointWorker", FakeWorker)
     monkeypatch.setattr(mw, "_SAM3_AVAILABLE", True)
 
     class NS:

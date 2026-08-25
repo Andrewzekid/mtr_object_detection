@@ -639,14 +639,14 @@ def test_propagate_worker_chain_passes_iou_thresholds(sam3_on, workers,
 # ---------------------------------------------------------------------------
 
 def test_build_grounding_dino_prompt():
-    from core.grounding_dino_detector import build_grounding_dino_prompt
+    from core.detectors import build_grounding_dino_prompt
     # lowercased, " . "-joined, trailing period, existing periods stripped
     assert build_grounding_dino_prompt(["Door", "Exit Sign."]) == \
         "door . exit sign ."
 
 
 def test_generic_detect_dispatch_grounding_dino(workers, monkeypatch):
-    import core.grounding_dino_detector as gd
+    import core.detectors as gd
     calls = {}
 
     def fake(img, concepts, model_id=None, device="cuda",
@@ -668,8 +668,8 @@ def test_generic_detect_dispatch_grounding_dino(workers, monkeypatch):
 
 
 def test_generic_detect_dispatch_florence2_and_falcon(workers, monkeypatch):
-    import core.falcon_detector as fa
-    import core.florence2_detector as fl
+    import core.detectors as fa
+    import core.detectors as fl
     monkeypatch.setattr(
         fl, "florence2_detect",
         lambda *a, **k: [{"label": "x", "bbox_xyxy": [0, 0, 1, 1],
@@ -757,7 +757,7 @@ def test_generic_autolabel_batch_worker_cancel(workers, monkeypatch,
 
 
 def test_owlv2_exemplar_worker(workers, monkeypatch):
-    import core.owlv2_detector as od
+    import core.detectors as od
     assert workers._OWLV2_AVAILABLE
     calls = {}
 
@@ -782,7 +782,7 @@ def test_owlv2_exemplar_worker(workers, monkeypatch):
 
 
 def test_owlv2_exemplar_batch_worker(workers, monkeypatch, tmp_path):
-    import core.owlv2_detector as od
+    import core.detectors as od
     monkeypatch.setattr(
         od, "owlv2_detect_exemplar",
         lambda *a, **k: [{"label": k.get("label") or a[2],
@@ -802,12 +802,12 @@ def test_owlv2_exemplar_batch_worker(workers, monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# core.falcon_detector helpers (no HF download — model/load monkeypatched)
+# core.detectors falcon helpers (no HF download — model/load monkeypatched)
 # ---------------------------------------------------------------------------
 
 def test_falcon_bbox_conversion(monkeypatch):
     """Normalized centre+size -> absolute xyxy using the image size."""
-    import core.falcon_detector as fd
+    import core.detectors as fd
 
     class FakeModel:
         def generate(self, img, query, compile=False):
@@ -829,7 +829,7 @@ def test_falcon_bbox_conversion(monkeypatch):
 def test_falcon_decode_mask_roundtrip():
     pytest.importorskip("pycocotools")
     from pycocotools import mask as mask_utils
-    from core.falcon_detector import _decode_mask
+    from core.detectors import _decode_mask
     m = np.zeros((10, 12), dtype=np.uint8, order="F")
     m[2:5, 3:8] = 1
     rle = mask_utils.encode(m)
@@ -840,6 +840,6 @@ def test_falcon_decode_mask_roundtrip():
 
 
 def test_falcon_decode_mask_empty():
-    from core.falcon_detector import _decode_mask
+    from core.detectors import _decode_mask
     assert _decode_mask({"counts": "", "size": [10, 10]}) is None
     assert _decode_mask({}) is None

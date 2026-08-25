@@ -563,17 +563,19 @@ class CocoState:
 
     def set_mask(self, ann_id: int, mask: Optional[np.ndarray]) -> None:
         """Attach (or clear) a SAM3 mask to an annotation, in-memory only."""
-        prev_mask = None
         for ann in self.annotations:
             if ann["id"] == ann_id:
-                prev_mask = ann.get("_mask")
-                if isinstance(prev_mask, np.ndarray):
-                    prev_mask = prev_mask.copy()
+                prev = ann.get("_mask")
                 if mask is None:
                     ann.pop("_mask", None)
                 else:
                     ann["_mask"] = mask
                 self.dirty = True
+                if self.undo_stack.muted:
+                    # The push would be dropped — skip the two full-res
+                    # snapshot copies (hot path during propagation runs).
+                    return
+                prev_mask = prev.copy() if isinstance(prev, np.ndarray) else None
                 # Undo: restore the previous mask (or None).
                 mask_copy = mask.copy() if isinstance(mask, np.ndarray) else None
                 self.undo_stack.push(
