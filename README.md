@@ -50,6 +50,47 @@ blocks at load; Florence-2 runs its 2023-era remote code under
 transformers 5.x via shims plus a local beam search (`model.generate` is
 unusable there — see `core/florence2_detector.py`).
 
+### Labelling assist features (when and how to use them)
+
+The review GUI is built so a human never labels every frame by hand. Typical
+session: let Qwen seed boxes on the keyframes, open the GUI, then combine
+the assistants below depending on the footage.
+
+- **Autolabel (frame / ALL frames)** — open-set detectors fill in boxes (+
+  masks for SAM3/Falcon) for the session categories. Highlighting 2+
+  categories in the list restricts the run to just those. Use it to add a
+  category you forgot to prompt Qwen for, or to re-label with a stronger
+  open-set model. `owlv2_exemplar` is the 1-shot variant: draw/fix ONE good
+  box by hand, select it, then autolabel — best for odd objects text
+  prompts miss.
+- **Keyframes** — for near-static cameras (corridors, platforms) frames are
+  near-duplicates, so label every Nth (`--keyframe-stride N`, N≈10) and let
+  interpolation/propagation cover the gaps. Small N for fast motion, large
+  N for static scenes. The GUI's ★ Keyframe toggle (K) marks frames that
+  anchor interpolation.
+- **Interpolate (I)** — linearly/optical-flow interpolates boxes of the
+  same track between two labelled frames. Use when motion is **smooth and
+  in a constant direction** (walking past a static camera, slow pans).
+  Workflow: label a frame, jump ~10–30 frames, label the same objects again,
+  select the boxes, Interpolate. Bad under occlusion, direction reversals,
+  or objects appearing/disappearing — check the in-between frames after
+  running it.
+- **Propagate → (SAM3 tracking)** — select a box and let SAM3's video
+  memory bank follow that instance forward frame by frame, producing masks.
+  Use for deformable/rotating objects or longer ranges where interpolation
+  drifts. Two methods in Settings → SAM3: `memory` (default; one video
+  session, can recover after temporary loss) and `chain` (re-detect each
+  frame from the previous box, IoU-gated; stops permanently at the first
+  miss). Stops being reliable under large camera jumps — re-seed from a
+  later frame.
+- **Re-segment selected** — re-runs SAM3 on a box you moved/resized to get
+  a fresh mask. Use after every manual box edit if masks matter.
+- **Discard image (🚫)** — drops the frame from the saved COCO entirely.
+  Use for blurry/irrelevant frames so they never reach training.
+- **Stereo sync** — left/right frames pair by timestamp filename; unmatched
+  frames are skipped everywhere (display and save), so a saved stereo COCO
+  only contains synced pairs, sorted earliest first.
+
 End-to-end pipeline that takes **raw images** and produces a **trained YOLO
 detection/segmentation model** plus **tracking results**, with a
 human-in-the-loop review step in the middle. It targets Hong Kong MTR and
@@ -66,21 +107,28 @@ python scripts/11_run_tracking.py \
 ```
 There are two labeling flows:
 
-**Full pipeline** (dense labeling — every frame is labeled. RECOMMENDED):
+**Keyframe pipeline** (MAIN — label keyframes in the GUI with Qwen seed
+labels, use the GUI's labelling assistants to cover the rest):
 
 ```
-raw images → 07 Qwen VLM auto-label → 17 combine per-image results into
-            labels_coco.json → 08 human review/clean boxes
-            → 08b train/val/test split → 09 SAM3 box→mask seg dataset → Review the masks on roboflow and augment data
-            → 04 YOLO train → 05 evaluate → 11 tracking on raw frames
+data folder (or rosbag) → undistort → 00 sample → 12 keyframes → 01a stats
+   → 07 Qwen seed labels on keyframes → 08c combine to COCO
+   → GUI review (fix boxes, SAM3-segment, autolabel, interpolate/propagate,
+     discard bad frames) → 01b COCO→YOLO-seg → 03 train/test/val split
+   → 02 augment (train split only, mask-aware) → 04 YOLO seg train
+   → 05 evaluate (per-class P/R/F1 CSV) → 11 tracking on raw frames
 ```
-**Keyframe pipeline** (sparse labeling for near-static cameras — label every
-Nth frame, interpolate the rest.):
+
+The whole chain runs from one command — see "Orchestrated pipeline" below.
+
+**Full pipeline** (dense labeling — every frame goes through the VLM; slower,
+no keyframe step):
 
 ```
-12 extract keyframes → 07 Qwen seed boxes on keyframes → 08 review keyframes
-   → 13 interpolation to all frames → 08 review all
-   → 09 SAM3 segmentation dataset → Review the masks on roboflow and augment data → 04 YOLO train → 05 evaluate → 11 tracking on raw frames
+raw images → 07 Qwen VLM auto-label → 08c combine per-image results into
+            labels_coco.json → GUI review (same as above)
+            → 01b → 03 split → 02 augment train → 04 train → 05 evaluate
+            → 11 tracking
 ```
 
 **GUI segmentation pipeline** (annotate + segment in the label-review GUI, no
@@ -95,35 +143,65 @@ GUI annotate (SAM3 masks) → COCO labels_coco.json (discard unwanted frames
 See "Segmentation dataset pipeline (GUI → YOLO seg)" below for commands, or
 run all post-GUI steps at once with `scripts/run_seg_dataset_pipeline.py`.
 
-**Orchestrated rosbag pipeline** — run the whole keyframe workflow with one
-command, including fisheye undistortion and a time-based train/val/test split:
+**Orchestrated pipeline** — the whole keyframe workflow with one command.
+Input is either a Metacam rosbag (adds the fisheye undistortion stage) or a
+plain image folder:
 
 ```bash
 # 1. Start the llama.cpp server with the Qwen GGUF + mmproj:
 #    llama-server -m Qwen3.8-27B-Q4_K_M.gguf --mmproj Qwen3.8-mmproj-F16.gguf --port 8089
 
-# 2. Run the orchestrator (stops before interactive human review):
+# 2. Run the orchestrator (blocks at the GUI stage; resumes when you close
+#    the GUI after saving):
 python scripts/orchestrate_pipeline.py \
   --rosbag 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 \
-  --camera left \
-  --qwen-model Qwen3.8-27B-Q4_K_M.gguf \
-  --qwen-mmproj Qwen3.8-mmproj-F16.gguf \
+  --camera both \
+  --sample-size 1000 --keyframe-stride 10 \
   --llamacpp-url http://127.0.0.1:8089 \
-  --sam3-model core/sam3/models/sam3-model/sam3.pt
+  --qwen-model Qwen3.8-27B-Q4_K_M.gguf --qwen-mmproj Qwen3.8-mmproj-F16.gguf \
+  --ratios 0.7 0.15 0.15 --split-seed 42 \
+  --augmentations flip_horizontal rotate brightness --multiplier 2 \
+  --epochs 100 --batch-size 16 --model-type yolo26n --task segment --imgsz 768 \
+  --eval-splits test train --tracker deepocsort
 
-# Or via the shell wrapper (same defaults, env overrides: LLAMACPP_URL,
-# QWEN_MODEL, QWEN_MMPROJ, SAM3_MODEL; all extra args pass through):
-./scripts/run_pipeline.sh 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52
-./scripts/run_pipeline.sh <rosbag> --stage qwen_coco   # run a single stage
+# From an existing image folder instead of a rosbag (mono; for stereo point
+# --images at the parent of left/ + right/ and pass --camera both):
+python scripts/orchestrate_pipeline.py --images Datasets/HKU_GH --camera both
+
+# Or via the shell wrapper (env overrides: LLAMACPP_URL, QWEN_MODEL,
+# QWEN_MMPROJ; all extra args pass through):
+./scripts/run_pipeline.sh 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 --camera both
 ```
 
-Stages: `undistort`, `split`, `keyframes`, `qwen`, `qwen_coco`, `review`,
-`propagate`, `export`. They can be run independently with `--stage <name>`
-and skipped with `--skip-stage <name>`. Completed stages write marker files
-so the pipeline resumes where it left off. The `qwen_coco` stage combines
-the per-image Qwen result JSONs into a single `labels_coco.json`
-(next to the images, so the label review GUI picks it up automatically)
-via `scripts/08c_qwen_results_to_coco.py`.
+Stages: `undistort`, `sample`, `keyframes`, `stats`, `qwen`, `qwen_coco`,
+`gui`, `yolo`, `split`, `augment`, `assemble`, `train`, `evaluate`,
+`tracking`. Run a subset with `--stage <name>` (repeatable) and skip with
+`--skip-stage <name>`; completed stages write `stage_completed.json` markers
+so re-runs resume where they stopped (`--force` ignores markers). The `gui`
+stage launches the label-review GUI on the keyframes (`--gui-on all` loads
+every sampled frame instead) and waits — the pipeline continues after you
+save and close. Useful per-stage knobs:
+
+- llama.cpp / Qwen: `--llamacpp-url`, `--qwen-model`, `--qwen-mmproj`,
+  `--prompt` (class list is parsed from it; or `--classes`), `--resume-from`
+- sampling/keyframes: `--sample-size` (stereo: right side is synced to the
+  sampled left timestamps), `--sample-seed`, `--keyframe-stride`
+- dataset: `--ratios TRAIN TEST VAL`, `--split-seed`, `--bbox-as-rect`
+- augmentation (train split only): `--augmentations` (flip_horizontal,
+  flip_vertical, rotate, brightness, contrast, hue, blur, resize, mosaic),
+  `--multiplier`, `--rotation-range`, `--brightness-range`, `--hue-range`,
+  `--blur-range`, `--resize W H`, `--skip-augment`
+- training: `--epochs`, `--batch-size`, `--model-type`, `--task`,
+  `--imgsz`, `--pretrained`, `--lr0`, `--device`
+- evaluation: `--eval-splits`, `--eval-conf`, `--eval-iou`
+- tracking: `--tracker`, `--track-conf`, `--track-iou`, `--track-imgsz`,
+  `--track-fps`, `--track-max-frames`
+
+Outputs under `<input>_pipeline/`: `undistorted/`, `sampled/`, `keyframes/`,
+`qwen/`, `reviewed/labels_coco.json`, `dataset/{yolo_flat,split,
+train_augmented,final}` (+ `dataset.yaml` and `dataset_statistics.csv`),
+`training/yolo_training/weights/best.pt`, `evaluation/metrics.csv`,
+`tracking/<camera>/`.
 
 
 ### Directory layout
@@ -569,14 +647,14 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 |-------|---------|------------|---------|
 | `00_sample_from_dataset.py` | Pick N images from a source folder that aren't already in the labeled YOLO set, ready for labeling. | `--source-dir`, `--labeled-dir`, `--out-dir`, `-n`, `--copy`/`--symlink`, `--dry-run` | New image folder (copied or symlinked) |
 | `07_run_qwen.py` | Auto-label images with a VLM: Qwen via Ollama or DashScope API, or Gemma/Gemini. Supports conditioning refs, per-class, per-image labels. | `--prompt`, `--image`/`--image-folder`, `--template`, `--model`, `--conditioning-images`, `--per-class`, `--per-image-labels`, `--bbox-order`, `--dedup-iou`, `--use-api` | `<stem>_result.json` per image, `summary.json`, optional `--vis-output` |
-| `08_click_review_coco.py` | Interactive matplotlib reviewer to clean Qwen boxes; exports COCO + YOLO detection labels. | `--qwen-annotations-dir`, `--img_dir`, `--output_json`, `--output-yolo-dir`, `--data-yaml` | `coco_reviewed.json`, `yolo_reviewed/` (images, labels, `data.yaml`) |
-| `08b_split_reviewed_dataset.py` | Split `08`'s flat `yolo_reviewed/` into train/val/test for `09`. | `--input-dir`, `--output-dir`, `--ratios`, `--seed`, `--symlink-images` | `images/labels/{train,val,test}/`, `data.yaml` |
-| `09_create_seg_dataset.py` | Convert detection boxes → SAM3 masks → YOLO seg polygons, per class. | `--input-dir` (split), `--output-dir`, `--model` (sam3), `--conf`, `--device` | YOLO seg dataset + `creation_summary.json` |
+| `08_click_review_coco.py` | **Superseded by the label-review GUI** (moved to `tests/`). Old matplotlib reviewer for Qwen boxes. | — | — |
+| `08b_split_reviewed_dataset.py` | **Superseded by `03_split_dataset.py`** (moved to `tests/`). | — | — |
+| `09_create_seg_dataset.py` | **Superseded by GUI SAM3 segmentation + `01b`** (moved to `tests/`). | — | — |
 | `04_train_model.py` | Train a YOLO detect/segment model (Ultralytics). | `--config` (data.yaml), `--model-type`, `--task`, `--epochs`, `--batch-size`, `--device`, `--loss-type` | `runs/.../weights/best.pt` |
 | `05_evaluate_model.py` | Evaluate a trained model on one or more splits (default `test train`) with per-class precision/recall/F1/AP50/AP50-95 (box + mask), or compare pred vs GT COCO JSON. | `--model`, `--data`, `--split`, `--conf`, `--iou`, `--csv` (or `--pred-json`/`--gt-json`) | Metrics report (stdout) + per-class CSV |
 | `11_run_tracking.py` | YOLO tracking (ByteTrack / BoT-SORT / detect-then-SAM3) + a no-output benchmark mode. | `--tracker`, `--model`, `--data`, `--output`, `--conf`, `--device`, `--warmup-frames` | `tracked_*.jpg`, `results.json`, `tracking_result.mp4` |
-| `orchestrate_pipeline.py` | End-to-end rosbag pipeline: undistort -> split -> keyframes -> Qwen -> COCO combine -> review -> propagate -> YOLO export. Stage markers make it resumable. | `--rosbag`, `--camera`, `--stage`, `--skip-stage`, `--force`, `--resume-from` | `<rosbag>_pipeline/` output tree |
-| `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`LLAMACPP_URL`, `QWEN_MODEL`, `QWEN_MMPROJ`, `SAM3_MODEL`). | `<rosbag_path>` + any orchestrator args | same as orchestrator |
+| `orchestrate_pipeline.py` | End-to-end keyframe pipeline: undistort → sample → keyframes → stats → Qwen → COCO combine → GUI review → 01b COCO→YOLO-seg → 03 split → 02 augment (train only) → assemble final dataset + stats CSV → 04 train → 05 evaluate → 11 tracking. Stage markers make it resumable. | `--rosbag`/`--images`, `--camera`, `--stage`, `--skip-stage`, `--force`, per-stage args (`--sample-size`, `--ratios`, `--augmentations`, `--epochs`, `--tracker`, ...) | `<input>_pipeline/` output tree |
+| `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`LLAMACPP_URL`, `QWEN_MODEL`, `QWEN_MMPROJ`). | `<rosbag_path>` + any orchestrator args | same as orchestrator |
 
 ### Keyframe pipeline
 

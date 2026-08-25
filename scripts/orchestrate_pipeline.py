@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
 """
-End-to-end rosbag annotation pipeline orchestrator.
+End-to-end keyframe annotation pipeline orchestrator.
 
-Automates the full workflow from a Metacam rosbag to a YOLO-format detection
-dataset:
+Main pipeline (see README "Keyframe pipeline"):
 
-    undistort -> time-based split -> keyframes -> Qwen -> human review
-    -> propagate -> YOLO export
+    data folder (or rosbag) -> undistort -> sample -> keyframes
+    -> dataset stats -> Qwen seed labels -> combine to COCO
+    -> GUI review (human fixes boxes, segments with SAM3, uses the
+       autolabel/propagation/interpolation assistants, discards bad frames)
+    -> COCO -> flat YOLO-seg dataset (01b) -> train/test/val split (03)
+    -> augment TRAIN split only (02, mask-aware) -> assemble final dataset
+       + dataset.yaml + dataset statistics CSV (01a)
+    -> train (04) -> evaluate per-class metrics (05) -> tracking (11)
 
-Example:
+Every stage is skip-able/re-runnable: `--stage NAME` runs only that stage,
+`--skip-stage NAME` omits it, markers (`stage_completed.json`) make re-runs
+incremental, `--force` ignores markers.
+
+Stage names: undistort, sample, keyframes, stats, qwen, qwen_coco, gui,
+yolo, split, augment, assemble, train, evaluate, tracking.
+
+Examples:
+
+    # From a Metacam rosbag, stereo:
     python scripts/orchestrate_pipeline.py \
         --rosbag 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 \
-        --camera left \
-        --qwen-model Qwen3.8-27B-Q4_K_M.gguf \
-        --qwen-mmproj Qwen3.8-mmproj-F16.gguf \
+        --camera both --sample-size 1000 --keyframe-stride 10 \
         --llamacpp-url http://127.0.0.1:8089 \
-        --sam3-model core/sam3/models/sam3-model/sam3.pt
+        --epochs 100 --batch-size 16 --model-type yolo26n --imgsz 768 \
+        --tracker deepocsort
 
-The default propagation method is ``interpolation+sam3``: reviewed keyframe
-boxes are first interpolated to every train frame with optical flow, then SAM3
-refines each interpolated box into a segmentation mask using the box as an
-exemplar and the class name as a text concept.
+    # From an existing image folder (mono), no sampling, label everything:
+    python scripts/orchestrate_pipeline.py \
+        --images Datasets/HKU_GH/HKU_GH_left --gui-on all
+
+    # Re-run only the post-GUI stages after a review session:
+    python scripts/orchestrate_pipeline.py --images /data/left \
+        --output-root /data/left_pipeline \
+        --stage yolo --stage split --stage augment --stage assemble \
+        --stage train --stage evaluate
 """
 
 import argparse
@@ -33,8 +51,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-from PIL import Image
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+# Format validators shared with run_seg_dataset_pipeline.py — every dataset
+# stage is validated so a format mismatch fails at the step that caused it.
+from run_seg_dataset_pipeline import (  # noqa: E402
+    validate_flat_dataset,
+    validate_split_dataset,
+)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
@@ -48,6 +74,12 @@ Sprinkler (on the ceiling): Detect small, localized fire safety sprinkler heads 
 
 NO_THINK_PREFIX = "Do not think or explain. Output only the final JSON.\n\n"
 
+STAGES = [
+    "undistort", "sample", "keyframes", "stats", "qwen", "qwen_coco",
+    "gui", "yolo", "split", "augment", "assemble", "train", "evaluate",
+    "tracking",
+]
+
 
 def get_project_root() -> Path:
     """Return the repository root (parent of scripts/)."""
@@ -56,104 +88,154 @@ def get_project_root() -> Path:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="End-to-end rosbag annotation pipeline orchestrator."
+        description="End-to-end keyframe annotation pipeline orchestrator.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Stages: " + ", ".join(STAGES),
     )
-    parser.add_argument(
-        "--rosbag",
-        required=True,
-        help="Path to rosbag root with camera/left, camera/right, info/calibration.json",
-    )
-    parser.add_argument(
-        "--camera",
-        default="left",
-        choices=["left", "right", "both"],
-        help="Camera(s) to process (default: left)",
-    )
-    parser.add_argument(
-        "--output-root",
-        default=None,
-        help="Root output directory (default: <rosbag>_pipeline)",
-    )
-    parser.add_argument(
-        "--qwen-model",
-        default="Qwen3.8-27B-Q4_K_M.gguf",
-        help="Path to Qwen GGUF weights",
-    )
-    parser.add_argument(
-        "--qwen-mmproj",
-        default="Qwen3.8-mmproj-F16.gguf",
-        help="Path to Qwen mmproj file (must be loaded by the llama.cpp server)",
-    )
-    parser.add_argument(
-        "--llamacpp-url",
-        default="http://127.0.0.1:8089",
-        help="llama.cpp server URL",
-    )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        default=DEFAULT_PROMPT,
-        help="Detection prompt for Qwen",
-    )
-    parser.add_argument(
-        "--classes",
-        nargs="+",
-        default=None,
-        help="Class names (default: parsed from --prompt)",
-    )
-    parser.add_argument(
-        "--keyframe-stride",
-        type=int,
-        default=10,
-        help="Extract 1 keyframe every N frames (default: 10)",
-    )
-    parser.add_argument(
-        "--splits",
-        type=float,
-        nargs=3,
-        default=[0.8, 0.1, 0.1],
-        metavar=("TRAIN", "VAL", "TEST"),
-        help="Train/val/test time ratios (default: 0.8 0.1 0.1)",
-    )
-    parser.add_argument(
-        "--sam3-model",
-        default="core/sam3/models/sam3-model/sam3.pt",
-        help="Path to SAM3 weights",
-    )
-    parser.add_argument(
-        "--propagation-method",
-        default="interpolation+sam3",
-        choices=["interpolation", "sam3", "interpolation+sam3"],
-        help="Propagation method (default: interpolation+sam3)",
-    )
-    parser.add_argument(
-        "--stage",
-        action="append",
-        default=None,
-        help="Run only this stage, e.g. undistort, split, keyframes, qwen, qwen_coco, review, propagate, export",
-    )
-    parser.add_argument(
-        "--skip-stage",
-        action="append",
-        default=None,
-        help="Skip this stage (can be repeated)",
-    )
-    parser.add_argument(
-        "--resume-from",
-        type=int,
-        default=None,
-        help="Resume Qwen batch from this 1-indexed image number (passed to 07_run_qwen.py)",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Rerun stages even if marker exists",
-    )
-    parser.add_argument(
-        "--device",
-        default="cuda",
-        help="Device for SAM3 (cuda or cpu, default: cuda)",
-    )
+
+    # ---- input ------------------------------------------------------------
+    g = parser.add_argument_group("input")
+    g.add_argument("--rosbag", default=None,
+                   help="Rosbag root with camera/<cam> + info/calibration.json "
+                        "(enables the undistort stage)")
+    g.add_argument("--images", default=None,
+                   help="Existing image folder (mono), or parent of left/ + "
+                        "right/ when --camera both. Skips undistort.")
+    g.add_argument("--camera", default="left", choices=["left", "right", "both"],
+                   help="Camera(s) to process (default: left)")
+    g.add_argument("--output-root", default=None,
+                   help="Root output directory (default: <input>_pipeline)")
+
+    # ---- run control ------------------------------------------------------
+    g = parser.add_argument_group("run control")
+    g.add_argument("--stage", action="append", default=None,
+                   help="Run only this stage (repeatable); see epilog")
+    g.add_argument("--skip-stage", action="append", default=None,
+                   help="Skip this stage (repeatable)")
+    g.add_argument("--force", action="store_true",
+                   help="Rerun stages even if their marker exists")
+    g.add_argument("--copy", action="store_true",
+                   help="Copy instead of symlink at the sample/keyframe/"
+                        "assemble stages (default: symlink)")
+
+    # ---- sample -----------------------------------------------------------
+    g = parser.add_argument_group("sample (00)")
+    g.add_argument("--sample-size", type=int, default=None,
+                   help="Randomly keep N frames (default: keep all — stage "
+                        "skipped). In stereo, right is synced to the sampled "
+                        "left timestamps.")
+    g.add_argument("--sample-seed", type=int, default=42,
+                   help="Sampling random seed (default: 42)")
+
+    # ---- keyframes ----------------------------------------------------------
+    g = parser.add_argument_group("keyframes (12)")
+    g.add_argument("--keyframe-stride", type=int, default=10,
+                   help="Extract 1 keyframe every N frames (default: 10)")
+
+    # ---- qwen seed labels ---------------------------------------------------
+    g = parser.add_argument_group("qwen (07 + 08c)")
+    g.add_argument("--qwen-model", default="Qwen3.8-27B-Q4_K_M.gguf",
+                   help="Qwen GGUF weights name/path served by llama.cpp")
+    g.add_argument("--qwen-mmproj", default="Qwen3.8-mmproj-F16.gguf",
+                   help="Qwen mmproj file (must be loaded by the server)")
+    g.add_argument("--llamacpp-url", default="http://127.0.0.1:8089",
+                   help="llama.cpp server URL")
+    g.add_argument("--prompt", type=str, default=DEFAULT_PROMPT,
+                   help="Detection prompt for Qwen")
+    g.add_argument("--classes", nargs="+", default=None,
+                   help="Class names (default: parsed from --prompt)")
+    g.add_argument("--resume-from", type=int, default=None,
+                   help="Resume Qwen batch from this 1-indexed image number")
+
+    # ---- gui review ---------------------------------------------------------
+    g = parser.add_argument_group("gui review")
+    g.add_argument("--gui-on", default="keyframes",
+                   choices=["keyframes", "all"],
+                   help="Frames loaded into the review GUI: keyframes only "
+                        "(sparse labeling, default) or every sampled frame "
+                        "(use with the GUI's Interpolate/Propagate tools)")
+
+    # ---- coco -> yolo (01b) -------------------------------------------------
+    g = parser.add_argument_group("coco->yolo (01b)")
+    g.add_argument("--bbox-as-rect", action="store_true",
+                   help="Emit mask-less COCO boxes as rectangle polygons")
+
+    # ---- split (03) ---------------------------------------------------------
+    g = parser.add_argument_group("split (03)")
+    g.add_argument("--ratios", type=float, nargs=3, default=[0.7, 0.15, 0.15],
+                   metavar=("TRAIN", "TEST", "VAL"),
+                   help="Split ratios, must sum to 1.0 (default: 0.7 0.15 0.15)")
+    g.add_argument("--split-seed", type=int, default=None,
+                   help="Random seed for the split (default: random)")
+
+    # ---- augment (02, train split only) -------------------------------------
+    g = parser.add_argument_group("augment (02, train split only)")
+    g.add_argument("--skip-augment", action="store_true",
+                   help="Skip augmentation; final train split = raw split")
+    g.add_argument("--augmentations", "-a", type=str, nargs="+",
+                   default=["flip_horizontal", "rotate", "brightness"],
+                   choices=["flip_horizontal", "flip_vertical", "rotate",
+                            "brightness", "contrast", "hue", "blur", "resize",
+                            "mosaic"],
+                   help="Augmentation types (default: flip_horizontal rotate "
+                        "brightness). Masks/polygons are transformed with "
+                        "the image.")
+    g.add_argument("--multiplier", "-m", type=int, default=2,
+                   help="Augmented copies per train image (1-10, default: 2)")
+    g.add_argument("--rotation-range", type=float, nargs=2, default=[-15, 15],
+                   metavar=("MIN", "MAX"), help="degrees (default: -15 15)")
+    g.add_argument("--brightness-range", type=float, nargs=2,
+                   default=[0.8, 1.2], metavar=("MIN", "MAX"),
+                   help="factor range (default: 0.8 1.2)")
+    g.add_argument("--hue-range", type=float, nargs=2, default=[-15, 15],
+                   metavar=("MIN", "MAX"), help="degrees (default: -15 15)")
+    g.add_argument("--blur-range", type=int, nargs=2, default=[3, 9],
+                   metavar=("MIN", "MAX"), help="kernel range (default: 3 9)")
+    g.add_argument("--resize", type=int, nargs=2, default=None,
+                   metavar=("WIDTH", "HEIGHT"),
+                   help="Target size when 'resize' is among --augmentations")
+
+    # ---- train (04) ---------------------------------------------------------
+    g = parser.add_argument_group("train (04)")
+    g.add_argument("--epochs", type=int, default=100)
+    g.add_argument("--batch-size", type=int, default=16)
+    g.add_argument("--model-type", default="yolo26n",
+                   help="Ultralytics model type (default: yolo26n)")
+    g.add_argument("--task", default="segment", choices=["detect", "segment"],
+                   help="Training task (default: segment — the GUI pipeline "
+                        "produces segmentation masks)")
+    g.add_argument("--imgsz", type=int, default=640)
+    g.add_argument("--pretrained", default=None,
+                   help="Pretrained weights to fine-tune from")
+    g.add_argument("--lr0", type=float, default=0.01,
+                   help="Initial learning rate (default: 0.01)")
+    g.add_argument("--device", default="0",
+                   help="Training/tracking device: '0', 'cpu', ... (default: 0)")
+
+    # ---- evaluate (05) --------------------------------------------------------
+    g = parser.add_argument_group("evaluate (05)")
+    g.add_argument("--eval-splits", nargs="+", default=["test", "train"],
+                   help="Splits to evaluate (default: test train)")
+    g.add_argument("--eval-conf", type=float, default=0.5,
+                   help="Confidence threshold (default: 0.5)")
+    g.add_argument("--eval-iou", type=float, default=0.5,
+                   help="IoU threshold for matching (default: 0.5)")
+
+    # ---- tracking (11) --------------------------------------------------------
+    g = parser.add_argument_group("tracking (11)")
+    g.add_argument("--tracker", default="deepocsort",
+                   choices=["bytetrack", "botsort", "ocsort", "deepocsort"],
+                   help="Tracker (default: deepocsort)")
+    g.add_argument("--track-conf", type=float, default=0.5,
+                   help="Detection confidence threshold (default: 0.5)")
+    g.add_argument("--track-iou", type=float, default=0.45,
+                   help="NMS IoU threshold (default: 0.45)")
+    g.add_argument("--track-imgsz", type=int, default=768,
+                   help="Inference image size (default: 768)")
+    g.add_argument("--track-fps", type=int, default=10,
+                   help="Output video FPS (default: 10)")
+    g.add_argument("--track-max-frames", type=int, default=None,
+                   help="Track only the first N frames (default: all)")
     return parser.parse_args(argv)
 
 
@@ -171,36 +253,6 @@ def parse_classes_from_prompt(prompt: str) -> list:
             if name:
                 classes.append(name)
     return classes
-
-
-def time_based_split(src_dir: Path, out_dir: Path, ratios: list) -> dict:
-    """Symlink images from src_dir into out_dir/images/{train,val,test} by time order."""
-    if abs(sum(ratios) - 1.0) > 0.001:
-        raise ValueError(f"Ratios must sum to 1.0, got {sum(ratios)}")
-    image_files = sorted(
-        p for p in src_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-    )
-    if not image_files:
-        raise RuntimeError(f"No images found in {src_dir}")
-    total = len(image_files)
-    train_end = int(total * ratios[0])
-    val_end = train_end + int(total * ratios[1])
-    partitions = {
-        "train": image_files[:train_end],
-        "val": image_files[train_end:val_end],
-        "test": image_files[val_end:],
-    }
-    counts = {}
-    for split, files in partitions.items():
-        split_img_dir = out_dir / "images" / split
-        split_img_dir.mkdir(parents=True, exist_ok=True)
-        for src in files:
-            dst = split_img_dir / src.name
-            if not dst.exists():
-                dst.symlink_to(src.resolve())
-        counts[split] = len(files)
-    return counts
 
 
 def read_marker(marker_path: Path) -> dict | None:
@@ -221,15 +273,17 @@ def write_marker(marker_path: Path, data: dict):
         json.dump(data, f, indent=2)
 
 
-def run_stage(stage_name: str, cmd: list, cwd: Path, marker_path: Path, force: bool = False):
+def run_stage(stage_name: str, cmd: list, cwd: Path, marker_path: Path,
+              force: bool = False):
     """Run a stage command unless its marker exists."""
     if not force and read_marker(marker_path):
         print(f"[skip] {stage_name}: marker exists at {marker_path}")
         return None
     print(f"[run] {stage_name}: {' '.join(str(c) for c in cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, check=False)
+    result = subprocess.run([str(c) for c in cmd], cwd=cwd, check=False)
     if result.returncode != 0:
-        raise RuntimeError(f"Stage {stage_name} failed with exit code {result.returncode}")
+        raise RuntimeError(
+            f"Stage {stage_name} failed with exit code {result.returncode}")
     write_marker(marker_path, {"stage": stage_name})
     return result
 
@@ -252,531 +306,542 @@ def should_run(stage: str, args) -> bool:
     return True
 
 
-def export_yolo_from_coco(
-    coco_path: Path,
-    img_dir: Path,
-    labels_dir: Path,
-    class_names: list,
-):
-    """Convert a COCO detection file to YOLO txt labels in labels_dir."""
-    labels_dir.mkdir(parents=True, exist_ok=True)
-    with open(coco_path, "r", encoding="utf-8") as f:
-        coco = json.load(f)
-    cat_id_to_yolo_id = {
-        cat["id"]: class_names.index(cat["name"])
-        for cat in coco.get("categories", [])
-        if cat["name"] in class_names
-    }
-    img_id_to_info = {img["id"]: img for img in coco.get("images", [])}
-    anns_by_image = {}
-    for ann in coco.get("annotations", []):
-        anns_by_image.setdefault(ann["image_id"], []).append(ann)
-
-    for img_id, img_info in img_id_to_info.items():
-        img_w = img_info.get("width")
-        img_h = img_info.get("height")
-        if not img_w or not img_h:
-            try:
-                with Image.open(img_dir / img_info["file_name"]) as im:
-                    img_w, img_h = im.size
-            except Exception:
-                continue
-        lines = []
-        for ann in anns_by_image.get(img_id, []):
-            yolo_id = cat_id_to_yolo_id.get(ann["category_id"])
-            if yolo_id is None:
-                continue
-            x, y, w, h = ann["bbox"]
-            xc = (x + w / 2.0) / img_w
-            yc = (y + h / 2.0) / img_h
-            nw = w / img_w
-            nh = h / img_h
-            xc = min(max(xc, 0.0), 1.0)
-            yc = min(max(yc, 0.0), 1.0)
-            nw = min(max(nw, 0.0), 1.0)
-            nh = min(max(nh, 0.0), 1.0)
-            if nw <= 0 or nh <= 0:
-                continue
-            lines.append(f"{yolo_id} {xc:.6f} {yc:.6f} {nw:.6f} {nh:.6f}")
-        stem = Path(img_info["file_name"]).stem
-        label_path = labels_dir / f"{stem}.txt"
-        with open(label_path, "w") as f:
-            f.write("\n".join(lines))
-            if lines:
-                f.write("\n")
+def iter_images(folder: Path):
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir()
+                  if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
 
 
-def write_data_yaml(split_dir: Path, class_names: list):
-    yaml_path = split_dir / "data.yaml"
+def link_or_copy(src: Path, dst: Path, copy: bool):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    if copy:
+        shutil.copy2(src, dst)
+    else:
+        dst.symlink_to(src.resolve())
+
+
+# ---------------------------------------------------------------------------
+# Stereo COCO merge (qwen_coco stage)
+# ---------------------------------------------------------------------------
+
+def merge_coco_sides(side_cocos: dict, out_path: Path):
+    """Merge per-camera COCO files (each image carries a "side" field) into
+    one file the GUI can open for a stereo session. Categories are merged by
+    name; image/annotation ids are renumbered."""
+    merged = {"images": [], "annotations": [], "categories": []}
+    cat_ids: dict = {}  # name -> new id
+    next_img = 1
+    next_ann = 1
+    for side in sorted(side_cocos):
+        with open(side_cocos[side], "r", encoding="utf-8") as f:
+            coco = json.load(f)
+        cat_remap = {}
+        for cat in coco.get("categories", []):
+            name = cat["name"]
+            if name not in cat_ids:
+                cat_ids[name] = len(cat_ids)
+                merged["categories"].append(
+                    {"id": cat_ids[name], "name": name})
+            cat_remap[cat["id"]] = cat_ids[name]
+        img_remap = {}
+        for img in coco.get("images", []):
+            img = dict(img)
+            img.setdefault("side", side)
+            img_remap[img["id"]] = next_img
+            img["id"] = next_img
+            next_img += 1
+            merged["images"].append(img)
+        for ann in coco.get("annotations", []):
+            ann = dict(ann)
+            ann["id"] = next_ann
+            next_ann += 1
+            ann["image_id"] = img_remap[ann["image_id"]]
+            ann["category_id"] = cat_remap[ann["category_id"]]
+            merged["annotations"].append(ann)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(merged, f)
+
+
+# ---------------------------------------------------------------------------
+# Per-camera working directories
+# ---------------------------------------------------------------------------
+
+class CamPaths:
+    """Resolve the per-camera folders for one pipeline run."""
+
+    def __init__(self, args, out_root: Path):
+        self.out_root = out_root
+        self.stereo = args.camera == "both"
+        self.cameras = ["left", "right"] if self.stereo else [args.camera]
+        # Raw input folders per camera.
+        self.raw: dict = {}
+        if args.rosbag:
+            rosbag = Path(args.rosbag).resolve()
+            for cam in self.cameras:
+                d = rosbag / "camera" / cam
+                if not d.exists():
+                    raise FileNotFoundError(f"Camera folder not found: {d}")
+                self.raw[cam] = d
+            self.calibration = rosbag / "info" / "calibration.json"
+            if not self.calibration.exists():
+                raise FileNotFoundError(
+                    f"Calibration not found: {self.calibration}")
+        else:
+            images = Path(args.images).resolve()
+            if self.stereo:
+                for cam in self.cameras:
+                    d = images / cam
+                    if not d.exists():
+                        raise FileNotFoundError(
+                            f"--camera both: expected {d} (parent of left/ "
+                            f"+ right/)")
+                    self.raw[cam] = d
+            else:
+                if not images.exists():
+                    raise FileNotFoundError(
+                        f"Images folder not found: {images}")
+                self.raw[self.cameras[0]] = images
+            self.calibration = None
+
+    def undistorted(self, cam: str) -> Path:
+        """Full-resolution working frames (undistorted when applicable)."""
+        return (self.out_root / "undistorted" / cam) if self.calibration \
+            else self.raw[cam]
+
+    def sampled(self, cam: str) -> Path:
+        return self.out_root / "sampled" / cam
+
+    def keyframes(self, cam: str) -> Path:
+        return self.out_root / "keyframes" / cam
+
+    def qwen(self, cam: str) -> Path:
+        return self.out_root / "qwen" / cam
+
+    def working(self, cam: str, sample: bool) -> Path:
+        """The frame pool everything downstream draws from."""
+        return self.sampled(cam) if sample else self.undistorted(cam)
+
+
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
+
+def stage_undistort(args, paths: CamPaths):
+    if not paths.calibration:
+        print("[skip] undistort: no --rosbag given (input used as-is)")
+        return
+    for cam in paths.cameras:
+        marker = paths.undistorted(cam) / "stage_completed.json"
+        cmd = [sys.executable, SCRIPTS_DIR / "undistort_rosbag.py",
+               "--images-root", paths.raw[cam],
+               "--output-root", paths.undistorted(cam),
+               "--calibration", paths.calibration,
+               "--camera-name", cam]
+        run_stage(f"undistort[{cam}]", cmd, get_project_root(), marker,
+                  args.force)
+
+
+def stage_sample(args, paths: CamPaths):
+    if args.sample_size is None:
+        print("[skip] sample: --sample-size not given (keeping all frames)")
+        return
+    first = paths.cameras[0]
+    marker = paths.sampled(first) / "stage_completed.json"
+    cmd = [sys.executable, SCRIPTS_DIR / "00_sample_from_dataset.py",
+           "--source-dir", paths.undistorted(first),
+           "--out-dir", paths.sampled(first),
+           "-n", str(args.sample_size),
+           "--seed", str(args.sample_seed)]
+    if not args.copy:
+        cmd.append("--symlink")
+    run_stage(f"sample[{first}]", cmd, get_project_root(), marker, args.force)
+
+    if paths.stereo:
+        # Sync the right side to the sampled left timestamps (the GUI pairs
+        # frames by timestamp filename, so both sides must carry the same
+        # names).
+        cam = paths.cameras[1]
+        marker = paths.sampled(cam) / "stage_completed.json"
+        if not args.force and read_marker(marker):
+            print(f"[skip] sample[{cam}]: marker exists")
+            return
+        names = {p.name for p in iter_images(paths.sampled(first))}
+        out_dir = paths.sampled(cam)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for img in iter_images(paths.undistorted(cam)):
+            if img.name in names:
+                link_or_copy(img, out_dir / img.name, args.copy)
+                n += 1
+        print(f"[sample:{cam}] synced {n}/{len(names)} frames to the "
+              f"{first} timestamps")
+        write_marker(marker, {"stage": f"sample[{cam}]", "synced": n})
+
+
+def stage_keyframes(args, paths: CamPaths):
+    for cam in paths.cameras:
+        marker = paths.keyframes(cam) / "stage_completed.json"
+        cmd = [sys.executable, SCRIPTS_DIR / "12_extract_keyframes.py",
+               "--image-folder", paths.working(cam, args.sample_size),
+               "--output-dir", paths.keyframes(cam),
+               "--every", str(args.keyframe_stride),
+               "--mode", "copy" if args.copy else "symlink"]
+        run_stage(f"keyframes[{cam}]", cmd, get_project_root(), marker,
+                  args.force)
+
+
+def stage_stats(args, paths: CamPaths):
+    """Pre-label statistics: frame counts at each reduction level."""
+    marker = paths.out_root / "stats" / "stage_completed.json"
+    if not args.force and read_marker(marker):
+        print(f"[skip] stats: marker exists at {marker}")
+        return
+    stats = {}
+    for cam in paths.cameras:
+        entry = {"raw": len(iter_images(paths.undistorted(cam)))}
+        if args.sample_size is not None:
+            entry["sampled"] = len(iter_images(paths.sampled(cam)))
+        src = paths.working(cam, args.sample_size)
+        entry["keyframes"] = len(iter_images(paths.keyframes(cam)))
+        entry["gui_frames"] = len(iter_images(
+            paths.keyframes(cam) if args.gui_on == "keyframes" else src))
+        stats[cam] = entry
+    print(json.dumps(stats, indent=2))
+    write_marker(marker, {"stage": "stats", "counts": stats})
+
+
+def stage_qwen(args, paths: CamPaths):
+    for cam in paths.cameras:
+        marker = paths.qwen(cam) / "stage_completed.json"
+        if not (args.force or read_marker(marker)) \
+                and not check_llamacpp_server(args.llamacpp_url):
+            raise RuntimeError(
+                f"llama.cpp server not reachable at {args.llamacpp_url}. "
+                "Start it with: llama-server -m <model> --mmproj <mmproj> "
+                "--image-min-tokens 2048 --port 8089")
+        cmd = [sys.executable, SCRIPTS_DIR / "07_run_qwen.py",
+               "--backend", "llamacpp",
+               "--llamacpp-url", args.llamacpp_url,
+               "--llamacpp-model", args.qwen_model,
+               "--prompt", NO_THINK_PREFIX + args.prompt,
+               "--template", "object_detection",
+               "--format", "json",
+               "--image-folder", paths.keyframes(cam),
+               "--annotations-output", paths.qwen(cam)]
+        if args.resume_from is not None:
+            cmd.extend(["--resume-from", str(args.resume_from)])
+        run_stage(f"qwen[{cam}]", cmd, get_project_root(), marker, args.force)
+
+
+def stage_qwen_coco(args, paths: CamPaths, reviewed_coco: Path):
+    """Per-camera qwen results -> per-camera COCO -> one (stereo-merged)
+    COCO the GUI opens for review."""
+    marker = paths.out_root / "reviewed" / "qwen_coco_completed.json"
+    if not args.force and read_marker(marker):
+        print(f"[skip] qwen_coco: marker exists at {marker}")
+        return
+    side_cocos = {}
+    for cam in paths.cameras:
+        coco_path = paths.qwen(cam) / "labels_coco.json"
+        cmd = [sys.executable, SCRIPTS_DIR / "08c_qwen_results_to_coco.py",
+               "--qwen-results-dir", paths.qwen(cam),
+               "--output", coco_path,
+               "--side", cam]
+        run_stage(f"qwen_coco[{cam}]", cmd, get_project_root(),
+                  paths.qwen(cam) / "qwen_coco_completed.json", args.force)
+        side_cocos[cam] = coco_path
+    if paths.stereo:
+        merge_coco_sides(side_cocos, reviewed_coco)
+    else:
+        reviewed_coco.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(side_cocos[paths.cameras[0]], reviewed_coco)
+    print(f"[qwen_coco] review COCO: {reviewed_coco}")
+    write_marker(marker, {"stage": "qwen_coco"})
+
+
+def stage_gui(args, paths: CamPaths, reviewed_coco: Path):
+    """Launch the label-review GUI and wait for the human session to end.
+
+    The GUI opens ``reviewed_coco`` (seeded by the qwen_coco stage), the
+    human reviews/corrects boxes, segments with SAM3/autolabel assistants,
+    and saves on exit. The COCO must exist afterwards for the run to count
+    as complete.
+    """
+    marker = paths.out_root / "reviewed" / "stage_completed.json"
+    if not args.force and read_marker(marker):
+        print(f"[skip] gui: marker exists at {marker}")
+        return
+    first = paths.cameras[0]
+
+    def gui_dir(cam):
+        return paths.keyframes(cam) if args.gui_on == "keyframes" \
+            else paths.working(cam, args.sample_size)
+
+    cmd = [sys.executable, "-m", "gui.label_review.main",
+           "--images", gui_dir(first),
+           "--output_json", reviewed_coco]
+    if paths.stereo:
+        cmd += ["--images-right", gui_dir(paths.cameras[1])]
+    print(f"[run] gui: {' '.join(str(c) for c in cmd)}")
+    print("      (the pipeline resumes when you close the GUI — save first!)")
+    result = subprocess.run([str(c) for c in cmd], cwd=get_project_root(),
+                            check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"GUI exited with code {result.returncode}; fix the issue and "
+            f"re-run with --stage gui (or --skip-stage gui to use the "
+            f"existing {reviewed_coco})")
+    if not reviewed_coco.exists():
+        raise RuntimeError(
+            f"GUI closed without saving {reviewed_coco} — re-run with "
+            f"--stage gui and save before closing")
+    write_marker(marker, {"stage": "gui", "coco": str(reviewed_coco)})
+
+
+def stage_yolo(args, paths: CamPaths, reviewed_coco: Path):
+    """Reviewed COCO -> flat YOLO-seg dataset (01b)."""
+    out_dir = paths.out_root / "dataset" / "yolo_flat"
+    marker = out_dir / "stage_completed.json"
+    first = paths.cameras[0]
+
+    def gui_dir(cam):
+        return paths.keyframes(cam) if args.gui_on == "keyframes" \
+            else paths.working(cam, args.sample_size)
+
+    # 01b resolves images as <images-dir>/<side>/<file_name> in stereo.
+    images_dir = gui_dir(first).parent if paths.stereo else gui_dir(first)
+    cmd = [sys.executable, SCRIPTS_DIR / "01b_coco_to_yolo_seg.py",
+           "--coco-json", reviewed_coco,
+           "--images-dir", images_dir,
+           "--output-dir", out_dir]
+    if args.bbox_as_rect:
+        cmd.append("--bbox-as-rect")
+    run_stage("yolo", cmd, get_project_root(), marker, args.force)
+    stats = validate_flat_dataset(out_dir)
+    print(f"  [validated] {stats['images']} images, "
+          f"{stats['label_lines']} polygons")
+
+
+def stage_split(args, paths: CamPaths):
+    out_dir = paths.out_root / "dataset" / "split"
+    marker = out_dir / "stage_completed.json"
+    cmd = [sys.executable, SCRIPTS_DIR / "03_split_dataset.py",
+           "--input-dir", paths.out_root / "dataset" / "yolo_flat",
+           "--output-dir", out_dir,
+           "--ratios", *(str(v) for v in args.ratios)]
+    if args.split_seed is not None:
+        cmd += ["--seed", str(args.split_seed)]
+    run_stage("split", cmd, get_project_root(), marker, args.force)
+    for name, s in validate_split_dataset(out_dir).items():
+        print(f"  [validated] {name}: {s['images']} images, "
+              f"{s['label_lines']} polygons")
+
+
+def stage_augment(args, paths: CamPaths):
+    """Augment the TRAIN split only (val/test stay clean for honest eval)."""
+    if args.skip_augment:
+        print("[skip] augment: --skip-augment")
+        return
+    split_dir = paths.out_root / "dataset" / "split"
+    out_dir = paths.out_root / "dataset" / "train_augmented"
+    marker = out_dir / "stage_completed.json"
+    cmd = [sys.executable, SCRIPTS_DIR / "02_augment_data.py",
+           "--input-dir", split_dir,
+           "--images-subdir", "train/images",
+           "--labels-subdir", "train/labels",
+           "--output-dir", out_dir,
+           "--augmentations", *args.augmentations,
+           "--multiplier", str(args.multiplier),
+           "--rotation-range", *(str(v) for v in args.rotation_range),
+           "--brightness-range", *(str(v) for v in args.brightness_range),
+           "--hue-range", *(str(v) for v in args.hue_range),
+           "--blur-range", *(str(v) for v in args.blur_range)]
+    if args.resize:
+        cmd += ["--resize", *(str(v) for v in args.resize)]
+    run_stage("augment", cmd, get_project_root(), marker, args.force)
+    stats = validate_flat_dataset(out_dir / "train", len(args.classes))
+    print(f"  [validated] augmented train: {stats['images']} images, "
+          f"{stats['label_lines']} polygons")
+
+
+def stage_assemble(args, paths: CamPaths):
+    """Build the final dataset tree + dataset.yaml + statistics CSV.
+
+    Layout: final/{train,val,test}/{images,labels}; train points at the
+    augmented train split when augmentation ran, val/test at the raw split.
+    """
+    dataset_dir = paths.out_root / "dataset"
+    final_dir = dataset_dir / "final"
+    marker = final_dir / "stage_completed.json"
+    if not args.force and read_marker(marker):
+        print(f"[skip] assemble: marker exists at {marker}")
+        return
+    split_dir = dataset_dir / "split"
+    train_src = split_dir / "train" if args.skip_augment \
+        else dataset_dir / "train_augmented" / "train"
+    if not train_src.is_dir():
+        raise RuntimeError(f"assemble: train split not found at {train_src}")
+    for split, src in [("train", train_src),
+                       ("val", split_dir / "val"),
+                       ("test", split_dir / "test")]:
+        for kind in ("images", "labels"):
+            src_dir = src / kind
+            if not src_dir.is_dir():
+                continue
+            for f in sorted(src_dir.iterdir()):
+                if f.is_file():
+                    link_or_copy(f, final_dir / split / kind / f.name,
+                                 args.copy)
+    yaml_path = final_dir / "dataset.yaml"
     config = {
-        "path": str(split_dir.absolute()),
-        "train": "images/train",
-        "val": "images/val",
-        "test": "images/test",
-        "nc": len(class_names),
-        "names": class_names,
+        "path": str(final_dir.absolute()),
+        "train": "train/images",
+        "val": "val/images",
+        "test": "test/images",
+        "nc": len(args.classes),
+        "names": list(args.classes),
     }
     with open(yaml_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False)
-
-
-def coco_to_per_image_annotations(
-    coco_path: Path,
-    out_annotations: Path,
-    image_dir: Path,
-):
-    """Convert a COCO file into the per-image per-class layout expected by 06_run_sam3.py."""
-    with open(coco_path, "r", encoding="utf-8") as f:
-        coco = json.load(f)
-    cat_id_to_name = {c["id"]: c["name"] for c in coco.get("categories", [])}
-    img_id_to_name = {img["id"]: img["file_name"] for img in coco.get("images", [])}
-    anns_by_image = {}
-    for ann in coco.get("annotations", []):
-        img_name = img_id_to_name.get(ann["image_id"])
-        if not img_name:
-            continue
-        cat_name = cat_id_to_name.get(ann["category_id"], "object")
-        x, y, w, h = ann["bbox"]
-        bbox = [x, y, x + w, y + h]
-        anns_by_image.setdefault(img_name, {}).setdefault(cat_name, []).append(bbox)
-
-    out_annotations.mkdir(parents=True, exist_ok=True)
-    for img_name, classes in anns_by_image.items():
-        img_stem = Path(img_name).stem
-        img_folder = out_annotations / img_stem
-        img_folder.mkdir(parents=True, exist_ok=True)
-        for class_name, bboxes in classes.items():
-            safe_name = class_name.replace(" ", "_")
-            json_path = img_folder / f"{safe_name}.json"
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "class_name": class_name,
-                        "image": str(image_dir / img_name),
-                        "bboxes": bboxes,
-                    },
-                    f,
-                    indent=2,
-                )
-
-
-def _nearest_keyframe_for_frames(
-    keyframe_names: set,
-    all_train_names: list,
-) -> dict:
-    """Map every train frame filename to the nearest preceding keyframe filename."""
-    keyframes_sorted = sorted(keyframe_names)
-    mapping = {}
-    for name in all_train_names:
-        # Find the last keyframe whose timestamp <= this frame's timestamp.
-        nearest = None
-        for kf in keyframes_sorted:
-            if kf <= name:
-                nearest = kf
-            else:
-                break
-        mapping[name] = nearest
-    return mapping
-
-
-def propagate_interpolation(
-    train_img_dir: Path,
-    keyframe_dir: Path,
-    reviewed_coco: Path,
-    propagated_coco: Path,
-    project_root: Path,
-):
-    cmd = [
-        sys.executable,
-        str(project_root / "scripts" / "13_interpolate_tracks.py"),
-        "--keyframes-coco",
-        str(reviewed_coco),
-        "--manifest",
-        str(keyframe_dir / "keyframe_manifest.json"),
-        "--image-folder",
-        str(train_img_dir),
-        "--output-coco",
-        str(propagated_coco),
-    ]
-    result = subprocess.run(cmd, cwd=project_root, check=False)
+    for name, s in validate_split_dataset(final_dir).items():
+        print(f"  [validated] final/{name}: {s['images']} images, "
+              f"{s['label_lines']} polygons")
+    # Full per-class dataset statistics CSV (01a).
+    csv_path = dataset_dir / "dataset_statistics.csv"
+    cmd = [sys.executable, SCRIPTS_DIR / "01a_dataset_statistics.py",
+           "--input-dir", final_dir, "--csv", csv_path]
+    result = subprocess.run([str(c) for c in cmd], check=False)
     if result.returncode != 0:
-        raise RuntimeError("Interpolation stage failed")
+        raise RuntimeError("assemble: 01a_dataset_statistics failed")
+    print(f"  dataset statistics: {csv_path}")
+    write_marker(marker, {"stage": "assemble"})
 
 
-def propagate_sam3(
-    train_img_dir: Path,
-    keyframe_dir: Path,
-    reviewed_coco: Path,
-    propagated_dir: Path,
-    sam3_model: str,
-    device: str,
-    project_root: Path,
-):
-    """Propagate keyframe boxes to all train frames using nearest-keyframe bboxes + SAM3."""
-    per_image_dir = propagated_dir / "per_image_annotations"
-    # Convert reviewed keyframe COCO into per-image per-class format.
-    coco_to_per_image_annotations(reviewed_coco, per_image_dir, train_img_dir)
+def stage_train(args, paths: CamPaths):
+    out_dir = paths.out_root / "training"
+    marker = out_dir / "stage_completed.json"
+    cmd = [sys.executable, SCRIPTS_DIR / "04_train_model.py",
+           "--config", paths.out_root / "dataset" / "final" / "dataset.yaml",
+           "--output-dir", out_dir,
+           "--epochs", str(args.epochs),
+           "--batch-size", str(args.batch_size),
+           "--model-type", args.model_type,
+           "--task", args.task,
+           "--imgsz", str(args.imgsz),
+           "--device", args.device,
+           "--lr0", str(args.lr0)]
+    if args.pretrained:
+        cmd += ["--pretrained", args.pretrained]
+    run_stage("train", cmd, get_project_root(), marker, args.force)
+    if not best_weights(paths).exists():
+        raise RuntimeError(
+            f"train: best weights not found at {best_weights(paths)}")
 
-    # For every non-keyframe train image, create an annotation folder using the
-    # nearest preceding keyframe's boxes as bbox exemplars.
-    keyframe_names = {p.name for p in keyframe_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS}
-    train_files = sorted(
-        p for p in train_img_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-    )
-    train_names = [p.name for p in train_files]
-    nearest_map = _nearest_keyframe_for_frames(keyframe_names, train_names)
 
-    keyframe_annotation_dirs = {p.name: p for p in per_image_dir.iterdir() if p.is_dir()}
-    for train_name in train_names:
-        if train_name in keyframe_names:
-            continue
-        nearest_keyframe = nearest_map.get(train_name)
-        if not nearest_keyframe:
-            continue
-        src_dir = keyframe_annotation_dirs.get(Path(nearest_keyframe).stem)
-        if not src_dir:
-            continue
-        dst_dir = per_image_dir / Path(train_name).stem
-        if dst_dir.exists():
-            shutil.rmtree(dst_dir)
-        shutil.copytree(src_dir, dst_dir)
-        # Update image path in copied JSONs to point at the current train frame.
-        for json_file in dst_dir.glob("*.json"):
-            with open(json_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            data["image"] = str(train_img_dir / train_name)
-            with open(json_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+def best_weights(paths: CamPaths) -> Path:
+    return paths.out_root / "training" / "yolo_training" / "weights" / "best.pt"
 
-    sam3_out = propagated_dir / "sam3_masks"
-    cmd = [
-        sys.executable,
-        str(project_root / "scripts" / "06_run_sam3.py"),
-        "--annotations-folder",
-        str(per_image_dir),
-        "--image-folder",
-        str(train_img_dir),
-        "--segmented-output",
-        str(sam3_out),
-        "--model",
-        sam3_model,
-        "--device",
-        device,
+
+def stage_evaluate(args, paths: CamPaths):
+    out_dir = paths.out_root / "evaluation"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    marker = out_dir / "stage_completed.json"
+    cmd = [sys.executable, SCRIPTS_DIR / "05_evaluate_model.py",
+           "--model", best_weights(paths),
+           "--data", paths.out_root / "dataset" / "final" / "dataset.yaml",
+           "--split", *args.eval_splits,
+           "--csv", out_dir / "metrics.csv",
+           "--conf", str(args.eval_conf),
+           "--iou", str(args.eval_iou)]
+    run_stage("evaluate", cmd, get_project_root(), marker, args.force)
+
+
+def stage_tracking(args, paths: CamPaths):
+    """Track on the full (pre-keyframe) frame sequence, per camera."""
+    for cam in paths.cameras:
+        out_dir = paths.out_root / "tracking" / cam
+        marker = out_dir / "stage_completed.json"
+        cmd = [sys.executable, SCRIPTS_DIR / "11_run_tracking.py",
+               "--tracker", args.tracker,
+               "--model", best_weights(paths),
+               "--data", paths.working(cam, args.sample_size),
+               "--output", out_dir,
+               "--conf", str(args.track_conf),
+               "--iou", str(args.track_iou),
+               "--imgsz", str(args.track_imgsz),
+               "--fps", str(args.track_fps),
+               "--device", args.device]
+        if args.track_max_frames is not None:
+            cmd += ["--max-frames", str(args.track_max_frames)]
+        run_stage(f"tracking[{cam}]", cmd, get_project_root(), marker,
+                  args.force)
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+def run_pipeline(args):
+    if not args.rosbag and not args.images:
+        raise SystemExit("Error: one of --rosbag or --images is required")
+    if abs(sum(args.ratios) - 1.0) > 1e-6:
+        raise SystemExit(f"Error: --ratios must sum to 1.0, got {args.ratios}")
+    if not args.skip_augment \
+            and "resize" in args.augmentations and not args.resize:
+        raise SystemExit(
+            "Error: 'resize' augmentation requires --resize WIDTH HEIGHT")
+
+    src = Path(args.rosbag or args.images).resolve()
+    out_root = Path(
+        args.output_root or f"{src}_pipeline").resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    paths = CamPaths(args, out_root)
+    reviewed_coco = out_root / "reviewed" / "labels_coco.json"
+
+    print(f"Classes: {args.classes}")
+    print(f"Cameras: {', '.join(paths.cameras)}")
+    print(f"Output root: {out_root}")
+
+    stages = [
+        ("undistort", lambda: stage_undistort(args, paths)),
+        ("sample", lambda: stage_sample(args, paths)),
+        ("keyframes", lambda: stage_keyframes(args, paths)),
+        ("stats", lambda: stage_stats(args, paths)),
+        ("qwen", lambda: stage_qwen(args, paths)),
+        ("qwen_coco", lambda: stage_qwen_coco(args, paths, reviewed_coco)),
+        ("gui", lambda: stage_gui(args, paths, reviewed_coco)),
+        ("yolo", lambda: stage_yolo(args, paths, reviewed_coco)),
+        ("split", lambda: stage_split(args, paths)),
+        ("augment", lambda: stage_augment(args, paths)),
+        ("assemble", lambda: stage_assemble(args, paths)),
+        ("train", lambda: stage_train(args, paths)),
+        ("evaluate", lambda: stage_evaluate(args, paths)),
+        ("tracking", lambda: stage_tracking(args, paths)),
     ]
-    result = subprocess.run(cmd, cwd=project_root, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("SAM3 propagation stage failed")
+    for name, fn in stages:
+        if should_run(name, args):
+            fn()
 
-
-def propagate_interpolation_plus_sam3(
-    train_img_dir: Path,
-    keyframe_dir: Path,
-    reviewed_coco: Path,
-    propagated_dir: Path,
-    propagated_coco: Path,
-    sam3_model: str,
-    device: str,
-    project_root: Path,
-):
-    """Interpolate boxes to all train frames, then run SAM3 on every frame."""
-    propagate_interpolation(
-        train_img_dir, keyframe_dir, reviewed_coco, propagated_coco, project_root
-    )
-    per_image_dir = propagated_dir / "per_image_annotations_interpolated"
-    coco_to_per_image_annotations(propagated_coco, per_image_dir, train_img_dir)
-
-    sam3_out = propagated_dir / "sam3_masks"
-    cmd = [
-        sys.executable,
-        str(project_root / "scripts" / "06_run_sam3.py"),
-        "--annotations-folder",
-        str(per_image_dir),
-        "--image-folder",
-        str(train_img_dir),
-        "--segmented-output",
-        str(sam3_out),
-        "--model",
-        sam3_model,
-        "--device",
-        device,
-    ]
-    result = subprocess.run(cmd, cwd=project_root, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("SAM3 refinement stage failed")
-
-
-def propagate(
-    args,
-    camera: str,
-    train_img_dir: Path,
-    keyframe_dir: Path,
-    reviewed_coco: Path,
-    propagated_dir: Path,
-    propagated_coco: Path,
-    project_root: Path,
-):
-    propagated_dir.mkdir(parents=True, exist_ok=True)
-    if args.propagation_method == "interpolation":
-        propagate_interpolation(
-            train_img_dir, keyframe_dir, reviewed_coco, propagated_coco, project_root
-        )
-    elif args.propagation_method == "sam3":
-        propagate_sam3(
-            train_img_dir,
-            keyframe_dir,
-            reviewed_coco,
-            propagated_dir,
-            args.sam3_model,
-            args.device,
-            project_root,
-        )
-    elif args.propagation_method == "interpolation+sam3":
-        propagate_interpolation_plus_sam3(
-            train_img_dir,
-            keyframe_dir,
-            reviewed_coco,
-            propagated_dir,
-            propagated_coco,
-            args.sam3_model,
-            args.device,
-            project_root,
-        )
-    else:
-        raise ValueError(f"Unknown propagation method: {args.propagation_method}")
-
-
-def run_camera_pipeline(args, camera: str):
-    rosbag = Path(args.rosbag).resolve()
-    out_root = Path(args.output_root or f"{rosbag}_pipeline").resolve()
-    project_root = get_project_root()
-
-    raw_cam_dir = rosbag / "camera" / camera
-    calibration = rosbag / "info" / "calibration.json"
-    if not raw_cam_dir.exists():
-        raise FileNotFoundError(f"Camera folder not found: {raw_cam_dir}")
-    if not calibration.exists():
-        raise FileNotFoundError(f"Calibration not found: {calibration}")
-
-    # Stage 1: Undistort
-    undistorted_dir = out_root / f"{camera}_undistorted"
-    marker = undistorted_dir / "stage_completed.json"
-    if should_run("undistort", args):
-        cmd = [
-            sys.executable,
-            str(project_root / "scripts" / "undistort_rosbag.py"),
-            "--images-root",
-            str(raw_cam_dir),
-            "--output-root",
-            str(undistorted_dir),
-            "--calibration",
-            str(calibration),
-            "--camera-name",
-            camera,
-        ]
-        run_stage("undistort", cmd, project_root, marker, args.force)
-
-    # Stage 2: Time-based split
-    split_dir = out_root / "splits" / camera
-    marker = split_dir / "stage_completed.json"
-    if should_run("split", args):
-        counts = time_based_split(undistorted_dir, split_dir, args.splits)
-        print(f"Split counts: {counts}")
-        write_marker(marker, {"stage": "split", "ratios": args.splits, "counts": counts})
-
-    train_img_dir = split_dir / "images" / "train"
-
-    # Stage 3: Extract keyframes
-    keyframe_dir = out_root / "keyframes" / camera
-    marker = keyframe_dir / "stage_completed.json"
-    if should_run("keyframes", args):
-        cmd = [
-            sys.executable,
-            str(project_root / "scripts" / "12_extract_keyframes.py"),
-            "--image-folder",
-            str(train_img_dir),
-            "--output-dir",
-            str(keyframe_dir),
-            "--every",
-            str(args.keyframe_stride),
-            "--mode",
-            "symlink",
-        ]
-        run_stage("keyframes", cmd, project_root, marker, args.force)
-
-    # Stage 4: Qwen annotation
-    qwen_dir = out_root / "qwen" / camera
-    marker = qwen_dir / "stage_completed.json"
-    if should_run("qwen", args):
-        if not check_llamacpp_server(args.llamacpp_url):
-            raise RuntimeError(
-                f"llama.cpp server not reachable at {args.llamacpp_url}. "
-                "Start it with: llama-server -m <model> --mmproj <mmproj> --image-min-tokens 2048 --port 8089"
-            )
-        cmd = [
-            sys.executable,
-            str(project_root / "scripts" / "07_run_qwen.py"),
-            "--backend",
-            "llamacpp",
-            "--llamacpp-url",
-            args.llamacpp_url,
-            "--llamacpp-model",
-            args.qwen_model,
-            "--prompt",
-            NO_THINK_PREFIX + args.prompt,
-            "--template",
-            "object_detection",
-            "--format",
-            "json",
-            "--image-folder",
-            str(keyframe_dir),
-            "--annotations-output",
-            str(qwen_dir),
-        ]
-        if args.resume_from is not None:
-            cmd.extend(["--resume-from", str(args.resume_from)])
-        run_stage("qwen", cmd, project_root, marker, args.force)
-
-    # Stage 4b: Combine per-image Qwen results into a single COCO file
-    # that gui/label_review can open directly.
-    qwen_coco = qwen_dir / "labels_coco.json"
-    marker = qwen_dir / "qwen_coco_completed.json"
-    if should_run("qwen_coco", args):
-        qwen_results_dir = qwen_dir
-        if not any(qwen_dir.glob("*_result.json")):
-            # Older runs kept per-image results next to the keyframes.
-            alt = keyframe_dir / "qwen_results"
-            if any(alt.glob("*_result.json")):
-                qwen_results_dir = alt
-        cmd = [
-            sys.executable,
-            str(project_root / "scripts" / "08c_qwen_results_to_coco.py"),
-            "--qwen-results-dir",
-            str(qwen_results_dir),
-            "--output",
-            str(qwen_coco),
-            "--side",
-            camera,
-        ]
-        run_stage("qwen_coco", cmd, project_root, marker, args.force)
-
-    # Stage 5: Human review
-    reviewed_dir = out_root / "reviewed" / camera
-    reviewed_coco = reviewed_dir / "coco_reviewed.json"
-    reviewed_yolo = reviewed_dir / "yolo_reviewed"
-    marker = reviewed_dir / "stage_completed.json"
-    if should_run("review", args):
-        cmd = [
-            sys.executable,
-            str(project_root / "scripts" / "08_click_review_coco.py"),
-            "--qwen-annotations-dir",
-            str(qwen_dir),
-            "--img_dir",
-            str(keyframe_dir),
-            "--output_json",
-            str(reviewed_coco),
-            "--output-yolo-dir",
-            str(reviewed_yolo),
-        ]
-        run_stage("review", cmd, project_root, marker, args.force)
-
-    # Stage 6: Propagate
-    propagated_dir = out_root / "propagated" / camera
-    propagated_coco = propagated_dir / "coco_full.json"
-    marker = propagated_dir / "stage_completed.json"
-    if should_run("propagate", args):
-        propagate(
-            args=args,
-            camera=camera,
-            train_img_dir=train_img_dir,
-            keyframe_dir=keyframe_dir,
-            reviewed_coco=reviewed_coco,
-            propagated_dir=propagated_dir,
-            propagated_coco=propagated_coco,
-            project_root=project_root,
-        )
-        write_marker(marker, {"stage": "propagate", "method": args.propagation_method})
-
-    # Stage 7: Export YOLO labels into split layout
-    marker = split_dir / "labels_exported.json"
-    if should_run("export", args):
-        labels_dir = split_dir / "labels" / "train"
-        labels_dir.mkdir(parents=True, exist_ok=True)
-        if args.propagation_method in ("interpolation", "interpolation+sam3"):
-            export_yolo_from_coco(
-                coco_path=propagated_coco,
-                img_dir=train_img_dir,
-                labels_dir=labels_dir,
-                class_names=args.classes,
-            )
-        else:
-            # For pure SAM3 mode, export from the SAM3 results JSON files.
-            sam3_results_dir = propagated_dir / "sam3_masks"
-            export_yolo_from_sam3_results(
-                sam3_results_dir=sam3_results_dir,
-                labels_dir=labels_dir,
-                class_names=args.classes,
-            )
-        write_data_yaml(split_dir, args.classes)
-        write_marker(marker, {"stage": "export"})
-
-
-def export_yolo_from_sam3_results(
-    sam3_results_dir: Path,
-    labels_dir: Path,
-    class_names: list,
-):
-    """Convert SAM3 per-image result JSON files to YOLO txt labels."""
-    labels_dir.mkdir(parents=True, exist_ok=True)
-    for json_file in sorted(sam3_results_dir.glob("*_results.json")):
-        with open(json_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        image_path = Path(data.get("image", ""))
-        if not image_path.name or not image_path.exists():
-            continue
-        try:
-            with Image.open(image_path) as im:
-                img_w, img_h = im.size
-        except Exception:
-            continue
-        detections = data.get("detections", [])
-        lines = []
-        for det in detections:
-            label = det.get("label")
-            if label not in class_names:
-                continue
-            yolo_id = class_names.index(label)
-            bbox = det.get("bbox")
-            if not bbox or len(bbox) != 4:
-                continue
-            x1, y1, x2, y2 = bbox
-            w = x2 - x1
-            h = y2 - y1
-            xc = (x1 + w / 2.0) / img_w
-            yc = (y1 + h / 2.0) / img_h
-            nw = w / img_w
-            nh = h / img_h
-            for v in (xc, yc, nw, nh):
-                v = min(max(v, 0.0), 1.0)
-            if nw <= 0 or nh <= 0:
-                continue
-            lines.append(f"{yolo_id} {xc:.6f} {yc:.6f} {nw:.6f} {nh:.6f}")
-        label_path = labels_dir / f"{json_file.stem.replace('_results', '')}.txt"
-        with open(label_path, "w") as f:
-            f.write("\n".join(lines))
-            if lines:
-                f.write("\n")
+    print("\n" + "=" * 60)
+    print("PIPELINE COMPLETE")
+    print("=" * 60)
+    print(f"  Reviewed COCO:   {reviewed_coco}")
+    print(f"  Final dataset:   {out_root / 'dataset' / 'final'}")
+    print(f"  Dataset stats:   {out_root / 'dataset' / 'dataset_statistics.csv'}")
+    print(f"  Best weights:    {best_weights(paths)}")
+    print(f"  Eval metrics:    {out_root / 'evaluation' / 'metrics.csv'}")
+    print(f"  Tracking:        {out_root / 'tracking'}")
 
 
 def main():
     args = parse_args()
     if args.classes is None:
         args.classes = parse_classes_from_prompt(args.prompt)
-    print(f"Classes: {args.classes}")
-    cameras = ["left", "right"] if args.camera == "both" else [args.camera]
-    for camera in cameras:
-        print(f"\n{'=' * 60}\nProcessing camera: {camera}\n{'=' * 60}")
-        run_camera_pipeline(args, camera)
+    run_pipeline(args)
 
 
 if __name__ == "__main__":

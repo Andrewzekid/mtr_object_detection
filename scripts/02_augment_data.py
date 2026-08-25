@@ -245,6 +245,8 @@ def main():
     config = {
         "input_dir": str(input_path),
         "output_dir": args.output_dir,
+        "images_subdir": args.images_subdir,
+        "labels_subdir": args.labels_subdir,
         "augmentation_types": args.augmentations,
         "multiplier": args.multiplier,
         "rotation_range": tuple(args.rotation_range),
