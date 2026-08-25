@@ -72,6 +72,10 @@ class DataProcessor:
         self.hue_range = self.config.get("hue_range", (-15, 15))
         self.blur_range = self.config.get("blur_range", (3, 9))
         self.resize = self.config.get("resize")  # (width, height) or None
+        # Layout overrides (02_augment_data.py --images-subdir/--labels-subdir):
+        # e.g. "train/images" to augment only one split of a dataset.
+        self.images_subdir = self.config.get("images_subdir", "images")
+        self.labels_subdir = self.config.get("labels_subdir", "labels")
 
     @staticmethod
     def _is_seg_label(label: List) -> bool:
@@ -88,22 +92,24 @@ class DataProcessor:
         otherwise images are read directly from ``directory``.
         """
         dir_path = directory or self.input_dir
-        images_subdir = dir_path / "images"
+        images_subdir = dir_path / self.images_subdir
         if images_subdir.exists() and images_subdir.is_dir():
             dir_path = images_subdir
+        elif self.images_subdir != "images":
+            # An explicit custom subdir that does not exist: do not fall
+            # back to the raw directory (that would silently augment the
+            # wrong images).
+            return []
         return [f for f in dir_path.iterdir() if f.suffix.lower() in self.IMAGE_EXTENSIONS]
 
     def _get_labels_dir(self, directory: Optional[Path] = None) -> Path:
         """Return the labels directory for a dataset root.
 
-        If ``<directory>/labels/`` exists it is returned; otherwise fall back to
-        ``<directory>/labels/`` so callers can create it when needed.
+        ``<directory>/<labels_subdir>/`` is returned whether or not it
+        exists, so callers can create it when needed.
         """
         base = directory or self.input_dir
-        labels_subdir = base / "labels"
-        if labels_subdir.exists() and labels_subdir.is_dir():
-            return labels_subdir
-        return labels_subdir
+        return base / self.labels_subdir
     
     def augment_dataset(
         self,
@@ -114,8 +120,8 @@ class DataProcessor:
     ) -> Dict:
         """Apply augmentation transformations to dataset."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        output_images_dir = self.output_dir / "images"
-        output_labels_dir = self.output_dir / "labels"
+        output_images_dir = self.output_dir / self.images_subdir
+        output_labels_dir = self.output_dir / self.labels_subdir
         output_images_dir.mkdir(parents=True, exist_ok=True)
         output_labels_dir.mkdir(parents=True, exist_ok=True)
         
