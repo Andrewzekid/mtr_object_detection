@@ -72,9 +72,10 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QListWidget, QListWidgetItem, QSlider,
     QSplitter, QFrame, QSizePolicy, QMessageBox, QCheckBox,
     QLineEdit, QProgressBar, QFileDialog, QAbstractItemView,
+    QScrollArea,
 )
 # QSizePolicy scoped enum alias
 QSizePolicy.Expanding = QSizePolicy.Policy.Expanding  # type: ignore[attr-defined]
 QSizePolicy.Fixed = QSizePolicy.Policy.Fixed  # type: ignore[attr-defined]
 QSizePolicy.Preferred = QSizePolicy.Policy.Preferred  # type: ignore[attr-defined]
-from PyQt6.QtGui import QShortcut, QAction
+from PyQt6.QtGui import QShortcut, QAction, QActionGroup

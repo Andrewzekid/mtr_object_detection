@@ -326,10 +326,10 @@ def test_segmentation_save_load_roundtrip(lr, make_coco, tmp_path):
     assert all(isinstance(p, list) and len(p) >= 6 and
                all(isinstance(v, int) for v in p) for p in seg)
 
-    # round-trip: load back, mask restored approximately
+    # round-trip: load back, mask restored approximately (rasterized lazily)
     coco2 = lr.CocoState(path, [{"id": 0, "name": "a"}])
     coco2.load_existing()
-    m2 = coco2.annotations[0].get("_mask")
+    m2 = coco2.ensure_mask(coco2.annotations[0])
     assert m2 is not None and m2.shape == (100, 100)
     iou = (m2 & mask).sum() / (m2 | mask).sum()
     assert iou > 0.95, f"mask round-trip IoU too low: {iou}"
@@ -417,6 +417,8 @@ def test_save_load_roundtrip_fields(lr, tmp_path):
     # annotated_image_ids = image ids with boxes ∪ explicit marks
     # (frame 5 has no image record so the mark contributes nothing)
     assert d["annotated_image_ids"] == [img]
+    # annotated_timestamps mirrors the annotated image's timestamp_ns.
+    assert d["annotated_timestamps"] == [3 * 10**9]
     # progress sidecar
     prog = json.load(open(path.replace(".json", ".progress")))
     assert prog["reviewed"] == [3]
@@ -533,7 +535,7 @@ def test_import_coco_merge_dedup_masks(lr, tmp_path):
     assert anns_a[0]["track_id"] == 41    # source track id preserved
     img_b = next(i for i in coco.images if i["file_name"] == "b.png")
     ann_b = [a for a in coco.annotations if a["image_id"] == img_b["id"]][0]
-    assert isinstance(ann_b.get("_mask"), np.ndarray)  # mask restored
+    assert isinstance(coco.ensure_mask(ann_b), np.ndarray)  # mask restored
 
     # round-trip through save: segmentation comes back out
     coco.save(is_final=True)
@@ -574,7 +576,7 @@ def test_import_coco_merges_masks_into_duplicate_boxes(lr, tmp_path):
                                                         idx)
     assert (n_ok, n_skip, n_merged) == (0, 1, 1)
     assert len(coco.annotations) == 1  # still just the original box
-    merged = coco.annotations[0].get("_mask")
+    merged = coco.ensure_mask(coco.annotations[0])
     assert isinstance(merged, np.ndarray) and merged.any()
 
     # second import: the box already has a mask — nothing to merge
@@ -602,7 +604,7 @@ def test_import_coco_zero_dim_source_decodes_frame(lr, tmp_path):
     coco.import_coco(src, file_to_frame, idx)
     img = coco.images[0]
     assert (img["width"], img["height"]) == (12, 10)
-    assert coco.annotations[0].get("_mask") is not None
+    assert coco.ensure_mask(coco.annotations[0]) is not None
 
 
 def test_ensure_image_never_clobbers_dims_with_zero(lr, make_coco):
@@ -643,6 +645,10 @@ def test_discarded_frames_excluded_from_final_only(lr, tmp_path):
     assert [i["id"] for i in final["images"]] == [id_a]
     assert {a["image_id"] for a in final["annotations"]} == {id_a}
     assert final["annotated_image_ids"] == [id_a]
+    # annotated_timestamps reflects only the surviving (non-discarded) frame
+    assert final["annotated_timestamps"] == [
+        next(i["timestamp_ns"] for i in final["images"]
+             if i["id"] == id_a)]
 
     # the discard set persists in the .progress sidecar
     progress = json.load(open(out.replace(".json", ".progress")))

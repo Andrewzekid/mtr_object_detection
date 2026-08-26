@@ -88,6 +88,7 @@ class FakeWorker:
         self._running = False
         self._cancelled = False
         self._terminated = False
+        self.args = a
         self.kw = kw
         FakeWorker.instances.append(self)
 

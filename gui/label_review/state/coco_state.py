@@ -207,10 +207,16 @@ class CocoState:
                 if isinstance(tid, int) and not isinstance(tid, bool):
                     self._track_next = max(self._track_next, tid + 1)
                 # Restore the in-memory mask: COCO polygon "segmentation"
-                # (current format) or legacy base64 PNG ("mask"). A corrupt
-                # entry must not kill the whole load — drop just the mask.
-                h, w = img_dims.get(ann["image_id"], (0, 0))
-                ann["_mask"] = _imported_mask(ann, h, w)
+                # (current format) or legacy base64 PNG ("mask"). Polygons
+                # are kept AS polygons in "_poly" and rasterized lazily via
+                # ensure_mask() — eagerly rasterizing a whole dataset to
+                # full-size boolean masks hangs the UI and can exhaust RAM.
+                # A corrupt entry must not kill the whole load.
+                if ann.get("segmentation"):
+                    ann["_poly"] = ann["segmentation"]
+                else:
+                    h, w = img_dims.get(ann["image_id"], (0, 0))
+                    ann["_mask"] = _imported_mask(ann, h, w)
             for img in self.images:
                 # Images saved before the stereo feature have no "side"
                 # field — they are treated as left.
@@ -316,11 +322,15 @@ class CocoState:
                 # box, but DO merge the mask when the live box has none
                 # (otherwise re-loading a SAM3-annotated file over existing
                 # boxes silently drops every mask).
-                if dup.get("_mask") is None:
-                    mask = _imported_mask(ann, h, w)
-                    if mask is not None:
-                        dup["_mask"] = mask
+                if dup.get("_mask") is None and not dup.get("_poly"):
+                    if ann.get("segmentation"):
+                        dup["_poly"] = ann["segmentation"]
                         n_merged += 1
+                    else:
+                        mask = _imported_mask(ann, h, w)
+                        if mask is not None:
+                            dup["_mask"] = mask
+                            n_merged += 1
                 n_skipped += 1
                 continue
             frames_matched.add(frame_idx)
@@ -332,7 +342,11 @@ class CocoState:
                 "area": float(ann.get("area", bbox[2] * bbox[3])),
                 "iscrowd": int(ann.get("iscrowd", 0)),
             }
-            new_ann["_mask"] = _imported_mask(ann, h, w)
+            # Polygons stay polygons (lazy rasterization via ensure_mask).
+            if ann.get("segmentation"):
+                new_ann["_poly"] = ann["segmentation"]
+            else:
+                new_ann["_mask"] = _imported_mask(ann, h, w)
             # Keep the source track id when it parses as an int; otherwise
             # assign a fresh one so tracking stays consistent.
             try:
@@ -389,8 +403,13 @@ class CocoState:
             # Legacy base64-PNG "mask" field is superseded by COCO polygon
             # "segmentation" (same shape as scripts/results.json).
             out.pop("mask", None)
+            # Imported polygons pass through untouched (rasterizing them
+            # just to re-polygonize at save would defeat the lazy masks).
+            polys = ann.get("_poly")
             mask = ann.get("_mask")
-            if mask is not None and isinstance(mask, np.ndarray) and mask.size:
+            if polys:
+                out["segmentation"] = polys
+            elif mask is not None and isinstance(mask, np.ndarray) and mask.size:
                 polys = _mask_to_polygons(mask, self.min_polygon_area)
                 if polys:
                     out["segmentation"] = polys
@@ -418,11 +437,20 @@ class CocoState:
             out_images,
             key=lambda i: (i.get("timestamp_ns") or 0,
                            0 if i.get("side", "left") == "left" else 1))
+        # Annotated timestamps: unique timestamp_ns of every annotated image
+        # (both sides of a stereo pair collapse to one entry). Falls back to
+        # 0 when an image record has no timestamp (synthetic test data).
+        annotated_ts = sorted({
+            img.get("timestamp_ns") or 0
+            for img in out_images
+            if img["id"] in annotated_ids
+        })
         data = {
             "images": out_images,
             "annotations": final_anns,
             "categories": self.categories,
             "annotated_image_ids": sorted(annotated_ids),
+            "annotated_timestamps": annotated_ts,
         }
         path = self.output_json if is_final else tmp_path
         with open(path, "w", encoding="utf-8") as f:
@@ -565,7 +593,11 @@ class CocoState:
         """Attach (or clear) a SAM3 mask to an annotation, in-memory only."""
         for ann in self.annotations:
             if ann["id"] == ann_id:
-                prev = ann.get("_mask")
+                # An explicit mask supersedes imported polygons. Materialize
+                # first so undo restores the full previous state even when
+                # the mask was still lazy.
+                prev = self.ensure_mask(ann)
+                ann.pop("_poly", None)
                 if mask is None:
                     ann.pop("_mask", None)
                 else:
@@ -926,8 +958,30 @@ class CocoState:
     def get_mask(self, ann_id: int) -> Optional[np.ndarray]:
         for ann in self.annotations:
             if ann["id"] == ann_id:
-                return ann.get("_mask")
+                return self.ensure_mask(ann)
         return None
+
+    def ensure_mask(self, ann: Dict[str, Any]) -> Optional[np.ndarray]:
+        """Materialize an annotation's mask, rasterizing imported polygons
+        (``_poly``) on first use.
+
+        Loading/importing keeps COCO polygon ``segmentation`` as polygons
+        instead of eagerly converting every annotation to a full-size
+        boolean mask — with tens of thousands of masks that is both
+        prohibitively slow and exhausts RAM (each HxW bool array is MBs).
+        """
+        mask = ann.get("_mask")
+        if mask is not None:
+            return mask
+        polys = ann.get("_poly")
+        if not polys:
+            return None
+        img = self._img_by_id.get(ann["image_id"]) or {}
+        mask = _polygons_to_mask(polys, int(img.get("height", 0)),
+                                 int(img.get("width", 0)))
+        if mask is not None:
+            ann["_mask"] = mask
+        return mask
 
     def _invalidate_ann_caches(self) -> None:
         """Mark the anns_for_image / labeled_frame_idxs caches stale.

@@ -12,11 +12,16 @@ trained segmentation model + tracking results in a single pipeline run.
 
 ### Step 0 — install
 
+See **[Installation](#installation)** below for the one-command setup
+(`./install.sh`), the Docker image, or manual steps. The short version:
+
 ```bash
-pip install -r requirements.txt
-# SAM3 weights for GUI segmentation/autolabel (one-time):
-#   place sam3.pt at core/sam3/models/sam3-model/sam3.pt
+./install.sh                # venv + pip + SAM3 weights (GPU auto-detected)
+# or with the Qwen VLM server too:
+./install.sh --llamacpp --hf-token hf_xxx
 ```
+
+Then start the Qwen VLM server (seed labels):
 
 ### Step 1 — start the Qwen VLM server (seed labels)
 
@@ -131,9 +136,11 @@ checkpoint from Hugging Face; models are cached per session.
 Two compatibility notes for the HF backends (handled automatically in
 `core/`): Falcon's pre-compiled flex-attention kernels exceed the shared
 memory of consumer GPUs (RTX 4090), so they are recompiled with smaller
-blocks at load; Florence-2 runs its 2023-era remote code under
-transformers 5.x via shims plus a local beam search (`model.generate` is
-unusable there — see `core/detectors.py`).
+blocks at load (BLOCK=128, 1 stage; tunable via `FALCON_FLEX_BLOCK_M` /
+`FALCON_FLEX_BLOCK_N` / `FALCON_FLEX_STAGES`), and per-category queries are
+batched into one `generate` call; Florence-2 runs its 2023-era remote
+code under transformers 5.x via shims plus a local beam search
+(`model.generate` is unusable there — see `core/detectors.py`).
 
 ### Labelling assist features (when and how to use them)
 
@@ -316,13 +323,164 @@ reference with inputs/outputs is at the bottom of this file.
 
 ---
 
-## Prerequisites
+## Installation
+
+The app needs **Python 3.10–3.13**, a Linux box (Ubuntu 20.04+/Debian 12
+tested), and **optionally an NVIDIA GPU** (strongly recommended — SAM3,
+YOLO training and tracking are 10–50× slower on CPU). There are three
+ways to install; pick one.
+
+### Option A — one-command installer (`install.sh`)
+
+`install.sh` (repo root) sets up a Python venv, installs system Qt/X
+libraries, installs all pip dependencies (CUDA torch auto-detected), and
+downloads the SAM3 + SAM3.1 weights from HuggingFace.
 
 ```bash
-pip install -r requirements.txt        # loose bounds
-# or exactly reproduce the dev machine:
-pip install -r requirements-lock.txt
+# default: venv at ./.venv, auto-detect GPU, fetch SAM3 weights
+./install.sh --hf-token hf_xxx          # token for the gated facebook/sam3 repo
+
+# use a conda env instead of a venv
+./install.sh --conda objdet --hf-token hf_xxx
+
+# also build llama.cpp for the Qwen seed-label VLM server
+./install.sh --llamacpp --hf-token hf_xxx
+
+# force CPU torch (no NVIDIA GPU)
+./install.sh --cpu --hf-token hf_xxx
 ```
+
+Flags:
+
+| Flag | Effect |
+|------|--------|
+| `--gpu` / `--cpu` | Force CUDA / CPU torch (default: auto-detect via `nvidia-smi`) |
+| `--conda NAME` | Use/create a conda env `NAME` instead of `./.venv` |
+| `--llamacpp` | Also clone + build llama.cpp (`~/code/llama/llama.cpp`) for the Qwen server |
+| `--skip-models` | Skip SAM3 weight download (GUI still starts, SAM3 features off until you place the weights) |
+| `--skip-apt` | Skip the `apt-get` system-lib step (you've already installed them) |
+| `--hf-token TOKEN` | HuggingFace token for the gated `facebook/sam3` repo (or `export HF_TOKEN=…`) |
+| `-h` / `--help` | Show usage |
+
+**SAM3 weights are gated.** Before the first run: visit
+<https://huggingface.co/facebook/sam3>, accept the license, create a token
+at <https://huggingface.co/settings/tokens>, and pass it via `--hf-token`
+or `HF_TOKEN`. The script downloads:
+
+| File | Destination | Size |
+|------|-------------|------|
+| `sam3.pt` (SAM3) | `core/sam3/models/sam3-model/sam3.pt` | ~3.4 GB |
+| `sam3.1_multiplex.pt` (SAM3.1, Propagate→) | `core/sam3/models/sam3.1-model/sam3.1_multiplex.pt` | ~3.4 GB |
+
+**Qwen VLM weights are NOT bundled** — they're ~18 GB and user-supplied.
+With `--llamacpp` the script builds `llama-server`; you then download a
+Qwen3.8 vision GGUF + its `mmproj` (e.g. `Qwen3.8-27B-Q4_K_M.gguf` +
+`Qwen3.8-mmproj-F16.gguf`) into `~/code/llama/llama.cpp/` and start it
+yourself (see Step 1 of the Quickstart).
+
+**HF autolabel backends** (`owlv2`, `grounding-dino`, `florence2`,
+`falcon`) download automatically on first use in the GUI's
+Settings → Autolabel, into `~/.cache/huggingface/`. YOLO pretrained base
+weights (`yolo26n.pt`, …) are fetched by Ultralytics on first training
+run into `models/`. Neither needs an install step.
+
+### Option B — Docker (GPU + GUI + full pipeline)
+
+The `Dockerfile` (repo root) builds an image with the CUDA runtime, all
+Python deps, the label-review GUI, and (optionally) a built `llama-server`
+for the Qwen VLM. GPU + X11 are forwarded to the host so the GUI shows
+on your desktop.
+
+```bash
+# build (fetch SAM3 weights at build time with a token):
+docker build -t object-detection-app --build-arg HF_TOKEN=hf_xxx .
+
+# run the GUI (Linux host; forwards display + GPU + HF cache):
+xhost +local:docker
+docker run --gpus all --rm -it --net=host \
+  -e DISPLAY=$DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v "$PWD":/work -w /work \
+  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -p 8089:8089 \
+  object-detection-app \
+  --images /work/Datasets/YourData
+```
+
+Run the **Qwen VLM server** in a second container (mount your GGUFs):
+
+```bash
+docker run --gpus all --rm -it --net=host \
+  -v "$HOME/code/llama/llama.cpp":/llama.cpp \
+  -v "$HOME/models/qwen":/models/qwen:ro \
+  object-detection-app \
+  /llama.cpp/build/bin/llama-server \
+    -m /models/qwen/Qwen3.8-27B-Q4_K_M.gguf \
+    --mmproj /models/qwen/Qwen3.8-mmproj-F16.gguf \
+    --port 8089 --host 0.0.0.0
+```
+
+Build-args:
+
+| Arg | Effect |
+|-----|--------|
+| `HF_TOKEN=hf_xxx` | Fetch SAM3 + SAM3.1 weights at build time (gated repo) |
+| `BUILD_LLAMACPP=1` | Also build `llama-server` inside the image (off by default — most users mount a prebuilt binary) |
+
+Without `HF_TOKEN` the image builds fine but the SAM3 weights are absent;
+mount them at runtime (`-v "$PWD/core/sam3/models":/app/core/sam3/models`).
+
+### Option C — manual install
+
+```bash
+# 1. Python env (3.10–3.13)
+python3 -m venv .venv && source .venv/bin/activate
+
+# 2. System libs for PyQt6 (Ubuntu/Debian)
+sudo apt-get update && sudo apt-get install -y \
+  libgl1 libegl1 libxkbcommon0 libdbus-1-3 \
+  libglib2.0-0 libfontconfig1 libxcb-cursor0 ffmpeg
+
+# 3. CUDA torch (NVIDIA GPU) — pick the index matching your CUDA:
+pip install --extra-index-url https://download.pytorch.org/whl/cu121 torch torchvision
+# CPU-only:
+#   pip install torch torchvision
+
+# 4. Python deps
+pip install -r requirements.txt
+pip install "git+https://github.com/ultralytics/CLIP.git"   # SAM3 text encoder
+
+# 5. SAM3 weights (gated HF repo — accept license + create token first)
+pip install huggingface_hub
+export HF_TOKEN=hf_xxx
+huggingface-cli download facebook/sam3     sam3.pt             \
+  --local-dir core/sam3/models/sam3-model      --token "$HF_TOKEN"
+huggingface-cli download facebook/sam3.1 sam3.1_multiplex.pt  \
+  --local-dir core/sam3/models/sam3.1-model    --token "$HF_TOKEN"
+
+# 6. (optional) Qwen VLM server — build llama.cpp + supply GGUFs
+git clone https://github.com/ggerganov/llama.cpp ~/code/llama/llama.cpp
+cd ~/code/llama/llama.cpp && mkdir build && cd build
+cmake .. -DLLAMA_CUDA=on -DLLAMA_BUILD_SERVER=on && cmake --build . --config Release -j
+# download Qwen3.8-27B-Q4_K_M.gguf + Qwen3.8-mmproj-F16.gguf into ~/code/llama/llama.cpp/
+```
+
+Verify:
+
+```bash
+python -c "from ultralytics.models.sam import SAM3SemanticPredictor; print('ok')"
+python -m gui.label_review.main --help
+```
+
+### Where each model lives
+
+| Model | Source | Destination | Downloaded by |
+|-------|--------|-------------|---------------|
+| SAM3 (`sam3.pt`) | `facebook/sam3` (gated) | `core/sam3/models/sam3-model/sam3.pt` | `install.sh` / manual / Docker build |
+| SAM3.1 (`sam3.1_multiplex.pt`) | `facebook/sam3.1` (gated) | `core/sam3/models/sam3.1-model/sam3.1_multiplex.pt` | same |
+| YOLO base weights (`yolo26n.pt` …) | Ultralytics | `models/` | Ultralytics on first training run |
+| OWLv2 / Grounding-DINO / Florence-2 / Falcon | HuggingFace | `~/.cache/huggingface/` | `transformers.from_pretrained` on first GUI use |
+| Qwen VLM (GGUF) | user-supplied | `~/code/llama/llama.cpp/` | you (install.sh `--llamacpp` builds the server only) |
 
 ### Standalone bundle (no Python needed on the target)
 
@@ -367,8 +525,6 @@ Notes:
 
 - **SAM3 segmentation** needs the Ultralytics SAM checkpoint. Place it at
   `core/sam3/models/sam3-model/sam3.pt` (or pass `--model` explicitly).
-
-  ```
 
 ---
 
@@ -849,7 +1005,7 @@ All flags: `--images`, `--images-right`, `--output_json`, `--json` (seed
 COCO), `--sam3-model/--sam3-device/--sam3-conf`, `--auto-segment`
 (SAM3 after every drawn box), `--interp-flow-method {dis,klt,farneback}`,
 `--interp-camera-model {none,global}`, `--output-yolo-dir` (also export YOLO
-on exit), `--rrd` (Rerun recording), `--pose-db` (Clio poses for map view),
+on exit), `--pose-db` (Clio poses for the Rerun map view),
 `--data-yaml` (class order), `--config FILE`. Omitting `--images` starts in
 idle mode — pick a source from the File menu. If a `labels_coco.json` sits
 next to the images it is auto-loaded.
@@ -862,8 +1018,31 @@ next to the images it is auto-loaded.
 | Open folder… | `Ctrl+Shift+O` | |
 | Open stereo folders… | — | pick left then right folder |
 | Load annotations file… | `Ctrl+I` | import COCO JSON |
+| **Open rerun file…** | — | open a Rerun recording (`.rrd`) in the rerun viewer (see below) |
+| **Open pose database…** | — | Clio inspection SQLite with per-timestamp poses for the map view |
 | Save / Save as… | `Ctrl+S` / `Ctrl+Shift+S` | |
 | Config settings… | `Ctrl+G` | same as the ⚙ button |
+
+The **View** menu switches the UI theme at runtime (**dark**, **light**, or
+**pastel** lime); the choice persists across sessions.
+
+### Rerun viewer & point-cloud map
+
+The GUI can place your labels on a 3D map with the [Rerun](https://rerun.io)
+viewer:
+
+1. **Open rerun file…** (File menu or the sidebar's **🎬 Rerun viewer / map…**
+   button) opens a `.rrd` recording — it carries the colored point-cloud
+   map, the camera images and their timestamps — in a windowed rerun
+   viewer. The GUI then streams into that recording.
+2. **Open pose database…** (or **📍 Pose database…**) loads a Clio
+   inspection SQLite DB whose `images` table holds per-timestamp
+   camera/lidar poses (`--pose-db` does the same at launch).
+3. **🗺 Show annotated in Rerun** plots every frame marked
+   **✔ Mark as annotated** as a labeled camera position on the map — a
+   visual coverage overview of what you labeled along the route.
+
+CLI equivalent: `--pose-db` preloads the pose DB at launch.
 
 ### Keyboard shortcuts
 
@@ -905,8 +1084,11 @@ next to the images it is auto-loaded.
 | **Add / Rename / Delete** (+ name field) | manage categories |
 | **▶ Play / ⏸ Pause** + speed combo | playback at 0.25x–10x |
 | **−10 −5 +5 +10** | jump buttons |
-| **✔ Mark as annotated** | count frame as done without boxes |
+| **✔ Mark as annotated** | count frame as done without boxes (Viewpoint Selection section) |
 | **🚫 Discard image** | drop the frame from the saved COCO entirely (blurry/irrelevant frames never reach training) |
+| **🗺 Show annotated in Rerun** | plot all annotated frames' camera positions on the Rerun map (needs a pose DB + opened `.rrd`) |
+| **🎬 Rerun viewer / map…** | open a `.rrd` recording in the rerun viewer — see *Rerun viewer & point-cloud map* above |
+| **📍 Pose database…** | load a Clio pose DB to place annotated frames on the map |
 | **★ Keyframe** (`K`) | mark anchor frame for interpolation |
 | **Interpolate (I)** + **Stop** | optical-flow-fill boxes between two labeled/keyframe anchors; use for smooth, constant-direction motion |
 | **Run SAM3 (all)** / **Re-seg sel (R)** / **Cancel** | segment all boxes on the frame / re-mask the selection |
@@ -957,8 +1139,13 @@ Load/Apply/Save buttons live at the bottom; example config:
 ### Files written by the GUI
 
 - `<output_json>` — the reviewed COCO: polygon `segmentation` masks,
-  `"side"` + `timestamp_ns` per image, `annotated_image_ids`; discarded
-  frames excluded. Stereo saves only synced pairs, sorted earliest first.
+  `"side"` + `timestamp_ns` per image, `annotated_image_ids`, and
+  `annotated_timestamps` (unique `timestamp_ns` of annotated frames, stereo
+  pair collapsed to one entry); discarded frames excluded. Stereo saves
+  only synced pairs, sorted earliest first.
 - `<output>.progress` sidecar — current index, reviewed/annotated/discard
   marks, keyframes (so you can quit and resume anytime).
-- Optional `.rrd` Rerun recording when launched with `--rrd`.
+
+Rerun recordings (`.rrd`) are not written by the GUI — open an existing
+recording via **Open rerun file…** and the GUI streams annotation markers
+into it.
