@@ -521,9 +521,19 @@ def _patch_flex_attention_for_smem(model) -> bool:
     default triton config needs ~146KB of shared memory per block — more
     than consumer GPUs have (RTX 4090: ~99KB), so kernel compilation fails
     with "No valid triton configs". When the GPU's limit is below that,
-    swap the module-level compiled variants for eager flex_attention
-    (slower, but runs). Returns True when the patch was applied.
+    recompile flex_attention with smaller block sizes that fit. Returns True
+    when the patch was applied.
+
+    The default Triton flex-attention kernels use BLOCK_M=BLOCK_N=128 with
+    3 pipeline stages (~146KB smem). On the RTX 4090 (~99KB opt-in smem),
+    BLOCK=128 + 3 stages does not fit; BLOCK=64 + 1 stage fits comfortably
+    but under-utilizes the SM. BLOCK=128 + 1 stage is the sweet spot: the
+    larger tile keeps the matmul efficient while the single stage cuts the
+    smem footprint enough to compile, giving meaningfully better
+    throughput than 64x64 on Ada-class GPUs. Override by setting
+    ``FALCON_FLEX_BLOCK_M`` / ``FALCON_FLEX_BLOCK_N`` / ``FALCON_FLEX_STAGES``.
     """
+    import os
     import sys
     import torch
 
@@ -533,16 +543,21 @@ def _patch_flex_attention_for_smem(model) -> bool:
         torch.cuda.current_device()).shared_memory_per_block_optin
     if smem >= 150_000:
         return False  # datacenter GPU — the default kernels fit
+
+    block_m = int(os.environ.get("FALCON_FLEX_BLOCK_M", "128"))
+    block_n = int(os.environ.get("FALCON_FLEX_BLOCK_N", "128"))
+    num_stages = int(os.environ.get("FALCON_FLEX_STAGES", "1"))
+
     # Eager flex_attention is NOT an option (it materializes the full
     # scores matrix — the AnyUp upsampler's cross-attention alone would
-    # need ~64GB), so recompile with small blocks that fit the smem limit.
+    # need ~64GB), so recompile with smaller blocks that fit the smem limit.
     from torch.nn.attention.flex_attention import flex_attention
 
     def _flex_small_blocks(*args, **kwargs):
         ko = dict(kwargs.get("kernel_options") or {})
-        ko.setdefault("BLOCK_M", 64)
-        ko.setdefault("BLOCK_N", 64)
-        ko.setdefault("num_stages", 1)
+        ko.setdefault("BLOCK_M", block_m)
+        ko.setdefault("BLOCK_N", block_n)
+        ko.setdefault("num_stages", num_stages)
         kwargs["kernel_options"] = ko
         return flex_attention(*args, **kwargs)
 
@@ -574,7 +589,8 @@ def load_falcon(model_id: Optional[str] = None, device: str = "cuda"):
         if device != "cpu" and _patch_flex_attention_for_smem(model):
             print("⚠️ Falcon: GPU shared-memory limit too small for the "
                   "default flex-attention kernels — recompiled with smaller "
-                  "blocks (somewhat slower).")
+                  "blocks (BLOCK=128, 1 stage; set FALCON_FLEX_BLOCK_M/N / "
+                  "FALCON_FLEX_STAGES to tune).")
         return model
 
     return _load_cached((model_id, device), _load)
@@ -604,6 +620,14 @@ def falcon_detect(image, queries: List[str],
     Every detection returned for a query gets that query as its label, so
     the caller's query->cat_id mapping applies directly. Unlike the other
     backends, Falcon also produces real instance masks (RLE-decoded).
+
+    All queries are sent to ``model.generate`` in ONE batched call (one
+    prefill + one decode loop), instead of one call per category. The
+    model's ``generate`` accepts a list of images and a list of queries
+    with one query per image, so we replicate the same image across the
+    batch. This cuts per-category Python/compile overhead and keeps the
+    GPU busy for the whole multi-category run instead of idling between
+    sequential ``generate`` calls.
     """
     model_id = model_id or DEFAULT_FALCON_MODEL
     state = _state if _state is not None else {}
@@ -626,9 +650,18 @@ def falcon_detect(image, queries: List[str],
     pil = _to_pil(image)
     width, height = pil.size
 
+    # Batch all queries in one generate() call: replicate the image so
+    # each (image, query) pair becomes one row of the batch. Returns a
+    # list-of-lists indexed [image_idx][det_idx]; queries with no
+    # detections come back as an empty list. With compile=False we skip
+    # Falcon's own torch.compile pass (our small-block patch already
+    # covers the flex-attention kernels, and the rest of the graph adds
+    # overhead on first-call latency without helping the per-frame path).
+    batch_images = [pil] * len(queries)
+    results_per_query = model.generate(batch_images, queries, compile=False)
+
     dets: List[Dict[str, Any]] = []
-    for query in queries:
-        preds = model.generate(pil, query, compile=False)[0]
+    for query, preds in zip(queries, results_per_query):
         for pred in preds or []:
             xy, hw = pred.get("xy") or {}, pred.get("hw") or {}
             cx, cy = float(xy.get("x", 0.0)), float(xy.get("y", 0.0))

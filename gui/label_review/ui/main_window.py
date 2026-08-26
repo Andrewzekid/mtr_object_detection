@@ -12,13 +12,14 @@ from PyQt6.QtCore import QRunnable, QThreadPool
 
 from ..qt_compat import Qt, QtCore, QtGui, QtWidgets, QEvent, QTimer, _QT_HORZ  # first: enum shims  # noqa: E501
 from ..qt_compat import (  # noqa: F401
-    QAction, QApplication, QCheckBox, QFileDialog, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPushButton, QShortcut, QSplitter,
+    QAction, QActionGroup, QApplication, QCheckBox, QFileDialog, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPushButton, QShortcut, QSplitter,
 )
 
 from ..config import _resolve_device
 from ..state.coco_state import CocoState
 from ..state.index import ImageFolderIndex, StereoIndex
+from . import theme as ui_theme
 from ..workers.label_review_workers import (  # noqa: F401
     SAM3Worker, SAM3BatchWorker, InterpBatchWorker,
     SAM3AutolabelWorker, SAM3AutolabelBatchWorker, SAM3PropagateWorker,
@@ -145,9 +146,12 @@ class ReviewWindow(QMainWindow):
         # resolution; config: display.max_image_dim). Box/mask coordinates
         # are unaffected — the canvases keep logical image coords.
         self.display_max_dim: int = max(0, int(display_max_dim))
-        # Optional Rerun (.rrd) recorder: when enabled (--rrd), marking a
-        # frame as annotated logs its image, boxes and box-center
-        # keypoints to the recording (see rerun_logger.py).
+        # Rerun (.rrd) marker streamer: "Open rerun file…" opens a provided
+        # recording in the viewer; "Show annotated in Rerun" plots annotated
+        # frames' camera positions on its map (see rerun_logger.py).
+        if rerun_logger is None:
+            from ..rerun_logger import RerunLogger
+            rerun_logger = RerunLogger()
         self.rerun = rerun_logger
         # Optional pose DB (Clio inspection SQLite) used to place marked
         # frames on the point-cloud map (see map_view.py).
@@ -219,6 +223,13 @@ class ReviewWindow(QMainWindow):
 
         # Persisted UI state (window geometry, sidebar width, etc.).
         self._ui_state_path = Path.home() / ".config" / "cv_label_review" / "state.json"
+
+        # Theme: apply the saved choice BEFORE building any widgets so the
+        # window never flashes with the wrong palette. The View menu can
+        # switch it at runtime; the choice persists via _write_ui_state.
+        self._theme_actions: Dict[str, QAction] = {}
+        self._apply_theme(self._saved_theme() or ui_theme.current_theme(),
+                          save=False)
 
         # Frame playback timer.
         self._play_timer = QTimer(self)
@@ -327,6 +338,8 @@ class ReviewWindow(QMainWindow):
         self.side.toggle_keyframe_clicked.connect(self._on_toggle_keyframe)
         self.side.toggle_annotated_clicked.connect(self._on_toggle_annotated)
         self.side.toggle_discard_clicked.connect(self._on_toggle_discard)
+        self.side.show_annotated_rerun_clicked.connect(
+            self._on_show_annotated_rerun)
         self.side.point_seg_toggled.connect(self._on_point_seg_toggled)
         self.side.segment_points_clicked.connect(self._on_segment_points)
         self.side.interpolate_clicked.connect(self._on_interpolate)
@@ -335,6 +348,9 @@ class ReviewWindow(QMainWindow):
         self.side.add_cat_clicked.connect(self._on_add_category)
         self.side.rename_cat_clicked.connect(self._on_rename_category)
         self.side.del_cat_clicked.connect(self._on_delete_category)
+        # Rerun viewer / map + pose DB (same handlers as the File menu).
+        self.side.rerun_open_clicked.connect(self._open_rerun_file)
+        self.side.pose_db_clicked.connect(self._open_pose_db)
 
         # Frame slider config
         self.side.set_slider_max(len(self.frame_index))
@@ -570,6 +586,32 @@ class ReviewWindow(QMainWindow):
             c.set_mask_alpha(round(pct * 255 / 100))
         self._write_ui_state(mask_opacity=int(pct))
 
+    # ----------------------- UI theme (View menu) ----------------------- #
+
+    def _saved_theme(self) -> Optional[str]:
+        """The persisted theme name, or None when unset/invalid."""
+        try:
+            if not self._ui_state_path.exists():
+                return None
+            with open(self._ui_state_path, "r") as f:
+                name = json.load(f).get("theme")
+            return name if name in ui_theme.THEMES else None
+        except Exception:
+            return None
+
+    def _apply_theme(self, name: str, save: bool = True) -> None:
+        """Switch the app-wide theme (View menu / startup restore).
+
+        The stylesheet swap triggers a full repaint, so the custom-painted
+        canvases pick up the new palette via theme.color() with no extra
+        wiring. `save=False` is used on the startup restore path."""
+        applied = ui_theme.apply_theme(name, QApplication.instance())
+        for tname, act in self._theme_actions.items():
+            act.setChecked(tname == applied)
+        if save and applied == name:
+            self._write_ui_state(theme=applied)
+            self.statusBar().showMessage(f"Theme: {applied}", 2000)
+
     # ----------------------- open images / folder ----------------------- #
 
     def _build_menu(self) -> None:
@@ -599,11 +641,11 @@ class ReviewWindow(QMainWindow):
         m.addAction(act_anns)
         act_rerun = QAction("Open rerun file…", self)
         act_rerun.setToolTip(
-            "Open a Rerun recording (.rrd) in the rerun viewer, or a "
-            "colored point-cloud map (.pcd): the map is loaded into this "
-            "session's recording and a live-connected rerun viewer opens. "
-            "Marking frames as annotated then marks their camera position "
-            "on the map (needs a pose DB, File -> Open pose database…).")
+            "Open a Rerun recording (.rrd) - with the colored point-cloud "
+            "map, images and timestamps - in the rerun viewer. Then "
+            "'🗺 Show annotated in Rerun' plots annotated frames' camera "
+            "positions on the map (needs a pose DB, File -> Open pose "
+            "database…).")
         act_rerun.triggered.connect(self._open_rerun_file)
         m.addAction(act_rerun)
         act_pose_db = QAction("Open pose database…", self)
@@ -635,8 +677,24 @@ class ReviewWindow(QMainWindow):
             "SAM3 / mask opacity; load/save a JSON config).")
         act_cfg.triggered.connect(self._load_config_dialog)
         m.addAction(act_cfg)
+
+        # View menu: UI theme switcher (dark / light / pastel).
+        view = self.menuBar().addMenu("&View")
+        theme_group = QActionGroup(self)  # exclusive radio-style actions
+        for name in ui_theme.THEMES:
+            act_theme = QAction(name.capitalize(), self)
+            act_theme.setCheckable(True)
+            act_theme.setChecked(name == ui_theme.current_theme())
+            act_theme.setToolTip(f"Use the {name} UI theme.")
+            act_theme.triggered.connect(
+                lambda _checked=False, n=name: self._apply_theme(n))
+            theme_group.addAction(act_theme)
+            view.addAction(act_theme)
+            self._theme_actions[name] = act_theme
+
         # A visible Config button in the menu bar's top-right corner.
         cfg_btn = QPushButton("⚙ Config")
+        cfg_btn.setObjectName("configButton")
         cfg_btn.setToolTip(
             "Open the settings dialog (hide UI elements / interpolation / "
             "SAM3 / mask opacity; load/save a JSON config).")
@@ -715,55 +773,21 @@ class ReviewWindow(QMainWindow):
             5000)
 
     def _open_rerun_file(self) -> None:
-        """File -> Open rerun file…: view a .rrd recording, or load a .pcd
-        colored map into this session's recording (and open a live
-        rerun viewer so mark-as-annotated markers appear on the map)."""
+        """File -> Open rerun file…: open an .rrd recording (with the map,
+        images and timestamps) in a windowed rerun viewer. It becomes the
+        target for '🗺 Show annotated in Rerun' markers."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open rerun file", "",
-            "Rerun / point cloud (*.rrd *.pcd);;Rerun recording (*.rrd);;"
-            "Point cloud map (*.pcd)")
+            self, "Open rerun file", "", "Rerun recording (*.rrd)")
         if not path:
             return
-        if path.lower().endswith(".rrd"):
-            # Static recording: just launch the rerun viewer on it.
-            import subprocess
-            try:
-                subprocess.Popen(["rerun", path])
-                self.statusBar().showMessage(
-                    f"Opened {path} in the rerun viewer", 4000)
-            except FileNotFoundError:
-                QMessageBox.warning(
-                    self, "rerun not found",
-                    "The `rerun` viewer executable is not on PATH. "
-                    "Install rerun-sdk / the rerun CLI first.")
-            return
-        # .pcd colored map: log it into the session recording.
-        from ..map_view import load_pcd
-        try:
-            positions, colors = load_pcd(path)
-        except Exception as exc:
-            QMessageBox.warning(self, "Could not read point cloud",
-                                f"{path}:\n{exc}")
-            return
-        logger = self._ensure_rerun()
-        if logger is None or not logger.enabled:
+        if not self.rerun.open_recording(path):
             QMessageBox.warning(
                 self, "Rerun unavailable",
-                "Could not start a Rerun recording (is rerun-sdk "
-                "installed?). The map cannot be displayed.")
+                "Could not open the recording (is rerun-sdk / the rerun "
+                "CLI installed?).")
             return
         self.statusBar().showMessage(
-            f"Loading {len(positions):,} map points into Rerun…", 3000)
-        QApplication.processEvents()
-        logger.log_map(positions, colors)
-        logger.flush()
-        logger.spawn()
-        self.statusBar().showMessage(
-            f"Map loaded ({len(positions):,} points). Marking frames as "
-            "annotated marks their camera position on the map"
-            + ("" if self._pose_db else
-               " - open a pose DB (File -> Open pose database…) to enable "
-               "map markers"), 8000)
+            f"Opened {path} in the rerun viewer", 4000)
 
     def _open_pose_db(self) -> None:
         """File -> Open pose database…: Clio inspection SQLite whose
@@ -783,15 +807,6 @@ class ReviewWindow(QMainWindow):
         n = len(self._pose_db._ts)
         self.statusBar().showMessage(
             f"Pose DB loaded: {n:,} image poses from {path}", 5000)
-
-    def _ensure_rerun(self):
-        """The active RerunLogger, creating one on demand (recording next
-        to the COCO output) when the session wasn't started with --rrd."""
-        if self.rerun is None or not self.rerun.enabled:
-            from ..rerun_logger import RerunLogger
-            out = Path(self.coco.output_json)
-            self.rerun = RerunLogger(str(out.with_suffix(".rrd")))
-        return self.rerun
 
     def _load_annotations_dialog(self) -> None:
         """File → Load annotations file…: import boxes/masks from a COCO
@@ -1102,7 +1117,7 @@ class ReviewWindow(QMainWindow):
                 "bbox": [x, y, bw, bh],
                 "cat_id": ann["category_id"],
                 "cat_name": self.coco.cat_map.get(ann["category_id"], "?"),
-                "mask": ann.get("_mask"),
+                "mask": self.coco.ensure_mask(ann),
                 "track_id": ann.get("track_id"),
                 "interp": ann.get("interp", False),
             })
@@ -1341,36 +1356,41 @@ class ReviewWindow(QMainWindow):
         self.coco.dirty = True
         self._sync_annotated_button()
         self.coco.save(is_final=False)
-        # Rerun recording: log what this frame currently holds (image,
-        # boxes, box-center keypoints) so the .rrd always reflects the
-        # latest state of the mark.
-        self._log_rerun_current()
         self.statusBar().showMessage(msg, 2500)
 
-    def _log_rerun_current(self) -> None:
-        """Log the current frame (all sides) to the Rerun recording."""
-        if self.rerun is None or not getattr(self.rerun, "enabled", False):
+    def _on_show_annotated_rerun(self) -> None:
+        """'🗺 Show annotated in Rerun' button: plot every annotated
+        frame's camera position (pose DB lookup by image timestamp) on the
+        map of the opened .rrd recording."""
+        if self._pose_db is None:
+            QMessageBox.warning(
+                self, "No pose database",
+                "Open a pose database first "
+                "(File -> Open pose database…).")
             return
-        try:
-            idx = self._current_idx
-            marked = idx in self.coco.annotated_marks
-            for side, canvas in self.canvases.items():
+        if not self.rerun.rrd_path:
+            QMessageBox.warning(
+                self, "No rerun recording",
+                "Open the .rrd recording first (File -> Open rerun "
+                "file…).")
+            return
+        marks = sorted(self.coco.annotated_marks - self.coco.discarded_frames)
+        markers = []
+        for idx in marks:
+            for side in self.canvases:
                 frame = self._frame_at_side(idx, side)
-                arr = self._decode_side(idx, side)
-                image_id = canvas._image_id
-                anns = self.coco.anns_for_image(image_id) \
-                    if image_id is not None else []
-                self.rerun.log_frame(frame, arr, anns,
-                                     self.coco.cat_map, side=side)
-                # Mark the frame's camera position on the colored map.
-                if marked and self._pose_db is not None:
-                    pos = self._pose_db.pose_at(frame.get("timestamp_ns"))
-                    if pos is not None:
-                        self.rerun.log_map_marker(
-                            pos, label=f"frame {idx + 1} ({side})")
-            self.rerun.flush()
-        except Exception as exc:
-            print(f"WARNING: Rerun logging failed: {exc}")
+                pos = self._pose_db.pose_at(frame.get("timestamp_ns"))
+                if pos is not None:
+                    markers.append((pos, f"frame {idx + 1} ({side})"))
+        if not self.rerun.log_annotated_markers(markers):
+            self.statusBar().showMessage(
+                "Rerun marker logging failed (see console)", 5000)
+            return
+        self.statusBar().showMessage(
+            f"Rerun: showing {len(markers)} annotated viewpoint(s)"
+            if markers else
+            "No poses found for the annotated frames (markers cleared)",
+            6000)
 
     @staticmethod
     def _ann_to_interp_dict(ann: Dict[str, Any]) -> Dict[str, Any]:
@@ -2256,7 +2276,7 @@ class ReviewWindow(QMainWindow):
             if img_id is None:
                 continue  # never visited → no annotations possible
             anns = [a for a in self.coco.anns_for_image(img_id)
-                    if a.get("_mask") is None]
+                    if a.get("_mask") is None and not a.get("_poly")]
             if not anns:
                 continue
             bboxes, concepts, ann_ids = [], [], []
@@ -2483,7 +2503,12 @@ class ReviewWindow(QMainWindow):
         return arr[y1:y2, x1:x2].copy(), label, cat_id
 
     def _on_autolabel_frame(self) -> None:
-        """Autolabel the current frame (highlighted categories, or all)."""
+        """Autolabel the current frame (highlighted categories, or all).
+
+        In stereo this covers BOTH sides: the active side's job starts
+        immediately, the other waits in the SAM3 queue (results apply by
+        image_id, so the second-side job runs as soon as the first ends).
+        """
         detector = self.autolabel_detector
         if detector in ("owlv2", "owlv2_exemplar"):
             if not _OWLV2_AVAILABLE:
@@ -2509,13 +2534,28 @@ class ReviewWindow(QMainWindow):
             if pair is None:
                 return
             concepts, cat_ids = pair
-        img_path = self._write_tmp_image()
-        if img_path is None:
+        # In stereo run on both sides: the active side starts now, the
+        # other queues through the SAM3 queue (which already handles
+        # back-to-back jobs via _start_next_queued_sam3). The exemplar
+        # (if any) is the active-side crop and is reused verbatim on
+        # the other side — visual queries generalize across a stereo pair.
+        sides = (["left", "right"] if self._stereo
+                 else [self._active_canvas.side])
+        started = False
+        for side in sides:
+            img_path = self._write_tmp_image(side)
+            if img_path is None:
+                self._set_sam3_status(
+                    f"autolabel failed — no image for {side} frame")
+                continue
+            image_id = self.canvases[side]._image_id
+            if image_id is None:
+                continue
+            self._start_autolabel_worker(img_path, concepts, cat_ids,
+                                         image_id, exemplar=exemplar)
+            started = True
+        if not started:
             self._set_sam3_status("autolabel failed — no image for frame")
-            return
-        self._start_autolabel_worker(img_path, concepts, cat_ids,
-                                     self._current_image_id,
-                                     exemplar=exemplar)
 
     def _start_autolabel_worker(self, img_path: str, concepts: list,
                                 cat_ids: list, image_id: int,
@@ -2671,8 +2711,10 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _on_autolabel_all(self) -> None:
-        """Background text-prompt autolabel over every frame — on the
-        ACTIVE side only (in stereo)."""
+        """Background text-prompt autolabel over every frame. In stereo
+        this covers BOTH sides: the first side's batch runs immediately,
+        the second is chained on finish (results apply by image_id, so
+        the per-side handlers are side-agnostic)."""
         detector = self.autolabel_detector
         if detector in ("owlv2", "owlv2_exemplar"):
             if not _OWLV2_AVAILABLE:
@@ -2691,7 +2733,6 @@ class ReviewWindow(QMainWindow):
         if self._sam3_busy():
             self.statusBar().showMessage("SAM3 already running", 2500)
             return
-        side = self._active_canvas.side
         exemplar = None
         if detector == "owlv2_exemplar":
             exemplar = self._exemplar_from_selection()
@@ -2711,9 +2752,12 @@ class ReviewWindow(QMainWindow):
         exemplar_note = ("\nThe currently selected box is the visual query "
                          "(1-shot exemplar)." if detector == "owlv2_exemplar"
                          else "")
+        sides = ["left", "right"] if self._stereo else ["left"]
+        scope = (f"both {len(sides)} sides ({n} pairs each)" if self._stereo
+                else f"{n} frame(s)")
         ret = QMessageBox.question(
             self, f"Autolabel all frames with {det_label}?",
-            f"Run text-prompt detection on all {n} frame(s) for "
+            f"Run text-prompt detection on {scope} for "
             f"{len(concepts)} categor{'y' if len(concepts) == 1 else 'ies'} "
             f"({', '.join(concepts[:5])}{'…' if len(concepts) > 5 else ''})"
             f"{selected_note}?{exemplar_note}\n"
@@ -2726,11 +2770,34 @@ class ReviewWindow(QMainWindow):
             QMessageBox.StandardButton.Yes)
         if ret != QMessageBox.StandardButton.Yes:
             return
+        # Stash the run parameters so _start_autolabel_batch_next_side can
+        # build the worker for each side without re-prompting.
+        self._autolabel_all_pending = list(sides)
+        self._autolabel_all_params = {
+            "detector": detector,
+            "concepts": concepts,
+            "cat_ids": cat_ids,
+            "exemplar": exemplar,
+            "n": n,
+        }
+        self._autolabel_all_added = 0
+        self._start_autolabel_batch_next_side()
+
+    def _start_autolabel_batch_next_side(self) -> None:
+        """Start the autolabel-all batch for the next pending side."""
+        side = self._autolabel_all_pending.pop(0)
+        p = self._autolabel_all_params
+        detector = p["detector"]
+        concepts = p["concepts"]
+        cat_ids = p["cat_ids"]
+        exemplar = p["exemplar"]
+        n = p["n"]
         tmp_dir = str(Path(self.coco.output_json).parent / "_tmp_sam3_imgs")
         self._autolabel_batch_side = side
         self._batch_frames_done = 0
         self._batch_added = 0
-        self._set_sam3_status(f"autolabel all: 0/{n} frames…")
+        tag = f"autolabel all[{side}]" if self._stereo else "autolabel all"
+        self._set_sam3_status(f"{tag}: 0/{n} frames…")
         self.side.set_sam3_running(True)
         if detector == "owlv2":
             # Same signal shape as the SAM3 batch worker; detections carry
@@ -2777,7 +2844,7 @@ class ReviewWindow(QMainWindow):
             self._on_autolabel_batch_frame_done)
         self._sam3_autolabel_batch_worker.progress_signal.connect(
             lambda d, t: self._set_sam3_status(
-                f"autolabel all: {d}/{t} frames…"))
+                f"{tag}: {d}/{t} frames…"))
         self._sam3_autolabel_batch_worker.finished_signal.connect(
             self._on_autolabel_batch_finished)
         self._sam3_autolabel_batch_worker.failed_signal.connect(
@@ -2790,6 +2857,8 @@ class ReviewWindow(QMainWindow):
     def _on_autolabel_batch_cancelled(self) -> None:
         if self._stale_sender():
             return
+        # Cancel drops any remaining pending sides — the user asked to stop.
+        self._autolabel_all_pending = []
         self.side.set_sam3_running(False)
         self._set_sam3_status("autolabel all: cancelled")
         self.coco.save(is_final=False)
@@ -2826,10 +2895,18 @@ class ReviewWindow(QMainWindow):
     def _on_autolabel_batch_finished(self, total_dets: int) -> None:
         if self._stale_sender():
             return
+        # Accumulate across sides so the final report covers the whole run.
+        self._autolabel_all_added = (
+            getattr(self, "_autolabel_all_added", 0) + self._batch_added)
+        if getattr(self, "_autolabel_all_pending", None):
+            # Stereo run: chain the other side's batch.
+            self.coco.save(is_final=False)
+            self._start_autolabel_batch_next_side()
+            return
         self.side.set_sam3_running(False)
         # total_dets is the raw detection count; NMS + existing-box dedup
         # drop many, so report the boxes actually added.
-        added = self._batch_added
+        added = self._autolabel_all_added
         self._set_sam3_status(f"autolabel all: done — {added} box(es) added")
         self.coco.save(is_final=False)
         self._refresh_boxes()
@@ -3357,6 +3434,7 @@ class ReviewWindow(QMainWindow):
         self.side.set_sam3_running(False)
         self._sam3_queue.clear()  # hard failure — don't keep retrying queued jobs
         self._sam3_all_pending = []  # and don't chain the other stereo side
+        self._autolabel_all_pending = []  # don't chain autolabel-all either
         self._set_sam3_status(f"failed — {msg}")
         QMessageBox.warning(self, "SAM3 failed", msg)
 
@@ -3575,9 +3653,6 @@ class ReviewWindow(QMainWindow):
     # ----------------------- shutdown ---------------------------------- #
 
     def closeEvent(self, ev: QtGui.QCloseEvent) -> None:
-        # Flush the Rerun recording so the .rrd is complete on disk.
-        if self.rerun is not None:
-            self.rerun.flush()
         # _on_quit / _on_save_quit already confirmed + saved; don't ask twice.
         if not self._quit_confirmed:
             res = self._confirm_quit()

@@ -41,6 +41,10 @@ image and annotation ids are re-assigned sequentially and all references
 (``image_id`` / ``category_id``) are fixed up, so inputs with clashing or
 string ids (like results.json) combine cleanly. Extra fields
 (``segmentation``, ``track_id``, ``confidence``, ...) are preserved.
+``annotated_image_ids`` and ``annotated_timestamps`` are recomputed from
+the merged annotations (unique ``timestamp_ns`` of annotated images —
+stereo pairs collapse to one entry), so the output has the same shape as
+the GUI's ``labels_coco.json``.
 """
 
 from __future__ import annotations
@@ -176,14 +180,18 @@ def run_combine(args: argparse.Namespace) -> None:
                 categories.append(merged)
             local_cat_map[_to_int(cat["id"])] = cat_id_by_name[name]
 
-        # Map this file's image ids → fresh sequential ids.
+        # Map this file's image ids → fresh sequential ids. Dedup key is
+        # (file_name, side) so a stereo pair sharing a filename across the
+        # left/right inputs is NOT a collision — both records are kept.
         local_img_map: Dict[int, int] = {}
         for img in data["images"]:
             fname = img["file_name"]
-            if fname in seen_files:
-                sys.exit(f"Error: duplicate image {fname!r} in {path} — "
-                         "inputs are assumed to be unique")
-            seen_files.add(fname)
+            side = img.get("side", "left")
+            dedup_key = (fname, side)
+            if dedup_key in seen_files:
+                sys.exit(f"Error: duplicate image {fname!r} (side={side}) in "
+                         f"{path} — inputs are assumed to be unique")
+            seen_files.add(dedup_key)
             merged = dict(img)
             merged["id"] = next_img_id
             local_img_map[_to_int(img["id"])] = next_img_id
@@ -214,6 +222,14 @@ def run_combine(args: argparse.Namespace) -> None:
         "images": images,
         "annotations": annotations,
         "categories": categories,
+        "annotated_image_ids": sorted({a["image_id"]
+                                      for a in annotations}),
+        "annotated_timestamps": sorted({
+            img.get("timestamp_ns") or 0
+            for img in images
+            if img["id"] in {a["image_id"] for a in annotations}
+            and img.get("timestamp_ns")
+        }),
     }
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

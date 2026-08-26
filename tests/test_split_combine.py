@@ -91,14 +91,17 @@ def test_combine_merges_with_remapped_ids(tmp_path):
     j1, j2 = tmp_path / "p1.json", tmp_path / "p2.json"
     _write_coco(
         j1,
-        [{"id": 1, "file_name": "a.jpg", "width": 4, "height": 4}],
+        [{"id": 1, "file_name": "a.jpg", "width": 4, "height": 4,
+          "timestamp_ns": 1000}],
         [{"id": "1", "image_id": "1", "category_id": "3",
           "bbox": [0, 0, 2, 2], "track_id": "7", "confidence": "0.9"}],
         [{"id": 3, "name": "box"}])
     _write_coco(
         j2,
-        [{"id": 1, "file_name": "b.jpg", "width": 4, "height": 4},
-         {"id": 2, "file_name": "c.jpg", "width": 4, "height": 4}],
+        [{"id": 1, "file_name": "b.jpg", "width": 4, "height": 4,
+          "timestamp_ns": 2000},
+         {"id": 2, "file_name": "c.jpg", "width": 4, "height": 4,
+          "timestamp_ns": 3000}],
         [{"id": 5, "image_id": 1, "category_id": 0, "bbox": [1, 1, 1, 1],
           "segmentation": [[0, 0, 1, 0, 1, 1]]},
          {"id": 6, "image_id": 2, "category_id": 1, "bbox": [0, 0, 1, 1]}],
@@ -123,6 +126,10 @@ def test_combine_merges_with_remapped_ids(tmp_path):
     # extras preserved
     assert anns[0]["track_id"] == "7" and anns[0]["confidence"] == "0.9"
     assert anns[1]["segmentation"] == [[0, 0, 1, 0, 1, 1]]
+    # annotated_image_ids / annotated_timestamps recomputed from the merge.
+    # All three images have annotations; timestamps 1000/2000/3000 unique.
+    assert d["annotated_image_ids"] == [1, 2, 3]
+    assert d["annotated_timestamps"] == [1000, 2000, 3000]
 
 
 def test_combine_rejects_duplicate_image(tmp_path):
@@ -132,3 +139,64 @@ def test_combine_rejects_duplicate_image(tmp_path):
     r = run_cli("combine", j1, j3, "--output", tmp_path / "dup.json")
     assert r.returncode != 0
     assert "duplicate" in (r.stderr + r.stdout).lower()
+
+
+def test_combine_allows_same_filename_across_sides(tmp_path):
+    """A stereo pair shares one filename; combine keeps both records
+    (dedup key is (file_name, side), not file_name alone)."""
+    j1, j2 = tmp_path / "L.json", tmp_path / "R.json"
+    _write_coco(j1,
+                [{"id": 1, "file_name": "100.png", "side": "left"}], [], [])
+    _write_coco(j2,
+                [{"id": 1, "file_name": "100.png", "side": "right"}], [], [])
+    out = tmp_path / "both.json"
+    r = run_cli("combine", j1, j2, "--output", out)
+    assert r.returncode == 0, r.stderr
+    d = json.load(open(out))
+    assert len(d["images"]) == 2
+    assert {i["side"] for i in d["images"]} == {"left", "right"}
+    # both records keep the shared filename
+    assert {i["file_name"] for i in d["images"]} == {"100.png"}
+
+
+def test_combine_timestamps_dedup_stereo_pair(tmp_path):
+    """A stereo pair shares one timestamp across two image records; the
+    combined annotated_timestamps list keeps it once."""
+    j1, j2 = tmp_path / "L.json", tmp_path / "R.json"
+    _write_coco(
+        j1,
+        [{"id": 1, "file_name": "100.png", "timestamp_ns": 100,
+          "side": "left"}],
+        [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [0, 0, 1, 1]}],
+        [{"id": 0, "name": "obj"}])
+    _write_coco(
+        j2,
+        [{"id": 1, "file_name": "100.png", "timestamp_ns": 100,
+          "side": "right"}],
+        [{"id": 2, "image_id": 1, "category_id": 0, "bbox": [0, 0, 1, 1]}],
+        [{"id": 0, "name": "obj"}])
+
+    out = tmp_path / "stereo_combined.json"
+    r = run_cli("combine", j1, j2, "--output", out)
+    assert r.returncode == 0, r.stderr
+    d = json.load(open(out))
+    # two image records, two annotations, but ONE unique timestamp
+    assert d["annotated_image_ids"] == [1, 2]
+    assert d["annotated_timestamps"] == [100]
+
+
+def test_combine_skips_images_without_timestamp(tmp_path):
+    """An image with no timestamp_ns (synthetic data) is excluded from
+    annotated_timestamps but still counts in annotated_image_ids."""
+    j1 = tmp_path / "p.json"
+    _write_coco(
+        j1,
+        [{"id": 1, "file_name": "a.jpg"}],   # no timestamp_ns
+        [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [0, 0, 1, 1]}],
+        [{"id": 0, "name": "obj"}])
+    out = tmp_path / "out.json"
+    r = run_cli("combine", j1, "--output", out)
+    assert r.returncode == 0, r.stderr
+    d = json.load(open(out))
+    assert d["annotated_image_ids"] == [1]
+    assert d["annotated_timestamps"] == []

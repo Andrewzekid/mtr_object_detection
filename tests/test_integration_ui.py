@@ -1739,24 +1739,6 @@ def test_discard_image_button(lr, make_coco, make_window, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Rerun on-demand recording
-# ---------------------------------------------------------------------------
-
-def test_ensure_rerun_replaces_disabled_logger(lr, make_coco, make_window):
-    """Launched without --rrd, self.rerun is a DISABLED logger (not None);
-    _ensure_rerun must still create a real recording next to the COCO
-    output so the .pcd map path works."""
-    pytest.importorskip("rerun")
-    from gui.label_review.rerun_logger import RerunLogger
-    win = make_window(coco=make_coco(categories=CATS))
-    win.rerun = RerunLogger(None)  # what main.py passes without --rrd
-    assert not win.rerun.enabled
-    logger = win._ensure_rerun()
-    assert logger is not None and logger.enabled
-    assert logger.path.endswith(".rrd")
-
-
-# ---------------------------------------------------------------------------
 # open-set autolabel backends (grounding_dino / florence2 / falcon) and
 # OWLv2 exemplar — routing, config roundtrip, exemplar crop extraction.
 # ---------------------------------------------------------------------------

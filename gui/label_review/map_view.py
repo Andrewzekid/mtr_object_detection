@@ -1,96 +1,18 @@
-"""Point-cloud map + pose database support for the Rerun view.
+"""Pose database support for the Rerun view.
 
-* :func:`load_pcd` - minimal PCD reader (ascii + binary, ``x y z rgb``
-  fields, packed float or uint rgb) returning positions + RGB colors.
-* :class:`PoseDb` - Clio inspection DB lookup: per-image ``cam_tf`` /
-  lidar ``tf`` poses keyed by ``timestamp_ns`` (with an ``is_left`` side
-  column), used to place annotated frames on the colored map.
+:class:`PoseDb` - Clio inspection DB lookup: per-image ``cam_tf`` /
+lidar ``tf`` poses keyed by ``timestamp_ns`` (with an ``is_left`` side
+column), used to place annotated frames on the map of an opened .rrd
+recording (see rerun_logger.py).
 """
 
 from __future__ import annotations
 
 import sqlite3
-import struct
-from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
-
-# --------------------------------------------------------------------------- #
-# PCD loading
-# --------------------------------------------------------------------------- #
-
-def load_pcd(path: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Read a .pcd into (positions Nx3 float32, colors Nx3 uint8).
-
-    Supports the layouts our Clio exports use: FIELDS ``x y z rgb`` with
-    DATA ascii or binary, rgb either packed into a float32 (bit-reinterpreted
-    as uint32 RGB) or a plain uint32. Colors default to gray when absent.
-    """
-    p = Path(path)
-    with p.open("rb") as f:
-        header: dict[str, str] = {}
-        while True:
-            line = f.readline()
-            if not line:
-                raise ValueError(f"{path}: truncated PCD header")
-            text = line.decode("ascii", "replace").strip()
-            if not text or text.startswith("#"):
-                continue
-            key, _, value = text.partition(" ")
-            header[key.upper()] = value.strip()
-            if key.upper() == "DATA":
-                break
-        data_fmt = header.get("DATA", "").lower()
-        if data_fmt not in ("ascii", "binary"):
-            raise ValueError(f"{path}: unsupported PCD DATA {data_fmt!r} "
-                             "(only ascii / binary)")
-
-        fields = header.get("FIELDS", "").split()
-        sizes = [int(v) for v in header.get("SIZE", "").split()]
-        types = header.get("TYPE", "").split()
-        counts = [int(v) for v in header.get("COUNT", "").split()]
-        n_points = int(header.get("POINTS", header.get("WIDTH", "0")))
-
-        type_codes = {"F": "f", "U": "u", "I": "i"}
-        dtype_list = []
-        for name, size, typ, cnt in zip(fields, sizes, types, counts):
-            code = type_codes.get(typ, "u")
-            dtype_list.append((name, f"<{code}{size}") if cnt == 1
-                              else (name, f"<{code}{size}", (cnt,)))
-        dtype = np.dtype(dtype_list)
-
-        if data_fmt == "binary":
-            raw = f.read(dtype.itemsize * n_points)
-            arr = np.frombuffer(raw, dtype=dtype, count=n_points)
-        else:
-            arr = np.loadtxt(f, dtype=dtype, max_rows=n_points)
-
-    if "x" not in arr.dtype.names:
-        raise ValueError(f"{path}: PCD has no x/y/z fields "
-                         f"({arr.dtype.names})")
-    positions = np.stack([arr["x"], arr["y"], arr["z"]], axis=1) \
-        .astype(np.float32)
-
-    colors = np.full((n_points, 3), 128, dtype=np.uint8)
-    for field in ("rgb", "rgba"):
-        if field in (arr.dtype.names or ()):
-            packed = arr[field]
-            # Float-packed rgb (PCD convention): reinterpreting the float
-            # bits as uint32 gives the packed color.
-            if arr.dtype[field].kind == "f":
-                packed = packed.view(np.uint32) \
-                    if packed.ndim == 1 else None
-            packed = np.asarray(packed, dtype=np.uint32)
-            has_a = field == "rgba"
-            r = (packed >> 16) & 0xFF if has_a else (packed >> 16) & 0xFF
-            g = (packed >> 8) & 0xFF
-            b = packed & 0xFF
-            colors = np.stack([r, g, b], axis=1).astype(np.uint8)
-            break
-
-    return positions, colors
 
 
 # --------------------------------------------------------------------------- #

@@ -13,12 +13,13 @@ Run it
     # With an image source:
     python -m gui.label_review.main \
         --images /path/to/folder_or_image.jpg \
-        --output_json output/my_labels/coco.json \
-        [--rrd output/my_labels/label_review.rrd]
+        --output_json output/my_labels/coco.json
 
-    (--rrd records a Rerun .rrd of what you label: every "Mark as
-    annotated" logs the frame's image, boxes and box-center keypoints.
-    View it afterwards with `rerun output/my_labels/label_review.rrd`.)
+    (To review annotated viewpoints on the map: File -> Open rerun file…
+    opens a provided .rrd - with the colored point cloud, images and
+    timestamps - in the rerun viewer; "🗺 Show annotated in Rerun" then
+    plots the annotated frames' camera positions on the map, using poses
+    from File -> Open pose database… or --pose-db.)
 
     # Stereo pair (left + right folders, frames paired positionally):
     python -m gui.label_review.main \
@@ -151,6 +152,9 @@ JSON so the result can be joined back to external databases by timestamp.
 The JSON also carries ``annotated_image_ids``: the sorted COCO image ids
 that count as annotated — images with at least one annotation, plus frames
 explicitly marked with the "Mark as annotated" button in the side panel.
+``annotated_timestamps`` is the same set reduced to unique ``timestamp_ns``
+values (both sides of a stereo pair collapse to one entry), for joining
+annotated frames to external databases by timestamp.
 
 USAGE
 -----
@@ -252,6 +256,8 @@ config override the corresponding CLI flags. Example:
                                       // "hide" fully controls them.
         "hide": ["sam3_all_frames"],  // button groups to hide; known groups:
                                       // keyframe, interpolate, jump,
+                                      // viewpoint (mark-as-annotated /
+                                      // discard / show-in-Rerun section),
                                       // sam3_run, sam3_all_frames, autolabel,
                                       // masks, play. Without "advanced",
                                       // keyframe and interpolate are always
@@ -339,17 +345,13 @@ def main():
     parser.add_argument("--db", help="Deprecated/unused: categories are no longer read "
                         "from a SQLite DB. Kept so old commands still parse.")
     parser.add_argument("--output-yolo-dir", help="Also export YOLO dataset on exit.")
-    parser.add_argument("--rrd", default=None,
-                        help="Write a Rerun recording (.rrd) of what you "
-                             "label: each 'Mark as annotated' logs the "
-                             "frame's image, boxes and box-center "
-                             "keypoints. View afterwards with: rerun <path>")
     parser.add_argument("--pose-db", default=None,
                         help="Clio inspection DB (SQLite) whose 'images' "
                              "table holds per-timestamp cam_tf/lidar "
-                             "poses. With --rrd (or an opened .pcd map), "
-                             "marking a frame as annotated also marks its "
-                             "camera position on the point-cloud map.")
+                             "poses. With an .rrd opened (File -> Open "
+                             "rerun file…), 'Show annotated in Rerun' "
+                             "plots each annotated frame's camera position "
+                             "on the recording's map.")
     parser.add_argument("--data-yaml", help="Reference data.yaml for YOLO class order.")
     # SAM3 options
     parser.add_argument("--sam3-model", default=None,
@@ -489,15 +491,16 @@ def main():
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Computer Vision Label Review Tool")
 
+    # Base theme before the window builds (the window refines it from the
+    # saved state, View → theme switches at runtime).
+    from .ui import theme as ui_theme
+    ui_theme.apply_theme(ui_theme.current_theme(), app)
+
     signal.signal(signal.SIGINT, lambda *a: app.quit())
 
     # Resolve ReviewWindow through the package at call time (not a module
     # global) so tests can monkeypatch gui.label_review.ReviewWindow.
     ReviewWindow = sys.modules[__package__].ReviewWindow
-    from .rerun_logger import RerunLogger
-    rerun_logger = RerunLogger(args.rrd)
-    if rerun_logger.enabled:
-        print(f"🎬 Rerun recording enabled: {args.rrd}")
     pose_db = None
     if args.pose_db:
         from .map_view import PoseDb
@@ -507,7 +510,6 @@ def main():
         except Exception as exc:
             print(f"⚠️ Could not load pose DB {args.pose_db}: {exc}")
     win = ReviewWindow(frame_index, coco,
-                       rerun_logger=rerun_logger,
                        pose_db=pose_db,
                        autolabel_detector=autolabel_cfg.get(
                            "detector", "sam3"),

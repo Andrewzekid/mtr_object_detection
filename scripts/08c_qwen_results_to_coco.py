@@ -12,6 +12,7 @@ Reads a folder of ``<timestamp>_result.json`` files as produced by
   convention - what gui/label_review expects), area, iscrowd 0
 - ``categories``: one per distinct label, ids starting at 0
 - ``annotated_image_ids``: ids of images that have at least one annotation
+- ``annotated_timestamps``: unique ``timestamp_ns`` of annotated images
 
 Usage:
     python 08c_qwen_results_to_coco.py \
@@ -130,11 +131,19 @@ def main():
 
         next_image_id += 1
 
+    annotated_image_ids = sorted({a["image_id"] for a in annotations})
+    # Unique timestamps of annotated images (stereo pair → one entry).
+    annotated_ts = sorted({
+        img.get("timestamp_ns") or 0
+        for img in images
+        if img["id"] in set(annotated_image_ids) and img.get("timestamp_ns")
+    })
     coco = {
         "images": images,
         "annotations": annotations,
         "categories": categories,
-        "annotated_image_ids": sorted({a["image_id"] for a in annotations}),
+        "annotated_image_ids": annotated_image_ids,
+        "annotated_timestamps": annotated_ts,
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

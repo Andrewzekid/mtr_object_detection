@@ -1,6 +1,6 @@
 """Canvas widget: shows the image + bboxes, supports draw/select/delete."""
 
-from ..qt_compat import Qt, QtCore, QtGui, pyqtSignal  # first: enum shims
+from ..qt_compat import Qt, QtCore, QtGui, pyqtSignal  # enum shims
 from ..qt_compat import (  # noqa: F401
     QColor, QFont, QPainter, QPen, QPixmap, QSizePolicy, QWidget,
 )
@@ -8,6 +8,10 @@ from ..qt_compat import (  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+# Theme: the canvas reads the live palette on every paint, so a theme
+# switch (View menu) restyles the backdrop without extra plumbing.
+from . import theme as _theme
 
 
 # ---------------------------------------------------------------------------
@@ -351,10 +355,10 @@ class CanvasWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
-        p.fillRect(self.rect(), QColor(20, 20, 25))
+        p.fillRect(self.rect(), _theme.color("canvas"))
 
         if self._pixmap is None:
-            p.setPen(QColor(180, 180, 180))
+            p.setPen(_theme.color("canvas_fg"))
             p.drawText(self.rect(), Qt.AlignCenter, "No image loaded")
             return
 
@@ -434,7 +438,7 @@ class CanvasWidget(QWidget):
             p.drawRect(QtCore.QRectF(tl, br))
 
         # Info HUD.
-        p.setPen(QColor(230, 230, 230))
+        p.setPen(_theme.color("canvas_fg"))
         p.setFont(QFont("Sans", 10))
         p.drawText(8, 16, self._info_text)
 

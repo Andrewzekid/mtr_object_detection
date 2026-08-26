@@ -1,39 +1,63 @@
 # Object Detection Application Requirements
+#
+# Python 3.10 – 3.13 recommended.  For NVIDIA GPU support install the
+# CUDA build of torch first (see README → Installation), then run
+#   pip install -r requirements.txt
+# `install.sh` does all of this automatically (including the CUDA
+# torch index URL when an NVIDIA GPU is detected).
 
-# GUI Framework
+# --- GUI framework -----------------------------------------------------------
 PyQt6>=6.4.0
-PyQt6-WebEngine>=6.5.0  # for gui.label_review embedded viewer
+PyQt6-WebEngine>=6.5.0            # gui.label_review embedded viewer
 
-# Rerun (for gui.label_review — review .rrd recordings + label)
+# --- Rerun (gui.label_review — review .rrd recordings + label) ----------------
 rerun-sdk>=0.34.0
 pyarrow>=14.0.0
 
-# Image Processing (use headless to avoid Qt conflicts with PyQt6)
-opencv-python-headless>=4.8.0
+# --- Deep-learning stack ------------------------------------------------------
+# torch / torchvision are NOT pinned here so the CUDA build selected by
+# install.sh (or the user) wins.  On a CPU-only machine a plain
+# `pip install torch torchvision` is fine; on NVIDIA use the index URL
+# documented in the README.  install.sh adds --extra-index-url for you.
+# torch>=2.4          # uncomment to pin a floor
+# torchvision>=0.19
+
+ultralytics>=8.4.83              # ships ultralytics.models.sam.SAM3* (older 8.x does not)
+transformers>=4.51                # HF autolabel backends; code has transformers-5.x shims
+accelerate>=0.34                 # from_pretrained device placement for HF backends
+einops>=0.8                       # SAM3 / Falcon attention reshapes
+huggingface_hub>=0.25            # huggingface-cli download for SAM3 weights
+sentencepiece>=0.1.99             # some HF tokenizers (Qwen/Falcon)
+
+# Ultralytics SAM3 text encoder imports the ultralytics CLIP fork.
+# (ultralytics checks this itself via check_requirements, but listing it
+#  here makes a plain `pip install -r requirements.txt` work offline-ready.)
+clip-anystyle @ git+https://github.com/ultralytics/CLIP.git
+
+# --- Image / video processing ------------------------------------------------
+# opencv-contrib-python is required (not the plain -python wheel): the
+# tracking utils use contrib trackers (bytesort / deepocsort).  Install
+# only ONE opencv flavour; if you already have opencv-python-headless,
+# `pip uninstall opencv-python-headless` first.
+opencv-contrib-python>=4.8.0
 numpy>=1.24.0
-
-# YOLO Training
-ultralytics>=8.0.0
-
-# SAM3 Segmentation
-segment-anything>=1.0
-
-# HTTP Requests (for Ollama API)
-requests>=2.28.0
-
-# OpenAI-compatible API (for Aliyun DashScope)
-openai>=1.0.0
-
-# Environment variable loading
-python-dotenv>=1.0.0
-
-# YAML Processing
-PyYAML>=6.0
-
-# Additional Utilities
 pillow>=9.0.0
+
+# --- HTTP / API clients -------------------------------------------------------
+requests>=2.28.0                 # Ollama API
+openai>=1.0.0                    # Aliyun DashScope (OpenAI-compatible)
+python-dotenv>=1.0.0             # .env loading
+
+# --- Data / config / utils ----------------------------------------------------
+PyYAML>=6.0
 matplotlib>=3.7.0
 tqdm>=4.65.0
 
-# Tests
+# --- Optional: TensorRT engine export (11_run_tracking.py --trt) ---------------
+# Uncomment if you build TensorRT engines; install.sh does NOT install
+# these by default (they need a matching CUDA/TensorRT stack).
+# tensorrt
+# onnx
+
+# --- Tests --------------------------------------------------------------------
 pytest>=8.0.0

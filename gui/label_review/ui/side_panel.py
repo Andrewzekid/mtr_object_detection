@@ -1,10 +1,16 @@
-"""Side panel: category list + buttons + frame slider."""
+"""Side panel: category list + buttons + frame slider.
 
-from ..qt_compat import Qt, QtWidgets, pyqtSignal, _QT_HORZ  # enum shims
+Layout: a scrollable column of grouped sections. Visual grouping comes
+from styled section headers + separators (see ``ui/theme.py`` QSS); every
+interactive widget keeps its historical attribute name so the main window,
+the config ``ui.hide`` groups and the tests can address them directly.
+"""
+
+from ..qt_compat import Qt, QtWidgets, pyqtSignal, QFrame, _QT_HORZ  # enum shims
 from ..qt_compat import (  # noqa: F401
     QAbstractItemView, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QProgressBar, QPushButton, QSlider, QVBoxLayout,
-    QWidget,
+    QListWidgetItem, QProgressBar, QPushButton, QScrollArea, QSlider,
+    QVBoxLayout, QWidget,
 )
 
 from typing import Any, Dict, List, Optional
@@ -55,6 +61,8 @@ class SidePanel(QWidget):
     toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
     toggle_annotated_clicked = pyqtSignal()  # "✔ Mark as annotated" button
     toggle_discard_clicked = pyqtSignal()    # "🚫 Discard image" button
+    # "🗺 Show annotated in Rerun" button
+    show_annotated_rerun_clicked = pyqtSignal()
     point_seg_toggled = pyqtSignal(bool)     # "🎯 Add points" toggle
     segment_points_clicked = pyqtSignal()    # "▶ Segment points" button
     interpolate_clicked = pyqtSignal()       # "Interpolate" button (I)
@@ -63,19 +71,56 @@ class SidePanel(QWidget):
     add_cat_clicked = pyqtSignal(str)        # new category name
     rename_cat_clicked = pyqtSignal(int)     # cat_id to rename
     del_cat_clicked = pyqtSignal(int)        # cat_id to delete
+    rerun_open_clicked = pyqtSignal()        # "🎬 Rerun viewer / map…" button
+    pose_db_clicked = pyqtSignal()           # "📍 Pose database…" button
 
     def __init__(self, coco: CocoState, parent=None):
         super().__init__(parent)
         self.coco = coco
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
+        # Scrollable column: the panel content lives in an inner widget so
+        # small windows get a scrollbar instead of clipping buttons.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("sideContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        def _header(text: str, attr: Optional[str] = None) -> QLabel:
+            hdr = QLabel(text)
+            hdr.setObjectName("sectionHeader")
+            if attr:
+                setattr(self, attr, hdr)
+            layout.addWidget(hdr)
+            return hdr
+
+        def _sep() -> None:
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setObjectName("sectionSeparator")
+            layout.addSpacing(2)
+            layout.addWidget(line)
+            layout.addSpacing(2)
 
         self.source_label = QLabel("Source: —")
+        self.source_label.setObjectName("mutedLabel")
         self.source_label.setToolTip(
             "Current frame source (image file / folder).")
         layout.addWidget(self.source_label)
 
-        self.cat_label = QLabel("Categories (click = preselect for next draw / 0-9; multi-select = autolabel only these):")
+        _header("Categories")
+        self.cat_label = QLabel("Click = preselect for next draw / 0-9 · "
+                                "multi-select = autolabel only these:")
+        self.cat_label.setObjectName("mutedLabel")
+        self.cat_label.setWordWrap(True)
         layout.addWidget(self.cat_label)
 
         self.cat_list = QListWidget()
@@ -123,9 +168,11 @@ class SidePanel(QWidget):
         self.btn_del_cat.clicked.connect(self._on_del_cat)
         edit_cat_row.addWidget(self.btn_del_cat)
         layout.addLayout(edit_cat_row)
+        _sep()
 
         # Boxes on current frame list.
         self.boxes_label = QLabel("Boxes on this frame:")
+        self.boxes_label.setObjectName("sectionHeader")
         layout.addWidget(self.boxes_label)
         self.box_list = QListWidget()
         self.box_list.setMaximumHeight(140)
@@ -165,7 +212,8 @@ class SidePanel(QWidget):
         # value via set_track_ids_visible() from the tracking.show_ids config.
         self.show_track_ids: bool = True
 
-        # Frame playback controls: play/pause + speed.
+        # Frame playback controls: play/pause + speed + timeline.
+        _header("Playback")
         play_row = QHBoxLayout()
         self.btn_play = QPushButton("▶ Play")
         self.btn_play.setCheckable(True)
@@ -198,9 +246,30 @@ class SidePanel(QWidget):
         jump_row.addStretch(1)
         layout.addLayout(jump_row)
 
+        # Timeline scrubber + frame info (kept with the playback controls).
+        self.frame_slider = QSlider(_QT_HORZ)
+        self.frame_slider.setMinimum(0)
+        self.frame_slider.setMaximum(0)
+        self.frame_slider.valueChanged.connect(self.slider_moved.emit)
+        self.frame_slider.sliderReleased.connect(self.slider_released.emit)
+        layout.addWidget(self.frame_slider)
+
+        self.info_label = QLabel("Frame: -\nTimestamp: -")
+        self.info_label.setObjectName("mutedLabel")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        # Viewpoint selection: mark frames as annotated / discard bad ones,
+        # and show the annotated viewpoints on the Rerun map.
+        _sep()
+        self.viewpoint_header = QLabel("Viewpoint Selection")
+        self.viewpoint_header.setObjectName("sectionHeader")
+        layout.addWidget(self.viewpoint_header)
+
         # Mark the current frame as annotated without drawing any boxes —
         # it is included in the output JSON's ``annotated_image_ids``.
         self.btn_mark_annotated = QPushButton("✔ Mark as annotated")
+        self.btn_mark_annotated.setProperty("cssClass", "primary")
         self.btn_mark_annotated.setCheckable(True)
         self.btn_mark_annotated.setToolTip(
             "Count this frame as annotated even though it has no boxes: "
@@ -214,6 +283,7 @@ class SidePanel(QWidget):
         # record(s) and annotations are excluded from the FINAL output
         # JSON. Toggle again to restore — reversible until the final save.
         self.btn_discard_image = QPushButton("🚫 Discard image")
+        self.btn_discard_image.setProperty("cssClass", "danger")
         self.btn_discard_image.setCheckable(True)
         self.btn_discard_image.setToolTip(
             "Exclude this frame's image(s) and boxes from the FINAL "
@@ -223,7 +293,19 @@ class SidePanel(QWidget):
             self.toggle_discard_clicked.emit)
         layout.addWidget(self.btn_discard_image)
 
-        layout.addSpacing(12)
+        # Plot every annotated frame's camera position on the map of the
+        # opened .rrd recording.
+        self.btn_show_annotated_rerun = QPushButton("🗺 Show annotated in Rerun")
+        self.btn_show_annotated_rerun.setToolTip(
+            "Plot every annotated frame's camera position on the map of "
+            "the opened .rrd recording (open it first: File -> Open rerun "
+            "file…; positions come from the pose DB: File -> Open pose "
+            "database…).")
+        self.btn_show_annotated_rerun.clicked.connect(
+            self.show_annotated_rerun_clicked.emit)
+        layout.addWidget(self.btn_show_annotated_rerun)
+
+        _sep()
 
         # Interpolation controls.
         interp_row = QHBoxLayout()
@@ -255,10 +337,9 @@ class SidePanel(QWidget):
         layout.addWidget(self.interp_status)
 
         # SAM3 controls
+        _sep()
         self.sam3_header = QLabel("SAM3 segmentation:")
-        f = self.sam3_header.font()
-        f.setBold(True)
-        self.sam3_header.setFont(f)
+        self.sam3_header.setObjectName("sectionHeader")
         layout.addWidget(self.sam3_header)
         sam_layout = QHBoxLayout()
         self.btn_run_sam3 = QPushButton("Run SAM3 (all)")
@@ -283,9 +364,10 @@ class SidePanel(QWidget):
         self.btn_add_points.setToolTip(
             "Point-prompt mode: while ON, left-click adds a positive point "
             "and right-click a negative point on the canvas. Points only "
-            "accumulate — nothing runs until you press ▶ Segment points. "
-            "Enter accepts the segmented object (next points start a new "
-            "one), Esc cancels it. Toggle off to go back to draw/select.")
+            "accumulate — nothing runs until you press ▶ Segment points, "
+            "which runs SAM3 once and turns point mode back OFF. Press "
+            "🎯 Add points again to start segmenting a new object. "
+            "Toggle off to go back to draw/select.")
         self.btn_add_points.toggled.connect(self.point_seg_toggled.emit)
         point_row.addWidget(self.btn_add_points)
         self.btn_segment_points = QPushButton("▶ Segment points")
@@ -295,8 +377,9 @@ class SidePanel(QWidget):
             "negative). The selected category is passed as a text prompt: "
             "SAM3 detects all instances of that category and your points "
             "pick which one to keep (falls back to pure point prompting "
-            "when nothing matches). Add more points and press again to "
-            "refine the same mask. Category = preselected / last-used.")
+            "when nothing matches). Running this ends point mode — press "
+            "🎯 Add points again to segment a new object. "
+            "Category = preselected / last-used.")
         self.btn_segment_points.clicked.connect(
             self.segment_points_clicked.emit)
         point_row.addWidget(self.btn_segment_points)
@@ -320,12 +403,14 @@ class SidePanel(QWidget):
         self.btn_propagate.clicked.connect(self.propagate_clicked.emit)
         layout.addWidget(self.btn_propagate)
 
-        layout.addSpacing(8)
+        self.sam3_status = QLabel("SAM3: idle")
+        self.sam3_status.setObjectName("mutedLabel")
+        layout.addWidget(self.sam3_status)
+
+        _sep()
 
         self.autolabel_header = QLabel("Autolabel:")
-        f = self.autolabel_header.font()
-        f.setBold(True)
-        self.autolabel_header.setFont(f)
+        self.autolabel_header.setObjectName("sectionHeader")
         layout.addWidget(self.autolabel_header)
 
         # Text-prompt autolabel: the detector finds objects by category name,
@@ -343,6 +428,8 @@ class SidePanel(QWidget):
         layout.addWidget(self.btn_autolabel_all)
         self.set_autolabel_detector("sam3")
 
+        _sep()
+        _header("Display")
         self.btn_masks = QPushButton("Masks: ON")
         self.btn_masks.setCheckable(True)
         self.btn_masks.setChecked(True)
@@ -366,9 +453,6 @@ class SidePanel(QWidget):
             lambda v: self.opacity_value_label.setText(f"{v}%"))
         layout.addLayout(op_row)
 
-        self.sam3_status = QLabel("SAM3: idle")
-        layout.addWidget(self.sam3_status)
-
         # Annotation coverage: how many frames have at least one box.
         self.annot_progress = QProgressBar()
         self.annot_progress.setMinimum(0)
@@ -380,16 +464,31 @@ class SidePanel(QWidget):
             "frame that still needs labels.")
         layout.addWidget(self.annot_progress)
 
-        self.frame_slider = QSlider(_QT_HORZ)
-        self.frame_slider.setMinimum(0)
-        self.frame_slider.setMaximum(0)
-        self.frame_slider.valueChanged.connect(self.slider_moved.emit)
-        self.frame_slider.sliderReleased.connect(self.slider_released.emit)
-        layout.addWidget(self.frame_slider)
+        _sep()
+        _header("Rerun & map", attr="rerun_header")
 
-        self.info_label = QLabel("Frame: -\nTimestamp: -")
-        self.info_label.setWordWrap(True)
-        layout.addWidget(self.info_label)
+        # Open a .rrd recording (with the colored point-cloud map, images
+        # and timestamps) in a windowed rerun viewer; it becomes the target
+        # for '🗺 Show annotated in Rerun' markers.
+        self.btn_rerun_map = QPushButton("🎬 Rerun viewer / map…")
+        self.btn_rerun_map.setProperty("cssClass", "primary")
+        self.btn_rerun_map.setToolTip(
+            "Open a Rerun recording (.rrd) - with the colored point-cloud "
+            "map, images and timestamps - in the rerun viewer. Then "
+            "'🗺 Show annotated in Rerun' plots annotated frames' camera "
+            "positions on the map.")
+        self.btn_rerun_map.clicked.connect(self.rerun_open_clicked.emit)
+        layout.addWidget(self.btn_rerun_map)
+
+        # Clio inspection SQLite DB with per-timestamp camera/lidar poses —
+        # places annotated frames on the point-cloud map.
+        self.btn_pose_db = QPushButton("📍 Pose database…")
+        self.btn_pose_db.setToolTip(
+            "Clio inspection DB (SQLite) with an 'images' table holding "
+            "per-timestamp cam_tf / lidar poses. Used to place annotated "
+            "frames on the point-cloud map.")
+        self.btn_pose_db.clicked.connect(self.pose_db_clicked.emit)
+        layout.addWidget(self.btn_pose_db)
 
         self.help_label = QLabel(
             "<b>Keys (work anywhere):</b><br>"
@@ -405,6 +504,7 @@ class SidePanel(QWidget):
             "<i>Click a category first to preselect it for the next draw.<br>"
             "New draws reuse the previous box's category automatically.</i>"
         )
+        self.help_label.setObjectName("helpLabel")
         self.help_label.setWordWrap(True)
         layout.addWidget(self.help_label)
 
@@ -640,6 +740,8 @@ class SidePanel(QWidget):
         "interpolate": ["btn_interpolate", "btn_cancel_interp",
                         "interp_status"],
         "jump": ["jump_buttons"],
+        "viewpoint": ["viewpoint_header", "btn_mark_annotated",
+                      "btn_discard_image", "btn_show_annotated_rerun"],
         "sam3_run": ["sam3_header", "btn_run_sam3", "btn_reseg",
                      "btn_cancel_sam3", "btn_propagate"],
         "sam3_all_frames": ["btn_sam3_all_frames"],
@@ -647,6 +749,7 @@ class SidePanel(QWidget):
                       "btn_autolabel_all"],
         "masks": ["btn_masks", "opacity_slider", "opacity_value_label"],
         "play": ["btn_play", "combo_speed"],
+        "rerun": ["rerun_header", "btn_rerun_map", "btn_pose_db"],
     }
 
     def set_hidden_groups(self, groups: List[str]) -> None:

@@ -1,31 +1,27 @@
-"""Rerun (.rrd) logging for the label review GUI.
+"""Annotated-viewpoint markers on top of a provided Rerun (.rrd) recording.
 
-When launched with ``--rrd <path>``, the app records what you label into a
-Rerun recording so you can inspect it afterwards in the Rerun viewer
-(``rerun <path>``). Every "Mark as annotated" (and every frame that already
-carries annotations when it is marked) logs:
+The map (colored point cloud), images and timestamps live in an .rrd
+produced elsewhere; this app only ADDS annotated-frame camera-position
+markers. "File -> Open rerun file…" opens the recording in a windowed
+viewer (which hosts a gRPC server); "🗺 Show annotated in Rerun" then
+streams the markers into that SAME recording - the stream is initialized
+with the .rrd's own application/recording id (read from the file), so the
+viewer merges the markers into the loaded store instead of showing a
+second recording. Markers are static points (always visible, independent
+of the timeline) under
 
-* the frame image,
-* the 2D boxes (one color per category),
-* one keypoint per box (its center), labeled with the category name - so
-  the keypoint "map" shows at a glance what was labelled on each frame.
+    world/map/annotated_frames
 
-Entity layout (per camera side):
-
-    world/<side>/image        - EncodedImage
-    world/<side>/boxes        - Boxes2D (colored per category)
-    world/<side>/keypoints    - Points2D (box centers, labeled)
-
-The timeline is driven by the frame's ``timestamp_ns`` (falling back to the
-frame index), so scrubbing the Rerun timeline walks the same frames as the
-GUI slider.
+Marker positions come from a pose database (PoseDb in map_view.py), keyed
+by each frame's ``timestamp_ns``.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
-
-import numpy as np
+import socket
+import subprocess
+import time
+from typing import List, Optional, Tuple
 
 try:
     import rerun as rr
@@ -34,159 +30,118 @@ except Exception:  # pragma: no cover - rerun is optional
     rr = None  # type: ignore[assignment]
     _HAS_RERUN = False
 
-
-# Distinct-ish colors, one per category id (cycled).
-_CATEGORY_COLORS = [
-    (255, 80, 80), (80, 200, 255), (120, 255, 120), (255, 200, 60),
-    (200, 120, 255), (255, 140, 200), (140, 255, 230), (255, 255, 120),
-]
+# Entity path of the markers inside the recording (sits next to the map,
+# conventionally logged at world/map).
+MARKER_ENTITY = "world/map/annotated_frames"
 
 
 class RerunLogger:
-    """Logs frames + annotation keypoints to a .rrd recording.
+    """Opens a provided .rrd in the viewer and streams markers into it.
 
-    A no-op (``enabled`` False) when rerun-sdk is missing or no ``--rrd``
-    path was given, so call sites never need to guard.
+    A no-op (``enabled`` False) when rerun-sdk is not installed, so call
+    sites never need to guard for that.
     """
 
-    def __init__(self, rrd_path: Optional[str] = None):
-        self.enabled = False
-        self.path = rrd_path
+    def __init__(self):
+        self.enabled = _HAS_RERUN
+        self.rrd_path: Optional[str] = None
         self._stream = None
-        self._logged_sides = set()
-        if not rrd_path:
-            return
-        if not _HAS_RERUN:
-            print("WARNING: --rrd given but rerun-sdk is not installed; "
-                  "no Rerun recording will be written.")
-            return
+        self._port: Optional[int] = None  # set while connected to a viewer
+
+    # ------------------------------------------------------------------ #
+
+    def open_recording(self, rrd_path: str) -> bool:
+        """Remember an .rrd as the marker target and open it in a windowed
+        rerun viewer."""
+        if not self.enabled:
+            return False
+        app_id, rec_id = self._read_store_id(rrd_path)
         try:
-            rr.init("label_review", recording_id="label_review")
-            self._stream = rr.get_global_data_recording()
-            # Do NOT call stream.save() here: it replaces the output sink
-            # with the file, so a live-spawned viewer would never receive
-            # any data. Persistence is handled by spawning the viewer with
-            # ``--save`` (see spawn()), which records the live gRPC stream.
-            self.enabled = True
+            self._stream = rr.RecordingStream(app_id, recording_id=rec_id)
         except Exception as exc:
-            print(f"WARNING: could not open Rerun recording {rrd_path}: {exc}")
+            print(f"WARNING: could not init Rerun stream for {rrd_path}: {exc}")
             self._stream = None
+            return False
+        self.rrd_path = rrd_path
+        self._port = None
+        return self._spawn_viewer()
 
-    # ------------------------------------------------------------------ #
+    def log_annotated_markers(self, markers: List[Tuple]) -> bool:
+        """Replace the annotated-frame markers on the recording's map.
 
-    def log_frame(self, frame: Dict[str, Any],
-                  image: Optional[np.ndarray],
-                  anns: List[Dict[str, Any]],
-                  cat_map: Dict[int, str],
-                  side: str = "left") -> None:
-        """Log one frame's image, boxes and box-center keypoints.
-
-        ``frame`` is an ImageFolderIndex frame dict (needs ``timestamp_ns``
-        and ``frame_idx``); ``anns`` are COCO annotations with xywh
-        ``bbox``; ``cat_map`` maps category_id -> name.
+        ``markers`` is a list of ``(position, label)``; an empty list just
+        clears the markers. Spawns the viewer first when not connected.
         """
-        if not self.enabled or self._stream is None:
-            return
-
-        ts = frame.get("timestamp_ns")
-        if ts is not None:
-            self._stream.set_time("timestamp",
-                                  timestamp=np.datetime64(int(ts), "ns"))
-        self._stream.set_time("frame_idx", sequence=int(
-            frame.get("frame_idx", 0)))
-
-        base = f"world/{side}"
-        if image is not None and image.size:
-            self._stream.log(f"{base}/image", rr.Image(image))
-
-        if not anns:
-            # Clear stale boxes/keypoints from any previous log at this
-            # time point so the recording reflects the current state.
-            self._stream.log(f"{base}/boxes", rr.Clear(recursive=False))
-            self._stream.log(f"{base}/keypoints", rr.Clear(recursive=False))
-            return
-
-        names: List[str] = []
-        colors: List[Any] = []
-        rects: List[List[float]] = []
-        centers: List[List[float]] = []
-        for ann in anns:
-            x, y, w, h = (float(v) for v in ann["bbox"])
-            name = cat_map.get(ann["category_id"], str(ann["category_id"]))
-            color = _CATEGORY_COLORS[int(ann["category_id"])
-                                     % len(_CATEGORY_COLORS)]
-            names.append(name)
-            colors.append(color)
-            rects.append([x, y, x + w, y + h])  # rerun boxes are xyxy
-            centers.append([x + w / 2.0, y + h / 2.0])
-
-        self._stream.log(
-            f"{base}/boxes",
-            rr.Boxes2D(array=rects, array_format=rr.Box2DFormat.XYXY,
-                       colors=colors, labels=names),
-        )
-        self._stream.log(
-            f"{base}/keypoints",
-            rr.Points2D(centers, colors=colors, labels=names),
-        )
-
-    def flush(self) -> None:
-        if self._stream is not None:
-            try:
-                self._stream.flush()
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------ #
-    # Colored point-cloud map + annotated-frame positions
-
-    def log_map(self, positions: "np.ndarray", colors: "np.ndarray") -> None:
-        """Log a colored point-cloud map (from a .pcd) as static 3D points."""
-        if not self.enabled or self._stream is None:
-            return
-        try:
-            self._stream.log(
-                "world/map",
-                rr.Points3D(positions, colors=colors),
-                static=True,
-            )
-        except Exception as exc:
-            print(f"WARNING: Rerun map logging failed: {exc}")
-
-    def log_map_marker(self, position, label: str,
-                       color=(255, 60, 60)) -> None:
-        """Mark one annotated frame's position on the map (large point)."""
-        if not self.enabled or self._stream is None:
-            return
-        try:
-            self._stream.log(
-                "world/map/annotated_frames",
-                rr.Points3D([position], radii=0.15, colors=[color],
-                            labels=[label]),
-            )
-        except Exception as exc:
-            print(f"WARNING: Rerun map marker logging failed: {exc}")
-
-    def spawn(self) -> bool:
-        """Open the standalone `rerun` viewer, live-connected to this
-        recording (gRPC), so later mark-as-annotated logs appear in it.
-
-        When an .rrd path was configured the viewer is launched with
-        ``--save`` so everything it receives is persisted to that file.
-        """
-        if not self.enabled or self._stream is None:
+        if not self.enabled or self._stream is None or not self.rrd_path:
             return False
         try:
-            import subprocess
-            cmd = ["rerun"]
-            if self.path:
-                cmd += ["--save", self.path]
-            subprocess.Popen(cmd)
-            try:
-                self._stream.connect_grpc()
-            except AttributeError:  # older rerun-sdk
-                self._stream.connect()
+            if self._port is None and not self._spawn_viewer():
+                return False
+            # Static clear + static points: previous markers disappear even
+            # when frames got un-marked, and markers stay visible at every
+            # timeline position.
+            self._stream.log(MARKER_ENTITY, rr.Clear(recursive=False),
+                             static=True)
+            if markers:
+                self._stream.log(
+                    MARKER_ENTITY,
+                    rr.Points3D([m[0] for m in markers], radii=0.15,
+                                colors=[(255, 60, 60)] * len(markers),
+                                labels=[m[1] for m in markers]),
+                    static=True,
+                )
+            self._stream.flush()
+            return True
+        except Exception as exc:
+            print(f"WARNING: Rerun marker logging failed: {exc}")
+            self._port = None  # viewer likely closed — respawn next time
+            return False
+
+    # ------------------------------------------------------------------ #
+
+    def _spawn_viewer(self) -> bool:
+        """Launch ``rerun <path> --port <free>`` (windowed, with a gRPC
+        server) and connect once the server accepts connections."""
+        try:
+            # Grab a free port instead of using the default (9876): with the
+            # default port occupied, the CLI "helpfully" streams into the
+            # already-running process instead of opening a new window.
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            subprocess.Popen(["rerun", self.rrd_path, "--port", str(port)])
+            # flush() on an unconnected gRPC sink raises after ~6s, so wait
+            # for the viewer's server to accept connections before
+            # connecting (the viewer takes a moment to boot).
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", port), 0.5):
+                        break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                print("WARNING: rerun viewer did not start listening")
+                return False
+            self._stream.connect_grpc(f"rerun+http://127.0.0.1:{port}/proxy")
+            self._port = port
             return True
         except Exception as exc:
             print(f"WARNING: could not spawn the rerun viewer: {exc}")
             return False
+
+    @staticmethod
+    def _read_store_id(rrd_path: str) -> Tuple[str, Optional[str]]:
+        """(application_id, recording_id) of the recording inside the .rrd,
+        so streamed markers merge into the same store in the viewer."""
+        try:
+            import rerun_bindings
+            entries = rerun_bindings.RrdReaderInternal(rrd_path) \
+                .store_entries()
+            for e in entries:
+                if getattr(e, "application_id", None):
+                    return e.application_id, getattr(e, "recording_id", None)
+        except Exception as exc:
+            print(f"WARNING: could not read the store id from {rrd_path}: "
+                  f"{exc}")
+        return "label_review", None

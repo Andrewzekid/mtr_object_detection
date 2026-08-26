@@ -6,7 +6,8 @@ import os
 
 import pytest
 
-from conftest import FakePropagateWorker, make_image_folder
+from conftest import (FakeAutolabelSingle, FakePropagateWorker,
+                      FakeWorker, make_image_folder)
 
 
 def _mkframe(i, ts=None, name=None):
@@ -133,6 +134,9 @@ def test_save_emits_side_and_unioned_annotated_idxs(lr, tmp_path):
     # image ids annotated on either side; frame 2 was explicitly marked
     # but has no image record, so it contributes nothing.
     assert d["annotated_image_ids"] == [l0, r1]
+    # annotated_timestamps: unique timestamp_ns of annotated images.
+    # _mkframe(0) → ts=0, _mkframe(1) → ts=1*10**9.
+    assert d["annotated_timestamps"] == [0, 10**9]
 
     # reload: side-keyed lookup tables are rebuilt from the file
     coco2 = lr.CocoState(path, [{"id": 0, "name": "a"}])
@@ -264,6 +268,10 @@ def test_stereo_active_canvas_and_side_aware_save(lr, make_coco, make_window,
     img = next(i for i in d["images"] if i["id"] == ann_img)
     assert img["side"] == "right"
     assert d["annotated_image_ids"] == [ann_img]
+    # the right-side frame 0 has timestamp 0 (FakeIdx default 1000+idx, but
+    # StereoIndex uses the file's timestamp; make_image_folder → 0). Just
+    # check the field exists and matches the annotated image's timestamp.
+    assert d["annotated_timestamps"] == [img["timestamp_ns"]]
 
 
 def test_stereo_discard_all_hits_active_side_only(lr, make_coco, make_window,
@@ -323,6 +331,113 @@ def test_sam3_all_cancel_stops_the_chain(lr, make_coco, make_window,
     # cancel must NOT chain the right side
     assert len(fake_sam3.any.instances) == 1
     assert win._sam3_all_pending == []
+
+
+def test_autolabel_frame_runs_both_sides_in_stereo(lr, make_coco, make_window,
+                                                   tmp_path, fake_sam3,
+                                                   monkeypatch):
+    """'Autolabel frame' in stereo autolabels BOTH sides: the active side's
+    job starts immediately, the other waits in the SAM3 queue."""
+    from gui.label_review.ui import main_window as mw
+    win, coco, idx, _l, _r = _stereo_setup(lr, make_coco, make_window,
+                                           tmp_path, name="alframe")
+    # Patch the generic autolabel single-frame worker (falcon/grounding_dino/
+    # florence2 share it) so we can observe both dispatches.
+    monkeypatch.setattr(mw, "GenericAutolabelWorker", FakeAutolabelSingle)
+    FakeAutolabelSingle.instances.clear()
+    win.autolabel_detector = "falcon"
+    win.falcon_model = "tiiuae/Falcon-Perception"
+    # RIGHT canvas focused — the reported bug scenario (only right got labelled)
+    win._set_active_canvas(win.canvases["right"])
+
+    win._on_autolabel_frame()
+    # One worker is running, the other side's job is queued behind it.
+    assert len(FakeAutolabelSingle.instances) == 1
+    running = FakeAutolabelSingle.instances[0]
+    assert running.isRunning()
+    assert running.kw["detector"] == "falcon"
+    assert len(win._sam3_queue) == 1
+    queued = win._sam3_queue[0]
+    assert queued["kind"] == "autolabel"
+    assert queued["detector"] == "falcon"
+    # The two jobs target different image ids (one per side).
+    left_id = win.canvas._image_id
+    right_id = win.canvases["right"]._image_id
+    started_ids = {running.kw["image_id"], queued["image_id"]}
+    assert started_ids == {left_id, right_id}
+    win._sam3_queue.clear()
+    FakeAutolabelSingle.instances[-1].stop()
+
+
+def test_autolabel_all_runs_both_sides_in_stereo(lr, make_coco, make_window,
+                                                tmp_path, fake_sam3,
+                                                monkeypatch, auto_yes):
+    """'Autolabel ALL frames' in stereo chains both sides: left batch, then
+    right batch, with the accumulated box count reported at the end."""
+    from gui.label_review.ui import main_window as mw
+    win, coco, idx, _l, _r = _stereo_setup(lr, make_coco, make_window,
+                                           tmp_path, name="alall")
+    monkeypatch.setattr(mw, "GenericAutolabelBatchWorker", FakeWorker)
+    FakeWorker.instances.clear()
+    win.autolabel_detector = "falcon"
+    win.falcon_model = "tiiuae/Falcon-Perception"
+
+    win._on_autolabel_all()
+    # Left batch started, right pending.
+    assert len(FakeWorker.instances) == 1
+    assert win._autolabel_batch_side == "left"
+    assert win._autolabel_all_pending == ["right"]
+    # GenericAutolabelBatchWorker receives `detector` as the first positional.
+    assert FakeWorker.instances[0].args[0] == "falcon"
+
+    # Finishing the left batch chains the right batch.
+    FakeWorker.instances[0].finished_signal.emit(0)
+    assert len(FakeWorker.instances) == 2
+    assert win._autolabel_batch_side == "right"
+    assert win._autolabel_all_pending == []
+
+    # Finishing the right batch completes the run; no extra workers spawned.
+    FakeWorker.instances[1].finished_signal.emit(0)
+    assert len(FakeWorker.instances) == 2
+
+
+def test_autolabel_all_cancel_stops_the_chain(lr, make_coco, make_window,
+                                              tmp_path, fake_sam3,
+                                              monkeypatch, auto_yes):
+    """Cancelling autolabel-all mid-side must NOT chain the other side."""
+    from gui.label_review.ui import main_window as mw
+    win, coco, idx, _l, _r = _stereo_setup(lr, make_coco, make_window,
+                                           tmp_path, name="alcancel")
+    monkeypatch.setattr(mw, "GenericAutolabelBatchWorker", FakeWorker)
+    FakeWorker.instances.clear()
+    win.autolabel_detector = "falcon"
+    win.falcon_model = "tiiuae/Falcon-Perception"
+
+    win._on_autolabel_all()
+    FakeWorker.instances[0].cancelled_signal.emit()
+    assert len(FakeWorker.instances) == 1
+    assert win._autolabel_all_pending == []
+
+
+def test_autolabel_all_mono_single_batch(lr, make_coco, make_window, tmp_path,
+                                        fake_sam3, monkeypatch, auto_yes):
+    """In mono, autolabel-all still runs exactly one batch (no stereo
+    chaining)."""
+    from gui.label_review.ui import main_window as mw
+    folder = make_image_folder(tmp_path / "almono", ["a.png", "b.png"])
+    monkeypatch.setattr(mw, "GenericAutolabelBatchWorker", FakeWorker)
+    FakeWorker.instances.clear()
+    win = make_window(lr.ImageFolderIndex([str(folder)]),
+                     make_coco([{"id": 0, "name": "a"}]))
+    win.autolabel_detector = "falcon"
+    win.falcon_model = "tiiuae/Falcon-Perception"
+
+    win._on_autolabel_all()
+    assert len(FakeWorker.instances) == 1
+    assert win._autolabel_batch_side == "left"
+    assert getattr(win, "_autolabel_all_pending", []) == []
+    FakeWorker.instances[0].finished_signal.emit(0)
+    assert len(FakeWorker.instances) == 1  # no chained second batch
 
 
 def test_sam3_all_mono_single_batch(lr, make_coco, make_window, tmp_path,
