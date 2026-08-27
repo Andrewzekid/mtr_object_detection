@@ -3,6 +3,7 @@
 import json
 import os
 import copy
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,6 +39,16 @@ from .side_panel import SidePanel, DETECTOR_LABELS
 from .dialogs import ConfigDialog
 
 
+# No-op X11 error handler for ReviewWindow._focus_rerun_window: keeps a
+# BadMatch (focus request racing the window's mapping) from aborting the
+# process on our own Display connection. Module-level so ctypes never
+# garbage-collects the callback while a Display is open.
+import ctypes as _ctypes  # noqa: E402
+
+_X11_ERR_CB = _ctypes.CFUNCTYPE(
+    _ctypes.c_int, _ctypes.c_void_p, _ctypes.c_void_p)(lambda d, e: 0)
+
+
 # ---------------------------------------------------------------------------
 # Prefetch runnable: decode one frame in the background for playback.
 # ---------------------------------------------------------------------------
@@ -46,14 +57,18 @@ class _PrefetchRunnable(QRunnable):
     """Decode a single frame into the index's LRU cache.
 
     The cache is thread-safe, so multiple runnables can run in parallel.
-    If the frame is already cached, decode_image returns immediately.
+    If the frame is already cached, decode_image returns immediately. The
+    window's _prefetch_pending entry is dropped when the decode finishes
+    (or fails) so a later tick can re-submit it if still needed.
     """
 
-    def __init__(self, frame_index, idx: int, side: Optional[str]):
+    def __init__(self, frame_index, idx: int, side: Optional[str],
+                 done_cb=None):
         super().__init__()
         self.frame_index = frame_index
         self.idx = idx
         self.side = side
+        self._done_cb = done_cb
 
     def run(self) -> None:
         try:
@@ -63,6 +78,9 @@ class _PrefetchRunnable(QRunnable):
                 self.frame_index.decode_image(self.idx, side=self.side)
         except Exception:
             pass
+        finally:
+            if self._done_cb is not None:
+                self._done_cb()
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +94,9 @@ class ReviewWindow(QMainWindow):
                  sam3_model: Optional[str] = None,
                  sam3_device: str = "cuda",
                   sam3_conf: float = 0.25,
-                 propagate_model: Optional[str] = None,
+                 sam3_imgsz: Optional[int] = None,
+                 sam3_quantize: Optional[int] = None,
+                  propagate_model: Optional[str] = None,
                  propagate_method: str = "memory",
                   propagate_min_iou: float = 0.3,
                   propagate_min_seed_iou: float = 0.2,
@@ -107,6 +127,16 @@ class ReviewWindow(QMainWindow):
         self.sam3_model = sam3_model
         self.sam3_device = sam3_device
         self.sam3_conf = sam3_conf
+        # Speed knobs (config: sam3.imgsz / sam3.quantize or the matching
+        # CLI flags): imgsz=None → library default; quantize=16 → FP16.
+        # Forwarded to every SAM3 worker (re-segment, point segment,
+        # autolabel, SAM3 ALL, propagate chain); the propagate memory-mode
+        # video engine uses imgsz when set and keeps its own FP16-on-GPU
+        # default unless a quantize is configured.
+        self.sam3_imgsz: Optional[int] = (
+            int(sam3_imgsz) if sam3_imgsz is not None else None)
+        self.sam3_quantize: Optional[int] = (
+            int(sam3_quantize) if sam3_quantize is not None else None)
         # Optional separate weights for "Propagate →" (defaults to sam3_model
         # when None). SAM3.1 multiplex (core/sam3/models/sam3.1-model/
         # sam3.1_multiplex.pt) tracks better than the base SAM3 checkpoint;
@@ -253,6 +283,16 @@ class ReviewWindow(QMainWindow):
         self._prefetch_timer = QTimer(self)
         self._prefetch_timer.timeout.connect(self._prefetch_tick)
         self._prefetch_lookahead = 8
+        # Dedicated 2-thread pool for prefetch decodes: full-res PIL decodes
+        # are GIL-heavy, and running all 8 lookahead decodes per side (16 in
+        # stereo) on the 24-thread global pool saturated the GIL — the UI
+        # thread's own decode then stalled behind them for several frames
+        # (the occasional stereo playback hiccup). Two threads keep the
+        # lookahead warm without starving the UI thread, and the pending-set
+        # below stops duplicate submissions of a frame still being decoded.
+        self._prefetch_pool = QThreadPool(self)
+        self._prefetch_pool.setMaxThreadCount(2)
+        self._prefetch_pending: set = set()
         # Per-tick counter used to throttle the keyframe/annotated/progress
         # UI syncs during playback (refresh every ~8 ticks instead of every
         # tick so the sync cost doesn't cap playback speed).
@@ -293,28 +333,34 @@ class ReviewWindow(QMainWindow):
         # _make_canvas).
         self.side.set_track_ids_visible(self.show_track_ids)
 
-        self.setCentralWidget(self._splitter)
-
-        # Embedded rerun viewer dock (View → "Rerun map"): hosts the rerun
-        # web viewer for the opened .rrd recording. Hidden by default; the
+        # The central area is a stack: page 0 is the image labeling view
+        # (canvas splitter), page 1 the embedded rerun waypoint map.
+        # View → "Switch to Rerun waypoint view" swaps the pages. The
         # QWebEngineView is created lazily on first embed so headless/test
         # runs never instantiate QtWebEngine.
-        self._rerun_dock = QtWidgets.QDockWidget("Rerun map", self)
-        self._rerun_dock.setObjectName("rerunMapDock")
+        self._stack = QtWidgets.QStackedWidget(self)
+        self._stack.addWidget(self._splitter)
+        self._rerun_page = QtWidgets.QWidget(self._stack)
+        _rerun_layout = QtWidgets.QVBoxLayout(self._rerun_page)
+        _rerun_layout.setContentsMargins(0, 0, 0, 0)
         _placeholder = QLabel(
-            "Open an .rrd recording while this panel is visible to embed "
-            "the rerun viewer here.", self._rerun_dock)
+            "Open an .rrd recording (File → Open rerun file…) to see the "
+            "rerun map here. Embedded view needs an X11 session (xcb) and "
+            "the `xwininfo` tool; otherwise the recording opens in the "
+            "external viewer.", self._rerun_page)
         _placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         _placeholder.setWordWrap(True)
-        self._rerun_dock.setWidget(_placeholder)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,
-                           self._rerun_dock)
-        self._rerun_dock.hide()
-        self._rerun_webview = None
-        # Showing the panel AFTER a recording was opened windowed re-opens
-        # the same .rrd embedded into the panel instead.
-        self._rerun_dock.visibilityChanged.connect(
-            self._on_rerun_dock_visibility)
+        _rerun_layout.addWidget(_placeholder)
+        self._stack.addWidget(self._rerun_page)
+        self.setCentralWidget(self._stack)
+        # The embedded native rerun window: container widget + the winId it
+        # wraps (recreated when the viewer process respawns).
+        self._rerun_container = None
+        self._rerun_native_win = None
+        self._rerun_embedded_wid: Optional[int] = None
+        # WindowActivate forwarding for the embedded rerun window (see
+        # eventFilter).
+        self.installEventFilter(self)
 
         self._build_menu()
 
@@ -445,6 +491,10 @@ class ReviewWindow(QMainWindow):
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.MouseButtonPress:
+            if obj is self._rerun_container:
+                # Clicking the embedded rerun window forwards X11 keyboard
+                # focus to it, so its camera controls (WASD…) work.
+                self._focus_rerun_window()
             # Clicking a stereo canvas makes it the active side (the target
             # of window-level edit shortcuts and per-frame ops).
             if isinstance(obj, CanvasWidget) \
@@ -454,7 +504,53 @@ class ReviewWindow(QMainWindow):
             fw = QApplication.focusWidget()
             if isinstance(fw, QLineEdit) and fw is not obj:
                 fw.clearFocus()
+        elif obj is self and event.type() == QEvent.Type.WindowActivate \
+                and self._in_rerun_view() and self._rerun_embedded_wid:
+            # Re-entering the app while the map view is up: keyboard focus
+            # belongs to the embedded rerun window again.
+            self._focus_rerun_window()
         return super().eventFilter(obj, event)
+
+    def _focus_rerun_window(self) -> None:
+        """Move X11 input focus to the embedded rerun window.
+
+        A reparented foreign window receives mouse events (they go to the
+        window under the cursor) but NOT keyboard events, which follow the
+        input focus our Qt window holds — so WASD camera controls are dead
+        until we hand the focus over via XSetInputFocus. Clicking any Qt
+        widget (menu bar, image view) lets the WM focus our window again.
+
+        A custom no-op error handler is installed on our own Display
+        connection: without it a BadMatch (window momentarily not
+        viewable, e.g. right after a respawn) would abort the process.
+        Retries cover that transient state.
+        """
+        wid = self._rerun_embedded_wid
+        if not wid:
+            return
+        try:
+            import ctypes
+            x11 = ctypes.CDLL("libX11.so.6")
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            dpy = x11.XOpenDisplay(None)
+            if not dpy:
+                return
+            x11.XSetErrorHandler(_X11_ERR_CB)  # module-level, stays alive
+            for _ in range(5):
+                x11.XSetInputFocus(ctypes.c_void_p(dpy), ctypes.c_ulong(wid),
+                                   1, 0)  # RevertToParent, CurrentTime
+                x11.XSync(ctypes.c_void_p(dpy), 0)
+                focus = ctypes.c_ulong(0)
+                x11.XGetInputFocus(ctypes.c_void_p(dpy),
+                                   ctypes.byref(focus),
+                                   ctypes.byref(ctypes.c_int(0)))
+                if focus.value == wid:
+                    break
+                time.sleep(0.1)
+            x11.XCloseDisplay(ctypes.c_void_p(dpy))
+        except Exception as exc:
+            print(f"WARNING: could not focus the embedded rerun window: "
+                  f"{exc}")
 
     # ----------------------- canvases (mono / stereo) ------------------- #
 
@@ -727,14 +823,12 @@ class ReviewWindow(QMainWindow):
             view.addAction(act_theme)
             self._theme_actions[name] = act_theme
         view.addSeparator()
-        # View switch: image labeling view <-> embedded rerun waypoint map.
-        # The label flips with the dock's visibility (kept in sync from
-        # _on_rerun_dock_visibility, so closing the dock via its ✖ also
-        # resets the menu text).
+        # View switch: image labeling view <-> embedded rerun waypoint map
+        # (the label flips in _show_rerun_page/_show_image_page).
         self._act_rerun_view = QAction("Switch to Rerun waypoint view", self)
         self._act_rerun_view.setToolTip(
-            "Show the embedded rerun waypoint map; switch back to return "
-            "to the image labeling view.")
+            "Replace the image labeling view with the embedded rerun "
+            "waypoint map; switch back to return to the images.")
         self._act_rerun_view.triggered.connect(self._on_toggle_rerun_view)
         view.addAction(self._act_rerun_view)
 
@@ -820,71 +914,92 @@ class ReviewWindow(QMainWindow):
 
     def _open_rerun_file(self) -> None:
         """File -> Open rerun file…: open an .rrd recording (with the map,
-        images and timestamps) in a rerun viewer. With the "Rerun map" dock
-        panel visible (View menu) the viewer is embedded into it via the
-        rerun web viewer; otherwise a separate windowed viewer opens. The
-        recording becomes the target for '🗺 Show annotated in Rerun'
-        markers."""
+        images and timestamps) in the embedded rerun waypoint view, which
+        replaces the image view automatically. Only when native embedding
+        is unavailable (no X11/xwininfo) or the spawn fails does the
+        recording stay in a standalone windowed viewer. The recording
+        becomes the target for '🗺 Show annotated in Rerun' markers."""
         path, _ = QFileDialog.getOpenFileName(
             self, "Open rerun file", "", "Rerun recording (*.rrd)")
         if not path:
             return
-        embed = self._rerun_panel_available()
+        embed = self._native_embed_available()
         if not self.rerun.open_recording(path, embed=embed):
-            if embed and self.rerun.open_recording(path, embed=False):
-                embed = False  # embedded spawn failed — external fallback
-            else:
-                QMessageBox.warning(
-                    self, "Rerun unavailable",
-                    "Could not open the recording (is rerun-sdk / the rerun "
-                    "CLI installed?).")
-                return
-        if embed and self.rerun.web_url:
+            QMessageBox.warning(
+                self, "Rerun unavailable",
+                "Could not open the recording (is rerun-sdk / the rerun "
+                "CLI installed?).")
+            return
+        if embed and self.rerun.win_id:
             self._load_rerun_embedded()
+            self._show_rerun_page()  # replace the image view with the map
         self.statusBar().showMessage(
             f"Opened {path} in the rerun viewer", 4000)
 
-    def _rerun_panel_available(self) -> bool:
-        """True when the "Rerun map" dock is visible AND QtWebEngine is
-        installed — only then does opening an .rrd embed the web viewer."""
-        if not self._rerun_dock.isVisible():
-            return False
-        try:
-            from PyQt6 import QtWebEngineWidgets  # noqa: F401
-        except ImportError:
-            return False
-        return True
+    @staticmethod
+    def _native_embed_available() -> bool:
+        """True when native window reparenting can work: X11 (xcb) session
+        with the `xwininfo` tool to locate the viewer window."""
+        import shutil
+        app = QApplication.instance()
+        return (app is not None and app.platformName() == "xcb"
+                and shutil.which("xwininfo") is not None)
 
     def _load_rerun_embedded(self) -> None:
-        """Load (or reload) the recording's web-viewer URL in the dock."""
-        url = self.rerun.web_url
-        if not url:
+        """Reparent the viewer's native window into the rerun page,
+        replacing the placeholder (or a stale container from a respawn)."""
+        wid = self.rerun.win_id
+        if not wid or wid == self._rerun_embedded_wid:
             return
-        if self._rerun_webview is None:
-            from PyQt6.QtWebEngineWidgets import QWebEngineView
-            self._rerun_webview = QWebEngineView(self._rerun_dock)
-            self._rerun_dock.setWidget(self._rerun_webview)
-        self._rerun_webview.load(QtCore.QUrl(url))
+        if self._rerun_container is not None:
+            self._rerun_container.hide()
+            self._rerun_container.deleteLater()
+            self._rerun_container = None
+            self._rerun_native_win = None
+        native = QtGui.QWindow.fromWinId(wid)
+        self._rerun_container = QtWidgets.QWidget.createWindowContainer(
+            native, self._rerun_page)
+        self._rerun_container.installEventFilter(self)  # click → X11 focus
+        self._rerun_native_win = native
+        lay = self._rerun_page.layout()
+        for i in reversed(range(lay.count())):  # drop the placeholder
+            item = lay.takeAt(i)
+            w = item.widget()
+            if w is not None and w is not self._rerun_container:
+                w.deleteLater()
+        lay.addWidget(self._rerun_container)
+        self._rerun_embedded_wid = wid
+
+    def _in_rerun_view(self) -> bool:
+        return self._stack.currentWidget() is self._rerun_page
+
+    def _show_rerun_page(self) -> None:
+        """Replace the image view with the embedded rerun waypoint map."""
+        self._stack.setCurrentWidget(self._rerun_page)
+        self._act_rerun_view.setText("Switch back to image view")
+        if self._rerun_embedded_wid:
+            # Let the page switch settle, then hand keyboard focus to the
+            # embedded window so WASD camera controls work immediately.
+            QTimer.singleShot(150, self._focus_rerun_window)
+
+    def _show_image_page(self) -> None:
+        """Back to the image labeling view."""
+        self._stack.setCurrentWidget(self._splitter)
+        self._act_rerun_view.setText("Switch to Rerun waypoint view")
 
     def _on_toggle_rerun_view(self) -> None:
         """View-menu switch between the image labeling view and the
-        embedded rerun waypoint map (the "Rerun map" dock panel)."""
-        self._rerun_dock.setVisible(not self._rerun_dock.isVisible())
-
-    def _on_rerun_dock_visibility(self, visible: bool) -> None:
-        """Keep the View-menu switch label in sync with the dock, and when
-        the panel is shown with a recording already open in an external
-        viewer, re-open the same .rrd embedded into the panel."""
-        act = getattr(self, "_act_rerun_view", None)
-        if act is not None:
-            act.setText("Switch back to image view" if visible
-                        else "Switch to Rerun waypoint view")
-        if not visible or not self.rerun.rrd_path or self.rerun.web_url:
+        embedded rerun waypoint map."""
+        if self._in_rerun_view():
+            self._show_image_page()
             return
-        if not self._rerun_panel_available():
-            return
-        if self.rerun.open_recording(self.rerun.rrd_path, embed=True):
-            self._load_rerun_embedded()
+        self._show_rerun_page()
+        # A recording stuck in an external viewer (e.g. native embedding
+        # was unavailable when it was opened) moves into the app now.
+        if (self.rerun.rrd_path and not self.rerun.win_id
+                and self._native_embed_available()):
+            if self.rerun.open_recording(self.rerun.rrd_path, embed=True):
+                self._load_rerun_embedded()
 
     def _open_pose_db(self) -> None:
         """File -> Open pose database…: Clio inspection SQLite whose
@@ -1019,6 +1134,21 @@ class ReviewWindow(QMainWindow):
             self.sam3_model = str(sam3_cfg["model"])
         if "conf" in sam3_cfg:
             self.sam3_conf = float(sam3_cfg["conf"])
+        if "imgsz" in sam3_cfg:
+            try:
+                self.sam3_imgsz = int(sam3_cfg["imgsz"])
+            except (TypeError, ValueError):
+                print(f"⚠️ config sam3.imgsz {sam3_cfg['imgsz']!r} invalid; "
+                      "keeping the previous value")
+        if "quantize" in sam3_cfg:
+            q = sam3_cfg["quantize"]
+            if q in (None, 0):
+                self.sam3_quantize = None
+            elif q in (8, 16, 32):
+                self.sam3_quantize = int(q)
+            else:
+                print(f"⚠️ config sam3.quantize {q!r} invalid (use 8, 16 "
+                      "or 32); keeping the previous value")
         if "auto_segment" in sam3_cfg:
             self.auto_segment = bool(sam3_cfg["auto_segment"])
         if "min_polygon_area" in sam3_cfg:
@@ -1195,13 +1325,20 @@ class ReviewWindow(QMainWindow):
                 fp = frame.get("file_path")
                 if fp and cache.contains(fp):
                     continue
-                QThreadPool.globalInstance().start(
-                    _PrefetchRunnable(frame_index, idx, side))
+                key = (idx, side)
+                if key in self._prefetch_pending:
+                    continue  # already queued — don't pile up duplicates
+                self._prefetch_pending.add(key)
+                self._prefetch_pool.start(
+                    _PrefetchRunnable(frame_index, idx, side,
+                                      done_cb=lambda k=key:
+                                      self._prefetch_pending.discard(k)))
 
     def _start_playback(self) -> None:
         if self._playing:
             return
         self._playing = True
+        self._prefetch_pending.clear()  # drop stale entries from a prior run
         self._play_timer.start(self._play_interval_ms)
         self._prefetch_tick()  # warm the first lookahead batch immediately
         self._prefetch_timer.start(100)
@@ -1537,9 +1674,9 @@ class ReviewWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Rerun marker logging failed (see console)", 5000)
             return
-        # A dropped embedded connection respawns on new ports — reload the
-        # dock's web view so it follows the new server.
-        if self._rerun_webview is not None and self.rerun.web_url:
+        # A dropped embedded connection respawns the viewer with a new
+        # window — re-embed it so the page follows the new process.
+        if self.rerun.win_id and self.rerun.win_id != self._rerun_embedded_wid:
             self._load_rerun_embedded()
         self.statusBar().showMessage(
             f"Rerun: showing {len(markers)} annotated viewpoint(s)"
@@ -2523,6 +2660,8 @@ class ReviewWindow(QMainWindow):
             model_path=self.sam3_model,
             device=self.sam3_device,
             conf=self.sam3_conf,
+            imgsz=self.sam3_imgsz,
+            quantize=self.sam3_quantize,
             parent=self,
         )
         self._sam3_batch_worker.frame_done_signal.connect(
@@ -2812,6 +2951,8 @@ class ReviewWindow(QMainWindow):
                 model_path=self.sam3_model,
                 device=self.sam3_device,
                 conf=self.sam3_conf,
+                imgsz=self.sam3_imgsz,
+                quantize=self.sam3_quantize,
                 parent=self,
             )
         self._sam3_autolabel_worker.finished_signal.connect(
@@ -3027,6 +3168,8 @@ class ReviewWindow(QMainWindow):
                 model_path=self.sam3_model,
                 device=self.sam3_device,
                 conf=self.sam3_conf,
+                imgsz=self.sam3_imgsz,
+                quantize=self.sam3_quantize,
                 parent=self,
             )
         self._sam3_autolabel_batch_worker.frame_done_signal.connect(
@@ -3308,6 +3451,8 @@ class ReviewWindow(QMainWindow):
             min_iou=self.propagate_min_iou,
             min_seed_iou=self.propagate_min_seed_iou,
             end_frame_idx=end_frame_idx,
+            imgsz=self.sam3_imgsz,
+            quantize=self.sam3_quantize,
             parent=self,
         )
         self._sam3_propagate_worker._meta = {
@@ -3534,6 +3679,8 @@ class ReviewWindow(QMainWindow):
             model_path=self.sam3_model,
             device=self.sam3_device,
             conf=self.sam3_conf,
+            imgsz=self.sam3_imgsz,
+            quantize=self.sam3_quantize,
             parent=self,
         )
         self._sam3_worker.finished_signal.connect(self._on_sam3_finished)
@@ -3780,6 +3927,8 @@ class ReviewWindow(QMainWindow):
             device=self.sam3_device,
             conf=self.sam3_conf,
             text=cat_name if cat_name != "?" else None,
+            imgsz=self.sam3_imgsz,
+            quantize=self.sam3_quantize,
             parent=self,
         )
         self._point_seg_worker.finished_signal.connect(

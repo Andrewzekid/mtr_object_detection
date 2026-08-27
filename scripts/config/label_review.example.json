@@ -9,6 +9,8 @@
     "device": "auto",
     "model": null,
     "conf": 0.25,
+    "imgsz": null,
+    "quantize": 16,
     "auto_segment": false,
     "min_polygon_area": 100,
     "autolabel_nms_iou": 0.7,

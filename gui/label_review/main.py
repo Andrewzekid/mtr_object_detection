@@ -239,6 +239,13 @@ config override the corresponding CLI flags. Example:
                                       // reports CUDA available, else cpu.
                                       // Or force "cuda" / "cpu".
         "conf": 0.25,
+        "imgsz": null,                // inference size (square). null =
+                                      // library default (1036 bbox / 644
+                                      // text). Smaller (644/770) is much
+                                      // faster; rounded to a multiple of 14.
+        "quantize": 16,               // 16 = FP16 (recommended on GPU,
+                                      // ~1.5-2x faster), 32 = FP32, 8 = INT8,
+                                      // null = FP32.
         "auto_segment": false,
         "min_polygon_area": 100,      // drop saved mask contours smaller
                                       // than this (px²); filters the speck
@@ -376,6 +383,20 @@ def main():
                              "cpu).")
     parser.add_argument("--sam3-conf", type=float, default=0.25,
                         help="SAM3 confidence threshold (default: 0.25).")
+    parser.add_argument("--sam3-imgsz", type=int, default=None,
+                        help="SAM3 inference image size (square). Default: "
+                             "library default (1036 for the bbox-exemplar "
+                             "model, 644 for the text/semantic model). "
+                             "Smaller values (644/770) run much faster with "
+                             "slightly coarser masks; rounded to a multiple "
+                             "of 14.")
+    parser.add_argument("--sam3-quantize", type=int, default=None,
+                        choices=[8, 16, 32],
+                        help="SAM3 precision: 16 = FP16 (much faster on "
+                             "GPU, recommended), 32 = FP32, 8 = INT8. "
+                             "Default: unset (FP32 for the GUI runs; the "
+                             "propagate video engine already defaults to "
+                             "FP16 on GPU).")
     parser.add_argument("--propagate-model", default=None,
                         help="Path to SAM3 weights used only by 'Propagate →' "
                              "(e.g. core/sam3/models/sam3.1-model/"
@@ -437,6 +458,27 @@ def main():
         sam3_device = args.sam3_device
     sam3_device = _resolve_device(sam3_device)
     print(f"🖥️  SAM3 device: {sam3_device}")
+    sam3_imgsz = sam3_cfg.get("imgsz", args.sam3_imgsz)
+    if sam3_imgsz is not None:
+        try:
+            sam3_imgsz = int(sam3_imgsz)
+        except (TypeError, ValueError):
+            print(f"⚠️ config sam3.imgsz {sam3_imgsz!r} invalid; "
+                  "using the library default")
+            sam3_imgsz = None
+    sam3_quantize = sam3_cfg.get("quantize", args.sam3_quantize)
+    if sam3_quantize is not None:
+        try:
+            sam3_quantize = int(sam3_quantize)
+            if sam3_quantize not in (8, 16, 32):
+                raise ValueError
+        except (TypeError, ValueError):
+            print(f"⚠️ config sam3.quantize {sam3_quantize!r} invalid "
+                  "(use 8, 16 or 32); using FP32")
+            sam3_quantize = None
+    if sam3_imgsz is not None or sam3_quantize is not None:
+        print(f"⚡ SAM3 speed: imgsz={sam3_imgsz or 'default'}, "
+              f"quantize={sam3_quantize or 'fp32'}")
     propagate_method = sam3_cfg.get("propagate_method", "memory")
     if propagate_method not in ("memory", "chain"):
         print(f"⚠️ config sam3.propagate_method {propagate_method!r} "
@@ -500,12 +542,6 @@ def main():
     coco.current_idx = coco.load_progress(len(frame_index))
 
     # ---------- 3. Qt app ----------
-    # QtWebEngine (the embedded "Rerun map" dock panel) requires shared
-    # OpenGL contexts; the attribute must be set before a QApplication
-    # exists. Harmless when the panel is never used.
-    from PyQt6.QtCore import QCoreApplication, Qt as _Qt
-    QCoreApplication.setAttribute(
-        _Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Computer Vision Label Review Tool")
 
@@ -551,6 +587,8 @@ def main():
                        sam3_model=sam3_cfg.get("model") or args.sam3_model,
                        sam3_device=sam3_device,
                        sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),
+                       sam3_imgsz=sam3_imgsz,
+                       sam3_quantize=sam3_quantize,
                        propagate_model=(sam3_cfg.get("propagate_model")
                                         or args.propagate_model),
                        propagate_method=propagate_method,

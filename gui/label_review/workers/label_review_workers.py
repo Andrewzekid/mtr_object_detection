@@ -49,6 +49,8 @@ class SAM3Worker(QThread):
       bboxes_xyxy: list of [x1,y1,x2,y2] pixel coords (one per region).
       concepts   : list of class names (one per bbox, used for labelling).
       model_path, device, conf : forwarded to run_sam3.
+      imgsz, quantize : optional speed knobs forwarded to run_sam3
+                   (imgsz=None → library default; quantize=16 → FP16 on GPU).
 
     Emits:
       finished_signal(list_of_dicts) where each dict is
@@ -69,6 +71,7 @@ class SAM3Worker(QThread):
     def __init__(self, image_path: str, bboxes_xyxy: list,
                  concepts: list, ann_ids: list,
                  model_path: Optional[str], device: str, conf: float,
+                 imgsz: Optional[int] = None, quantize: Optional[int] = None,
                  parent=None):
         super().__init__(parent)
         self.image_path = image_path
@@ -78,6 +81,8 @@ class SAM3Worker(QThread):
         self.model_path = model_path
         self.device = device
         self.conf = conf
+        self.imgsz = imgsz
+        self.quantize = quantize
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -97,6 +102,7 @@ class SAM3Worker(QThread):
         results, _device, cancelled = _segment_concepts(
             self.image_path, self.bboxes_xyxy, self.concepts, self.ann_ids,
             self.model_path, self.device, self.conf,
+            imgsz=self.imgsz, quantize=self.quantize,
             cancel_check=lambda: self._cancel_requested,
             progress_cb=lambda d, t, c: self.progress_signal.emit(d, t, c),
         )
@@ -128,7 +134,9 @@ class SAM3PointWorker(QThread):
 
     def __init__(self, image_path: str, points: list, labels: list,
                  model_path: Optional[str], device: str, conf: float,
-                 text: Optional[str] = None, parent=None):
+                 text: Optional[str] = None,
+                 imgsz: Optional[int] = None, quantize: Optional[int] = None,
+                 parent=None):
         super().__init__(parent)
         self.image_path = image_path
         self.points = points      # [[x, y], ...]
@@ -137,6 +145,8 @@ class SAM3PointWorker(QThread):
         self.device = device
         self.conf = conf
         self.text = text          # category name → text-guided instance pick
+        self.imgsz = imgsz
+        self.quantize = quantize
 
     def run(self) -> None:  # noqa: D401 (QThread override)
         if not _SAM3_AVAILABLE:
@@ -151,7 +161,8 @@ class SAM3PointWorker(QThread):
             res = run_sam3(image_path=self.image_path, points=pts,
                            point_labels=list(self.labels), text=self.text,
                            model_path=self.model_path, device=device,
-                           conf=self.conf)
+                           conf=self.conf, imgsz=self.imgsz,
+                           quantize=self.quantize)
         except Exception as e:
             res = {"success": False, "error": str(e)}
         # CUDA OOM → retry once on CPU (same policy as _segment_concepts).
@@ -163,7 +174,8 @@ class SAM3PointWorker(QThread):
                 res = run_sam3(image_path=self.image_path, points=pts,
                                point_labels=list(self.labels), text=self.text,
                                model_path=self.model_path, device=device,
-                               conf=self.conf)
+                               conf=self.conf, imgsz=self.imgsz,
+                               quantize=self.quantize)
             except Exception as e2:
                 res = {"success": False, "error": str(e2)}
 
@@ -218,7 +230,9 @@ def _iou_xyxy(a: List[float], b: List[float]) -> float:
 
 def _segment_concepts(image_path: str, bboxes_xyxy: list, concepts: list,
                       ann_ids: list, model_path: Optional[str], device: str,
-                      conf: float, cancel_check=None, progress_cb=None
+                      conf: float, imgsz: Optional[int] = None,
+                      quantize: Optional[int] = None, cancel_check=None,
+                      progress_cb=None
                       ) -> Tuple[List[Dict[str, Any]], str, bool]:
     """Run SAM3 on `bboxes_xyxy`, one run_sam3 call per unique concept.
 
@@ -271,6 +285,8 @@ def _segment_concepts(image_path: str, bboxes_xyxy: list, concepts: list,
                 model_path=model_path,
                 device=device,
                 conf=conf,
+                imgsz=imgsz,
+                quantize=quantize,
             )
         except Exception as e:
             res = {"success": False, "error": str(e)}
@@ -293,6 +309,8 @@ def _segment_concepts(image_path: str, bboxes_xyxy: list, concepts: list,
                     model_path=model_path,
                     device=device,
                     conf=conf,
+                    imgsz=imgsz,
+                    quantize=quantize,
                 )
             except Exception as e2:
                 res = {"success": False, "error": str(e2)}
@@ -361,6 +379,7 @@ class SAM3BatchWorker(QThread):
 
     def __init__(self, frame_index, jobs: List[Dict[str, Any]], tmp_dir: str,
                  model_path: Optional[str], device: str, conf: float,
+                 imgsz: Optional[int] = None, quantize: Optional[int] = None,
                  parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -369,6 +388,8 @@ class SAM3BatchWorker(QThread):
         self.model_path = model_path
         self.device = device
         self.conf = conf
+        self.imgsz = imgsz
+        self.quantize = quantize
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -397,6 +418,7 @@ class SAM3BatchWorker(QThread):
             results, device, cancelled = _segment_concepts(
                 img_path, job["bboxes_xyxy"], job["concepts"], job["ann_ids"],
                 self.model_path, device, self.conf,
+                imgsz=self.imgsz, quantize=self.quantize,
                 cancel_check=lambda: self._cancel_requested,
             )
             if cancelled:
@@ -423,13 +445,22 @@ def _default_sam3_weights() -> str:
 
 
 def _load_sam3_semantic(model_path: Optional[str], device: str,
-                        conf: float):
-    """Build a SAM3SemanticPredictor ready for text-prompt detection."""
+                        conf: float, imgsz: Optional[int] = None,
+                        quantize: Optional[int] = None):
+    """Build a SAM3SemanticPredictor ready for text-prompt detection.
+
+    ``imgsz``/``quantize`` are speed knobs: imgsz=None keeps the library
+    default (644), quantize=16 enables FP16 (GPU only — much faster)."""
     from ultralytics.models.sam.predict import SAM3SemanticPredictor
-    pred = SAM3SemanticPredictor(overrides=dict(
+    overrides = dict(
         model=model_path or _default_sam3_weights(),
         conf=conf, device=device, task="segment", mode="predict",
-        save=False, verbose=False))
+        save=False, verbose=False)
+    if imgsz is not None:
+        overrides["imgsz"] = int(imgsz)
+    if quantize is not None:
+        overrides["quantize"] = quantize
+    pred = SAM3SemanticPredictor(overrides=overrides)
     pred.setup_model(model=None, verbose=False)
     return pred
 
@@ -450,10 +481,10 @@ def _autolabel_frame(pred, image_path: str,
     boxes = getattr(r, "boxes", None)
     if boxes is None or len(boxes) == 0:
         return dets
-    xyxy = boxes.xyxy.cpu().numpy()
+    xyxy = boxes.xyxy.cpu().numpy().astype(float)
     cls = (boxes.cls.cpu().numpy().astype(int)
            if hasattr(boxes, "cls") else np.zeros(len(xyxy), int))
-    confs = (boxes.conf.cpu().numpy()
+    confs = (boxes.conf.cpu().numpy().astype(float)
              if hasattr(boxes, "conf") else np.ones(len(xyxy)))
     masks = getattr(r, "masks", None)
     mask_data = masks.data.cpu().numpy() if masks is not None else None
@@ -474,7 +505,9 @@ def _autolabel_frame(pred, image_path: str,
 
 def _autolabel_with_fallback(image_path: str, concepts: List[str],
                              model_path: Optional[str], device: str,
-                             conf: float, pred=None
+                             conf: float, pred=None,
+                             imgsz: Optional[int] = None,
+                             quantize: Optional[int] = None
                              ) -> Tuple[List[Dict[str, Any]], str, Any]:
     """_autolabel_frame with model load + CUDA-OOM→CPU retry.
 
@@ -483,13 +516,14 @@ def _autolabel_with_fallback(image_path: str, concepts: List[str],
     (detections, device_in_use, predictor_in_use) so a caller can keep the
     (possibly CPU-fallback) predictor for the next frame."""
     if pred is None:
-        pred = _load_sam3_semantic(model_path, device, conf)
+        pred = _load_sam3_semantic(model_path, device, conf, imgsz, quantize)
     try:
         return _autolabel_frame(pred, image_path, concepts), device, pred
     except Exception as e:
         if device != "cpu" and "out of memory" in str(e).lower():
             print("⚠️ SAM3 CUDA OOM — retrying autolabel on CPU")
-            pred = _load_sam3_semantic(model_path, "cpu", conf)
+            pred = _load_sam3_semantic(model_path, "cpu", conf, imgsz,
+                                       quantize)
             return _autolabel_frame(pred, image_path, concepts), "cpu", pred
         raise
 
@@ -508,6 +542,7 @@ class SAM3AutolabelWorker(QThread):
     def __init__(self, image_path: str, concepts: List[str],
                  cat_ids: List[int], image_id: int,
                  model_path: Optional[str], device: str, conf: float,
+                 imgsz: Optional[int] = None, quantize: Optional[int] = None,
                  parent=None):
         super().__init__(parent)
         self.image_path = image_path
@@ -517,6 +552,8 @@ class SAM3AutolabelWorker(QThread):
         self.model_path = model_path
         self.device = device
         self.conf = conf
+        self.imgsz = imgsz
+        self.quantize = quantize
 
     def run(self) -> None:  # noqa: D401 (QThread override)
         if not _SAM3_AVAILABLE:
@@ -525,7 +562,8 @@ class SAM3AutolabelWorker(QThread):
         try:
             dets, _dev, _pred = _autolabel_with_fallback(
                 self.image_path, self.concepts, self.model_path,
-                self.device, self.conf)
+                self.device, self.conf, imgsz=self.imgsz,
+                quantize=self.quantize)
         except Exception as e:
             self.failed_signal.emit(str(e))
             return
@@ -552,6 +590,7 @@ class SAM3AutolabelBatchWorker(QThread):
     def __init__(self, frame_index, frame_idxs: List[int],
                  concepts: List[str], cat_ids: List[int], tmp_dir: str,
                  model_path: Optional[str], device: str, conf: float,
+                 imgsz: Optional[int] = None, quantize: Optional[int] = None,
                  parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -562,6 +601,8 @@ class SAM3AutolabelBatchWorker(QThread):
         self.model_path = model_path
         self.device = device
         self.conf = conf
+        self.imgsz = imgsz
+        self.quantize = quantize
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -579,7 +620,8 @@ class SAM3AutolabelBatchWorker(QThread):
         # rebuilt if a CUDA OOM forces a CPU fallback mid-run. (Kept in a
         # try so a load failure reports failed_signal like the per-frame path.)
         try:
-            pred = _load_sam3_semantic(self.model_path, device, self.conf)
+            pred = _load_sam3_semantic(self.model_path, device, self.conf,
+                                       self.imgsz, self.quantize)
         except Exception as e:
             self.failed_signal.emit(f"model load: {e}")
             return
@@ -598,7 +640,8 @@ class SAM3AutolabelBatchWorker(QThread):
             try:
                 dets, device, pred = _autolabel_with_fallback(
                     img_path, self.concepts, self.model_path, device,
-                    self.conf, pred=pred)
+                    self.conf, pred=pred, imgsz=self.imgsz,
+                    quantize=self.quantize)
             except Exception as e:
                 self.failed_signal.emit(f"frame {frame_idx + 1}: {e}")
                 return
@@ -631,7 +674,9 @@ def _propagate_step(image_path: str, prev_bbox_xyxy: List[float],
                     conf: float,
                     min_iou: float = _PROPAGATE_MIN_IOU,
                     seed_bbox_xyxy: Optional[List[float]] = None,
-                    min_seed_iou: float = _PROPAGATE_MIN_SEED_IOU
+                    min_seed_iou: float = _PROPAGATE_MIN_SEED_IOU,
+                    imgsz: Optional[int] = None,
+                    quantize: Optional[int] = None
                     ) -> Tuple[Optional[Dict[str, Any]], str]:
     """One chain-mode propagation step: re-detect the object on a new frame.
 
@@ -651,7 +696,8 @@ def _propagate_step(image_path: str, prev_bbox_xyxy: List[float],
         return run_sam3(image_path=image_path,
                         bboxes=[list(prev_bbox_xyxy)],
                         concepts=[concept],
-                        model_path=model_path, device=dev, conf=conf)
+                        model_path=model_path, device=dev, conf=conf,
+                        imgsz=imgsz, quantize=quantize)
 
     try:
         res = _run(device)
@@ -744,6 +790,7 @@ class SAM3PropagateWorker(QThread):
                  min_iou: float = _PROPAGATE_MIN_IOU,
                  min_seed_iou: float = _PROPAGATE_MIN_SEED_IOU,
                  end_frame_idx: Optional[int] = None,
+                 imgsz: Optional[int] = None, quantize: Optional[int] = None,
                  parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -757,6 +804,10 @@ class SAM3PropagateWorker(QThread):
         self.min_iou = min_iou
         self.min_seed_iou = min_seed_iou
         self.end_frame_idx = end_frame_idx  # exclusive; None = end of index
+        # Speed knobs for the chain method (run_sam3) and the memory-method
+        # video predictor (imgsz already supported there; quantize=16 → FP16).
+        self.imgsz = imgsz
+        self.quantize = quantize
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -869,10 +920,13 @@ class SAM3PropagateWorker(QThread):
                     [list(s["bbox_xyxy"]) for s in self.seeds],
                     model_path=self.model_path, device=self.device,
                     conf=self.conf,
+                    imgsz=(self.imgsz if self.imgsz is not None else 1280),
                     # FP16 on GPU (~2x faster per frame, same policy as
                     # scripts/11_run_tracking.py --half); FP32 on CPU where
-                    # half precision would be slower.
-                    quantize=(16 if str(self.device) != "cpu" else None),
+                    # half precision would be slower. A config-set quantize
+                    # wins (0/None disables).
+                    quantize=(self.quantize if self.quantize is not None
+                              else (16 if str(self.device) != "cpu" else None)),
                     is_cancelled=lambda: self._cancel_requested):
                 if self._cancel_requested:
                     self.cancelled_signal.emit()
@@ -945,7 +999,8 @@ class SAM3PropagateWorker(QThread):
                         self.model_path, device, self.conf,
                         min_iou=self.min_iou,
                         seed_bbox_xyxy=seed["bbox_xyxy"],
-                        min_seed_iou=self.min_seed_iou)
+                        min_seed_iou=self.min_seed_iou,
+                        imgsz=self.imgsz, quantize=self.quantize)
                     if det is None:
                         alive[i] = False
                         lost[i] = frame_idx

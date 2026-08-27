@@ -17,12 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PyQt6 import QtCore, QtWidgets
-
-# Same as gui.label_review.main: lets QtWebEngineWidgets be imported lazily
-# after the QApplication exists (embedded "Rerun map" panel tests).
-QtCore.QCoreApplication.setAttribute(
-    QtCore.Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+from PyQt6 import QtWidgets
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -147,10 +142,11 @@ class FakePropagateWorker:
     def __init__(self, frame_index, start_frame_idx, seeds, tmp_dir,
                  model_path, device, conf, method="memory",
                  min_iou=0.3, min_seed_iou=0.2, end_frame_idx=None,
-                 parent=None):
+                 imgsz=None, quantize=None, parent=None):
         self.kw = dict(start_frame_idx=start_frame_idx, seeds=seeds,
                        method=method, min_iou=min_iou,
-                       min_seed_iou=min_seed_iou, end_frame_idx=end_frame_idx)
+                       min_seed_iou=min_seed_iou, end_frame_idx=end_frame_idx,
+                       imgsz=imgsz, quantize=quantize)
         self.frame_done_signal = FakeSig()
         self.progress_signal = FakeSig()
         self.stage_signal = FakeSig()

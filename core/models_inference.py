@@ -87,8 +87,11 @@ except ImportError:
 _SAM_PREDICTOR_CACHE: Dict[Tuple, Any] = {}
 
 
-def _get_sam_predictor(model_path, device: str, quantize=None):
-    """Cached Ultralytics SAM predictor for (model_path, device, quantize)."""
+def _get_sam_predictor(model_path, device: str, quantize=None, imgsz=None):
+    """Cached Ultralytics SAM predictor for (model_path, device, quantize).
+
+    ``imgsz`` is forwarded per-call in predict_kwargs (the SAM.predict
+    override defaults to 1024), so it is not part of the cache key."""
     from ultralytics import SAM
     key = (str(model_path), str(device), quantize)
     model = _SAM_PREDICTOR_CACHE.get(key)
@@ -101,15 +104,19 @@ def _get_sam_predictor(model_path, device: str, quantize=None):
 _SAM3_SEMANTIC_CACHE: Dict[Tuple, Any] = {}
 
 
-def _get_sam3_semantic_predictor(model_path, device: str, quantize=None):
+def _get_sam3_semantic_predictor(model_path, device: str, quantize=None,
+                                 imgsz=None):
     """Cached Ultralytics SAM3SemanticPredictor (text-prompted SAM3).
 
     Same cache rationale as _get_sam_predictor. Text embeddings are cached
     inside the predictor per query string, so repeated clicks with the same
-    category skip the text-encoder forward pass.
-    """
+    category skip the text-encoder forward pass. ``imgsz`` IS part of the
+    cache key here: it is baked into the predictor's overrides (the
+    letterbox in pre_transform reads predictor.imgsz, which only updates
+    via setup_source at construction)."""
     from ultralytics.models.sam import SAM3SemanticPredictor
-    key = (str(model_path), str(device), quantize)
+    key = (str(model_path), str(device), quantize, None if imgsz is None
+           else int(imgsz))
     predictor = _SAM3_SEMANTIC_CACHE.get(key)
     if predictor is None:
         overrides = dict(task="segment", mode="predict",
@@ -117,6 +124,8 @@ def _get_sam3_semantic_predictor(model_path, device: str, quantize=None):
                          verbose=False)
         if quantize is not None:
             overrides["quantize"] = quantize
+        if imgsz is not None:
+            overrides["imgsz"] = int(imgsz)
         predictor = SAM3SemanticPredictor(overrides=overrides)
         _SAM3_SEMANTIC_CACHE[key] = predictor
     return predictor
@@ -152,7 +161,7 @@ def _select_masks_at_points(masks: List[np.ndarray],
 
 def _sam3_text_guided_point_masks(image, image_file, points, point_labels,
                                   text, model_path, device, conf, quantize,
-                                  log_callback=None):
+                                  log_callback=None, imgsz=None):
     """Category + point segmentation: run SAM3 semantic detection with the
     category name as the text prompt, then keep only the instance mask(s)
     under the clicked point(s).
@@ -161,7 +170,8 @@ def _sam3_text_guided_point_masks(image, image_file, points, point_labels,
     nothing at the points (caller falls back to pure point prompting).
     """
     try:
-        predictor = _get_sam3_semantic_predictor(model_path, device, quantize)
+        predictor = _get_sam3_semantic_predictor(model_path, device, quantize,
+                                                 imgsz)
         predictor.args.conf = conf  # per-call threshold (predictor is cached)
         results = predictor(source=str(image_file), text=[text])
     except Exception as e:
@@ -211,6 +221,7 @@ def run_sam3(
     device: str = "cuda",
     conf: float = 0.25,
     quantize: Optional[int] = None,
+    imgsz: Optional[int] = None,
     save: bool = False,
     points: Optional[List[List[float]]] = None,
     point_labels: Optional[List[int]] = None,
@@ -240,7 +251,14 @@ def run_sam3(
                        If None, defaults to './core/sam3/models/sam3-model/sam3.pt'.
         device       : 'cuda' or 'cpu' (string).
         conf         : Confidence threshold for segmentation mask.
-        quantize     : INT8 / INT16 quantization (None to disable).
+        quantize     : INT8 / INT16 quantization (None to disable). 16 = FP16
+                       (~1.5-2x faster on GPU, negligible accuracy change).
+        imgsz        : Inference image size (square). None = library default
+                       (1024 for the interactive bbox model — the letterbox
+                       rounds to 1036 — and 644 for the semantic model).
+                       Smaller sizes (e.g. 644/770) trade a little mask
+                       accuracy for a large speedup. Rounded to a multiple
+                       of the model's stride (14) by ultralytics.
         save         : Whether Ultralytics should save annotated images.
         points       : Optional list of [x, y] pixel coordinates used as
                        SAM2-style positive point prompts (ignored when bboxes
@@ -319,7 +337,7 @@ def run_sam3(
         if points is not None and text:
             guided = _sam3_text_guided_point_masks(
                 image, image_file, points, point_labels, text,
-                model_path, device, conf, quantize, log_callback)
+                model_path, device, conf, quantize, log_callback, imgsz)
             if guided is not None:
                 detections, masks_array = guided
                 text_guided = True
@@ -354,6 +372,10 @@ def run_sam3(
             # Note: SAM3 does not support 'text' parameter - it uses bboxes as exemplars only
             if quantize is not None:
                 predict_kwargs["quantize"] = quantize
+            if imgsz is not None:
+                # The SAM.predict override defaults to imgsz=1024 (rounded to
+                # 1036 at setup_source); an explicit value overrides it.
+                predict_kwargs["imgsz"] = int(imgsz)
 
             model = _get_sam_predictor(model_path, device, quantize)
 
@@ -383,7 +405,7 @@ def run_sam3(
         for result in results:
             # Extract bounding boxes (primary detection output)
             if hasattr(result, 'boxes') and result.boxes is not None and len(result.boxes) > 0:
-                boxes = result.boxes.xyxy.cpu().numpy()
+                boxes = result.boxes.xyxy.cpu().numpy().astype(np.float64)
 
                 # Get class IDs to map to concepts
                 if hasattr(result.boxes, 'cls'):
@@ -393,7 +415,7 @@ def run_sam3(
 
                 # Get confidence scores if available
                 if hasattr(result.boxes, 'conf'):
-                    confidences = result.boxes.conf.cpu().numpy()
+                    confidences = result.boxes.conf.cpu().numpy().astype(np.float64)
                 else:
                     confidences = np.ones(len(boxes))
 

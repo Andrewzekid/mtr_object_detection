@@ -29,7 +29,7 @@ def test_segment_concepts_iou_pairing(workers, monkeypatch):
     m_right[7:9, 7:9] = True
 
     def fake_run_sam3(image_path, bboxes, concepts, model_path, device,
-                      conf):
+                      conf, **kw):
         # deliberately return detections in reversed order
         return _ok_result(
             [{"bbox": [7, 7, 9, 9]}, {"bbox": [1, 1, 3, 3]}],
@@ -117,7 +117,7 @@ def test_segment_concepts_cuda_oom_retries_on_cpu(workers, monkeypatch):
     calls = []
 
     def fake_run_sam3(image_path, bboxes, concepts, model_path, device,
-                      conf):
+                      conf, **kw):
         calls.append(device)
         if device != "cpu":
             raise RuntimeError("CUDA out of memory")
@@ -148,7 +148,7 @@ def test_segment_concepts_oom_in_returned_error_retries(workers,
     calls = []
 
     def fake_run_sam3(image_path, bboxes, concepts, model_path, device,
-                      conf):
+                      conf, **kw):
         calls.append(device)
         if device != "cpu":
             return {"success": False, "error": "CUDA out of memory"}
@@ -362,7 +362,7 @@ def test_batch_worker_all_frames(sam3_on, workers, monkeypatch, tmp_path):
 
 
 def test_autolabel_worker_maps_cat_ids(sam3_on, workers, monkeypatch):
-    def fake_fallback(image_path, concepts, model_path, device, conf):
+    def fake_fallback(image_path, concepts, model_path, device, conf, **kw):
         return ([{"label": "monitor", "bbox_xyxy": [0, 0, 4, 4],
                   "mask": None, "confidence": 0.9},
                  {"label": "???", "bbox_xyxy": [5, 5, 9, 9],
@@ -518,7 +518,7 @@ def test_propagate_worker_chain_mode(sam3_on, workers, monkeypatch, tmp_path):
     """Chain mode calls _propagate_step per alive seed per frame, emits the
     same frame_done contract, and never builds an mp4."""
     def fake_step(img_path, prev, concept, model_path, device, conf,
-                  min_iou, seed_bbox_xyxy, min_seed_iou):
+                  min_iou, seed_bbox_xyxy, min_seed_iou, **kw):
         # Drift 1px right per frame so we can verify the chain advances.
         x1, y1, x2, y2 = prev
         return {
@@ -557,7 +557,7 @@ def test_propagate_worker_chain_lost_seed_stops(sam3_on, workers, monkeypatch,
     calls = []
 
     def fake_step(img_path, prev, concept, model_path, device, conf,
-                  min_iou, seed_bbox_xyxy, min_seed_iou):
+                  min_iou, seed_bbox_xyxy, min_seed_iou, **kw):
         calls.append((concept, list(prev)))
         # First call (seed 0, frame 1) reports lost.
         if len(calls) == 1:
@@ -589,7 +589,7 @@ def test_propagate_worker_chain_cancel(sam3_on, workers, monkeypatch,
                                        tmp_path):
     """Cancel is honored between frames in chain mode."""
     def fake_step(img_path, prev, concept, model_path, device, conf,
-                  min_iou, seed_bbox_xyxy, min_seed_iou):
+                  min_iou, seed_bbox_xyxy, min_seed_iou, **kw):
         x1, y1, x2, y2 = prev
         return {"bbox_xyxy": [x1 + 1, y1, x2 + 1, y2],
                 "mask": None, "confidence": 0.9}, device
@@ -618,7 +618,7 @@ def test_propagate_worker_chain_passes_iou_thresholds(sam3_on, workers,
     seen = {}
 
     def fake_step(img_path, prev, concept, model_path, device, conf,
-                  min_iou, seed_bbox_xyxy, min_seed_iou):
+                  min_iou, seed_bbox_xyxy, min_seed_iou, **kw):
         seen["min_iou"] = min_iou
         seen["min_seed_iou"] = min_seed_iou
         return None, device

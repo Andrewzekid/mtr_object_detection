@@ -12,6 +12,7 @@ entity is now derived as a sibling of the map point cloud.
 import os
 import sqlite3
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -185,3 +186,176 @@ class TestMarkerEntityDerivation:
     def test_fallback_for_missing_recording(self, map_rrd):
         path, _ = map_rrd
         assert RerunLogger._find_marker_entity(path, "nope") == MARKER_ENTITY
+
+
+class TestMapBlueprint:
+    def test_default_blueprint_is_single_3d_map_view(self):
+        """The viewer opens on the 3D map: the sent blueprint is one
+        Spatial3DView rooted at the map cloud's directory (the markers'
+        parent), leaving out the camera image/depth 2D views."""
+        pytest.importorskip("rerun")
+        logger = RerunLogger()
+        logger._marker_entity = "world/leveled/camera_init/annotated_frames"
+        sent = []
+        logger._stream = types.SimpleNamespace(send_blueprint=sent.append)
+        logger._send_map_blueprint()
+        (view,) = sent[0].root_container.contents
+        assert type(view).__name__ == "Spatial3DView"
+        assert view.origin == "/world/leveled/camera_init"
+        # the camera-body subtree is excluded from the default map view
+        assert list(view.contents) == ["+ $origin/**", "- $origin/body/**"]
+
+
+class TestAutoLevel:
+    """Auto-levelling: on open, the map cloud's ground plane is fitted and
+    a corrective static transform is derived for the ancestor carrying the
+    recorded (mis-)levelling transform, so the map renders flat."""
+
+    @staticmethod
+    def _quat_about_y(deg):
+        rad = np.radians(deg)
+        return [0.0, float(np.sin(rad / 2)), 0.0, float(np.cos(rad / 2))]
+
+    @staticmethod
+    def _quat_to_R(q):
+        x, y, z, w = q
+        return np.array([
+            [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+            [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+            [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]])
+
+    @pytest.fixture()
+    def tilted_rrd(self, tmp_path):
+        """Cloud whose ground plane is tilted -7 deg about Y, under a
+        recorded 'leveled' transform of +20 deg (net displayed tilt 13)."""
+        rr = pytest.importorskip("rerun")
+        path = tmp_path / "tilted.rrd"
+        rec = rr.RecordingStream("test_app", recording_id="test_rec")
+        rec.save(str(path))
+        rec.log("world/leveled",
+                rr.Transform3D(rotation=rr.Quaternion(
+                    xyzw=self._quat_about_y(20.0))),
+                static=True)
+        rng = np.random.default_rng(0)
+        gx, gy = np.meshgrid(np.linspace(-5, 5, 30), np.linspace(-5, 5, 30))
+        flat = np.stack([gx.ravel(), gy.ravel(),
+                         rng.normal(0, 0.02, gx.size)], axis=1)
+        tilted = flat @ self._quat_to_R(self._quat_about_y(-7.0)).T
+        rec.log("world/leveled/camera_init/colored_map",
+                rr.Points3D(tilted), static=True)
+        rec.flush()
+        return str(path), "test_rec"
+
+    def test_correction_levels_the_map(self, tilted_rrd):
+        path, rec_id = tilted_rrd
+        entity, level = RerunLogger._inspect_recording(path, rec_id)
+        assert entity == "world/leveled/camera_init/annotated_frames"
+        assert level is not None
+        target, quat, trans = level
+        # the override lands on the ancestor carrying the recorded transform
+        assert target == "world/leveled"
+        # applying the override INSTEAD of the recorded transform (static
+        # last-wins) levels the cloud: its ground normal becomes +Z
+        r_new = self._quat_to_R(quat)
+        n_local = self._quat_to_R(self._quat_about_y(-7.0)) @ [0, 0, 1.0]
+        n_disp = r_new @ n_local
+        assert np.degrees(np.arccos(np.clip(n_disp[2], -1, 1))) < 0.5
+        # and the map stays in place: the displayed position of the
+        # ground slice's centroid is preserved by the correction
+        rng = np.random.default_rng(0)
+        gx, gy = np.meshgrid(np.linspace(-5, 5, 30), np.linspace(-5, 5, 30))
+        flat = np.stack([gx.ravel(), gy.ravel(),
+                         rng.normal(0, 0.02, gx.size)], axis=1)
+        tilted = flat @ self._quat_to_R(self._quat_about_y(-7.0)).T
+        low = tilted[tilted[:, 2] <= np.quantile(tilted[:, 2], 0.15)]
+        c = low.mean(axis=0)
+        r_old = self._quat_to_R(self._quat_about_y(20.0))
+        np.testing.assert_allclose(r_new @ c + np.asarray(trans),
+                                   r_old @ c, atol=0.05)
+
+    def test_level_map_is_left_alone(self, tmp_path):
+        rr = pytest.importorskip("rerun")
+        path = tmp_path / "level.rrd"
+        rec = rr.RecordingStream("test_app", recording_id="test_rec")
+        rec.save(str(path))
+        rng = np.random.default_rng(1)
+        gx, gy = np.meshgrid(np.linspace(-5, 5, 30), np.linspace(-5, 5, 30))
+        flat = np.stack([gx.ravel(), gy.ravel(),
+                         rng.normal(0, 0.02, gx.size)], axis=1)
+        rec.log("world/leveled/camera_init/colored_map",
+                rr.Points3D(flat), static=True)
+        rec.flush()
+        _, level = RerunLogger._inspect_recording(str(path), "test_rec")
+        assert level is None
+
+    def test_tilt_without_recorded_transform_targets_cloud_parent(
+            self, tmp_path):
+        rr = pytest.importorskip("rerun")
+        path = tmp_path / "bare.rrd"
+        rec = rr.RecordingStream("test_app", recording_id="test_rec")
+        rec.save(str(path))
+        rng = np.random.default_rng(2)
+        gx, gy = np.meshgrid(np.linspace(-5, 5, 30), np.linspace(-5, 5, 30))
+        flat = np.stack([gx.ravel(), gy.ravel(),
+                         rng.normal(0, 0.02, gx.size)], axis=1)
+        tilted = flat @ self._quat_to_R(self._quat_about_y(-12.0)).T
+        rec.log("world/leveled/camera_init/colored_map",
+                rr.Points3D(tilted), static=True)
+        rec.flush()
+        _, level = RerunLogger._inspect_recording(str(path), "test_rec")
+        assert level is not None
+        target, quat, _ = level
+        assert target == "world/leveled/camera_init"
+        n_disp = self._quat_to_R(quat) @ \
+            (self._quat_to_R(self._quat_about_y(-12.0)) @ [0, 0, 1.0])
+        assert np.degrees(np.arccos(np.clip(n_disp[2], -1, 1))) < 0.5
+
+    def test_apply_logs_static_transform(self):
+        pytest.importorskip("rerun")
+        logger = RerunLogger()
+        logger._level_transform = ("world/leveled", [0, 0, 0, 1], [0, 0, 0])
+        logged = []
+        logger._stream = types.SimpleNamespace(
+            log=lambda *a, **k: logged.append((a, k)), flush=lambda: None)
+        logger._apply_level_transform()
+        (args, kwargs), = logged
+        assert args[0] == "/world/leveled"
+        assert kwargs.get("static") is True
+
+
+class TestEmbeddedReopen:
+    def test_embed_reopen_closes_external_viewer(self, monkeypatch):
+        """Re-opening a recording with embed=True (the "Rerun map" panel
+        was shown after the windowed viewer had already launched)
+        terminates the windowed process so both views don't coexist."""
+        import subprocess
+        pytest.importorskip("rerun")
+        logger = RerunLogger()
+        spawned = []
+
+        def fake_spawn(embed=False):
+            proc = subprocess.Popen(["sleep", "30"])
+            spawned.append(proc)
+            if embed:
+                logger._proc = proc
+            else:
+                logger._ext_proc = proc
+            logger._port = 1
+            return True
+
+        monkeypatch.setattr(logger, "_spawn_viewer", fake_spawn)
+        monkeypatch.setattr(logger, "_read_store_id", lambda p: ("app", None))
+        monkeypatch.setattr(logger, "_find_marker_entity",
+                            lambda p, r: MARKER_ENTITY)
+        try:
+            assert logger.open_recording("map.rrd", embed=False)
+            ext = logger._ext_proc
+            assert ext.poll() is None  # windowed viewer running
+            assert logger.open_recording("map.rrd", embed=True)
+            ext.wait(timeout=5)
+            assert ext.returncode is not None  # windowed viewer terminated
+        finally:
+            logger.shutdown()
+            for p in spawned:
+                if p.poll() is None:
+                    p.terminate()

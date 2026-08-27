@@ -1432,6 +1432,7 @@ def test_rerun_markers_labeled_with_waypoint_ids(lr, make_coco,
 
     class FakeRerun:
         rrd_path = "map.rrd"
+        win_id = None
 
         def __init__(self):
             self.markers = None
@@ -1483,44 +1484,48 @@ def test_clear_rerun_waypoints_requires_recording(lr, make_coco, make_window):
     win._on_clear_rerun_waypoints()  # no exception, no log call
 
 
-def test_open_rerun_embeds_when_panel_visible(lr, make_coco, make_window,
-                                              monkeypatch):
-    """Opening an .rrd with the "Rerun map" dock visible spawns the viewer
-    embedded (embed=True) and loads its web URL into the dock."""
+def test_open_rerun_embeds_and_reveals_panel(lr, make_coco, make_window,
+                                             monkeypatch):
+    """Opening an .rrd embeds the viewer by default (embed=True) and the
+    rerun map page replaces the image view — no external window."""
     class FakeRerun:
         def __init__(self):
             self.rrd_path = None
-            self.web_url = None
+            self.win_id = None
             self.embed_modes = []
 
         def open_recording(self, path, embed=False):
             self.embed_modes.append(embed)
             self.rrd_path = path
-            self.web_url = "http://127.0.0.1:1/?url=x" if embed else None
+            self.win_id = 0xABC if embed else None
             return True
 
     coco = make_coco([{"id": 0, "name": "x"}])
     rerun = FakeRerun()
     win = make_window(FakeIdx(6), coco, rerun_logger=rerun)
-    win._rerun_dock.show()
+    assert win._stack.currentWidget() is win._splitter  # image view
+    # Tests run on the offscreen platform — pretend X11 reparenting works.
+    monkeypatch.setattr(win, "_native_embed_available", lambda: True)
     monkeypatch.setattr(lr.QFileDialog, "getOpenFileName",
                         staticmethod(lambda *a, **k: ("map.rrd", "")))
     loaded = []
     monkeypatch.setattr(win, "_load_rerun_embedded",
-                        lambda: loaded.append(win.rerun.web_url))
+                        lambda: loaded.append(win.rerun.win_id))
     win._open_rerun_file()
     assert rerun.embed_modes == [True]
-    assert loaded == ["http://127.0.0.1:1/?url=x"]
+    assert loaded == [0xABC]
+    # The embedded map replaces the image view.
+    assert win._stack.currentWidget() is win._rerun_page
 
 
-def test_open_rerun_windowed_by_default(lr, make_coco, make_window,
-                                        monkeypatch):
-    """Dock hidden (the default): the .rrd opens in the external windowed
-    viewer (embed=False)."""
+def test_open_rerun_external_only_without_embed(lr, make_coco,
+                                                make_window, monkeypatch):
+    """When native embedding is unavailable the standalone windowed viewer
+    is the fallback (embed=False, image view stays)."""
     class FakeRerun:
         def __init__(self):
             self.rrd_path = None
-            self.web_url = None
+            self.win_id = None
             self.embed_modes = []
 
         def open_recording(self, path, embed=False):
@@ -1531,31 +1536,59 @@ def test_open_rerun_windowed_by_default(lr, make_coco, make_window,
     coco = make_coco([{"id": 0, "name": "x"}])
     rerun = FakeRerun()
     win = make_window(FakeIdx(6), coco, rerun_logger=rerun)
+    monkeypatch.setattr(win, "_native_embed_available", lambda: False)
     monkeypatch.setattr(lr.QFileDialog, "getOpenFileName",
                         staticmethod(lambda *a, **k: ("map.rrd", "")))
     win._open_rerun_file()
     assert rerun.embed_modes == [False]
+    assert win._stack.currentWidget() is win._splitter  # stays on images
+
+
+def test_embedded_rerun_click_forwards_focus(lr, make_coco, make_window,
+                                             monkeypatch):
+    """Clicking the embedded rerun container forwards X11 keyboard focus to
+    it (so WASD camera controls work); re-activating the app window while
+    the map page is shown forwards it again."""
+    coco = make_coco([{"id": 0, "name": "x"}])
+    win = make_window(FakeIdx(6), coco)
+    calls = []
+    monkeypatch.setattr(win, "_focus_rerun_window", lambda: calls.append(1))
+    win._rerun_embedded_wid = 0xABC
+    container = QtWidgets.QWidget()
+    win._rerun_container = container
+
+    press = QtGui.QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(1, 1),
+                              Qt.MouseButton.LeftButton,
+                              Qt.MouseButton.LeftButton, NM)
+    win.eventFilter(container, press)
+    assert calls == [1]
+
+    # WindowActivate while the map page is shown forwards focus too.
+    win._show_rerun_page()
+    activate = QEvent(QEvent.Type.WindowActivate)
+    win.eventFilter(win, activate)
+    assert len(calls) == 2
+
+    # On the image page, WindowActivate does NOT forward focus.
+    win._show_image_page()
+    win.eventFilter(win, QEvent(QEvent.Type.WindowActivate))
+    assert len(calls) == 2
 
 
 def test_rerun_view_menu_switch(lr, make_coco, make_window):
-    """View → 'Switch to Rerun waypoint view' toggles the map dock and its
-    own label flips to 'Switch back to image view' while the map is shown
-    (including when the dock is closed via its ✖ button)."""
+    """View → 'Switch to Rerun waypoint view' replaces the image view with
+    the rerun map page; its label flips to 'Switch back to image view'
+    while the map is shown."""
     coco = make_coco([{"id": 0, "name": "x"}])
     win = make_window(FakeIdx(6), coco)
     act = win._act_rerun_view
     assert act.text() == "Switch to Rerun waypoint view"
-    assert not win._rerun_dock.isVisible()
+    assert win._stack.currentWidget() is win._splitter
     act.trigger()
-    assert win._rerun_dock.isVisible()
+    assert win._stack.currentWidget() is win._rerun_page
     assert act.text() == "Switch back to image view"
     act.trigger()
-    assert not win._rerun_dock.isVisible()
-    assert act.text() == "Switch to Rerun waypoint view"
-    # Closing the dock directly resets the menu label too.
-    win._rerun_dock.show()
-    assert act.text() == "Switch back to image view"
-    win._rerun_dock.hide()
+    assert win._stack.currentWidget() is win._splitter
     assert act.text() == "Switch to Rerun waypoint view"
 
 

@@ -796,7 +796,10 @@ python -m gui.label_review.main --images /path/to/keyframes \
 ```
 
 All flags: `--images`, `--images-right`, `--output_json`, `--json` (seed
-COCO), `--sam3-model/--sam3-device/--sam3-conf`, `--auto-segment`
+COCO), `--sam3-model/--sam3-device/--sam3-conf`, `--sam3-imgsz` (inference
+size; smaller = faster, e.g. 770), `--sam3-quantize {8,16,32}` (16 = FP16,
+~1.5-2x faster on GPU — set once in the config's `sam3` block),
+`--auto-segment`
 (SAM3 after every drawn box), `--interp-flow-method {dis,klt,farneback}`,
 `--interp-camera-model {none,global}`, `--output-yolo-dir` (also export YOLO
 on exit), `--pose-db` (Clio poses for the Rerun map view),
@@ -819,10 +822,9 @@ next to the images it is auto-loaded.
 
 The **View** menu switches the UI theme at runtime (**dark**, **light**, or
 **pastel** lime); the choice persists across sessions. It also carries
-**Switch to Rerun waypoint view**, which swaps the image labeling view for
-the embedded rerun waypoint map (the **Rerun map** dock panel — the menu
-item becomes **Switch back to image view** while the map is shown; see
-below).
+**Switch to Rerun waypoint view**, which replaces the image labeling view
+with the embedded rerun waypoint map (the menu item becomes **Switch back
+to image view** while the map is shown; see below).
 
 ### Rerun viewer & point-cloud map
 
@@ -831,13 +833,28 @@ viewer:
 
 1. **Open rerun file…** (File menu or the sidebar's **🎬 Rerun viewer / map…**
    button) opens a `.rrd` recording — it carries the colored point-cloud
-   map, the camera images and their timestamps — in a rerun viewer. By
-   default that's a separate window; when the **Rerun map** dock panel is
-   visible (View → **Switch to Rerun waypoint view**, needs
-   `PyQt6-WebEngine` installed) the recording is instead embedded into
-   that panel via the rerun web viewer — handy on one
-   screen, though heavier and slower than the native viewer on big maps.
-   The GUI then streams into that recording.
+   map, the camera images and their timestamps — embedded in the app: the
+   native rerun viewer runs as a subprocess and its X11 window is
+   reparented into the waypoint view, which replaces the image labeling
+   view (switch back with View → **Switch back to image view**). This is
+   the full-speed native renderer, so even maps with 100M+ points stay
+   smooth. Embedding needs an X11 session (xcb) and the `xwininfo` tool —
+   standard on Linux desktops; over SSH/Wayland the recording opens in a
+   standalone viewer window instead. The viewer opens on the **3D map
+   view** by default — the camera image/depth views are left out; add
+   them back from the viewer's blueprint menu if needed. The camera-body
+   subtree (`body/camera_left`, `body/camera_right`, `body/axes`,
+   `body/cloud_body` scans) is hidden by default — re-include it from the
+   streams panel. If the recording's ground plane comes out tilted (some
+   pipelines write a "leveled" ancestor transform that doesn't actually
+   level the map), the GUI fits the map cloud's ground plane on open and
+   streams a corrective static transform, so the map renders flat — the
+   `.rrd` itself is never modified. Clicking the embedded map hands it the
+   keyboard focus,
+   so the viewer's WASD camera controls work as usual. Switching to the
+   waypoint view with a recording already open in a standalone window
+   moves it into the app (the extra window is closed). The GUI then
+   streams into that recording.
 2. **Open pose database…** (or **📍 Pose database…**) loads a Clio
    inspection SQLite DB whose `images` table holds per-timestamp
    camera/lidar poses (`--pose-db` does the same at launch).
