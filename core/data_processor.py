@@ -80,9 +80,20 @@ class DataProcessor:
     @staticmethod
     def _is_seg_label(label: List) -> bool:
         """True for YOLO segmentation labels (class_id x1 y1 x2 y2 ...),
-        False for detection labels (class_id xc yc w h)."""
+        False for detection labels (class_id xc yc w h, optionally with
+        trailing attributes like visibility/confidence).
+
+        Detection is the canonical 5-value form (4 trailing numbers);
+        anything with more numeric trailing values in an even count is a
+        polygon. A 5-value label with trailing extras can't be a polygon
+        (polygons need >= 6 coords), so it stays detection.
+        """
         n = len(label) - 1
-        return n >= 6 and n % 2 == 0
+        if n < 4:
+            return False
+        if n == 4:
+            return False
+        return n % 2 == 0
     
     def get_image_files(self, directory: Optional[Path] = None) -> List[Path]:
         """Get all image files in a directory.
@@ -100,7 +111,10 @@ class DataProcessor:
             # back to the raw directory (that would silently augment the
             # wrong images).
             return []
-        return [f for f in dir_path.iterdir() if f.suffix.lower() in self.IMAGE_EXTENSIONS]
+        # Sorted so mosaic neighbor groups (i+1..i+3) are deterministic.
+        return sorted((f for f in dir_path.iterdir()
+                       if f.suffix.lower() in self.IMAGE_EXTENSIONS),
+                      key=lambda f: f.name)
 
     def _get_labels_dir(self, directory: Optional[Path] = None) -> Path:
         """Return the labels directory for a dataset root.
@@ -156,17 +170,25 @@ class DataProcessor:
                 
                 # Apply mosaic augmentation if selected
                 if "mosaic" in self.augmentation_types and i + 3 < total:
-                    mosaic_img, mosaic_labels = self.apply_mosaic(
-                        [img, cv2.imread(str(image_files[i+1])),
-                         cv2.imread(str(image_files[i+2])), cv2.imread(str(image_files[i+3]))],
-                        [labels] + [self._read_labels(image_files[k], self.input_dir) for k in range(i+1, i+4)]
-                    )
-                    aug_name = f"{img_file.stem}_mosaic{img_file.suffix}"
-                    cv2.imwrite(str(output_images_dir / aug_name), mosaic_img)
-                    self._save_labels(output_labels_dir, f"{img_file.stem}_mosaic", mosaic_labels)
-                    total_augmented += 1
-                    if log_callback:
-                        log_callback(f"Augmented: {aug_name} (mosaic)")
+                    neighbor_imgs = [cv2.imread(str(image_files[k]))
+                                     for k in range(i + 1, i + 4)]
+                    if any(m is None for m in neighbor_imgs):
+                        errors.append(
+                            f"Skipping mosaic for {img_file.name}: could not "
+                            f"read a neighbor image")
+                    else:
+                        mosaic_img, mosaic_labels = self.apply_mosaic(
+                            [img] + neighbor_imgs,
+                            [labels] + [self._read_labels(image_files[k], self.input_dir)
+                                        for k in range(i + 1, i + 4)]
+                        )
+                        aug_name = f"{img_file.stem}_mosaic{img_file.suffix}"
+                        cv2.imwrite(str(output_images_dir / aug_name), mosaic_img)
+                        self._save_labels(output_labels_dir,
+                                          f"{img_file.stem}_mosaic", mosaic_labels)
+                        total_augmented += 1
+                        if log_callback:
+                            log_callback(f"Augmented: {aug_name} (mosaic)")
                 
                 # Generate other augmented versions
                 for aug_idx in range(self.multiplier):
@@ -214,8 +236,8 @@ class DataProcessor:
             shutil.copy2(src, self.output_dir / "classes.txt")
     
     def _read_labels(self, img_file: Path, base_dir: Path) -> List[List]:
-        """Read labels for an image file."""
-        label_file = base_dir / "labels" / f"{img_file.stem}.txt"
+        """Read labels for an image file (honours ``labels_subdir``)."""
+        label_file = base_dir / self.labels_subdir / f"{img_file.stem}.txt"
         if label_file.exists():
             with open(label_file, 'r') as f:
                 return [line.strip().split() for line in f.readlines()]
@@ -255,8 +277,9 @@ class DataProcessor:
         - YOLO segmentation: ``class_id x1 y1 x2 y2 ... xn yn``
 
         Detection boxes are rotated via their four corners, then a new axis-aligned
-        bbox is computed and filtered by area. Polygon points are rotated and
-        clamped individually.
+        bbox is computed and filtered by area. Polygon points are rotated,
+        filtered by their area change (objects mostly outside the frame are
+        dropped), then clamped to the image bounds.
         """
         rotated_labels = []
 
@@ -274,8 +297,20 @@ class DataProcessor:
                     [float(values[i]) * img_w, float(values[i + 1]) * img_h]
                     for i in range(0, n_values, 2)
                 ], dtype=np.float32)
-                rotated = self._rotate_points(pts, M, img_w, img_h)
+                ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+                rotated = (M @ np.hstack([pts, ones]).T).T
                 if rotated.shape[0] < 3:
+                    continue
+                original_area = cv2.contourArea(pts.reshape(-1, 1, 2))
+                rotated[:, 0] = np.clip(rotated[:, 0], 0, img_w)
+                rotated[:, 1] = np.clip(rotated[:, 1], 0, img_h)
+                # Rotation preserves area, so the area change comes entirely
+                # from clamping to the frame — compare the clamped (visible)
+                # area against the original and drop mostly-hidden objects.
+                visible_area = cv2.contourArea(rotated.astype(np.float32)
+                                               .reshape(-1, 1, 2))
+                if original_area > 0 and \
+                        (visible_area / original_area) < min_area_ratio:
                     continue
                 new_values = []
                 for x, y in rotated:

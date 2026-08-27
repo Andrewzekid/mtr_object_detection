@@ -164,6 +164,98 @@ class TestSegAugmentations:
         assert out.shape == self.img.shape
         assert labels == [self.poly]
 
+    def test_detection_label_with_trailing_attrs_stays_detection(self):
+        # 5 values + 1 trailing attribute (odd count) must remain detection
+        det = ["0", "0.25", "0.5", "0.2", "0.4", "0.9"]
+        assert not DataProcessor._is_seg_label(det)
+        _, labels = DataProcessor().apply_augmentation(
+            self.img, [det], "flip_horizontal")
+        assert labels[0][1] == 0.75          # xc mirrored
+        assert labels[0][5] == "0.9"         # trailing attr untouched
+
+
+class TestMosaicCustomSubdir:
+    """Mosaic must read neighbor labels from the configured subdir (#1)."""
+
+    def _make_flat(self, root, n=6, images_subdir="images",
+                   labels_subdir="labels"):
+        img_dir = root / images_subdir
+        lab_dir = root / labels_subdir
+        img_dir.mkdir(parents=True)
+        lab_dir.mkdir(parents=True)
+        for i in range(n):
+            cv2.imwrite(str(img_dir / f"{i}.png"),
+                        np.full((32, 32, 3), 100 + i, np.uint8))
+            (lab_dir / f"{i}.txt").write_text(
+                "0 0.1 0.1 0.3 0.1 0.1 0.3 0.1 0.3\n")
+        return img_dir, lab_dir
+
+    def test_mosaic_reads_labels_from_custom_subdir(self, tmp_path):
+        dp = DataProcessor({
+            "input_dir": str(tmp_path / "in"),
+            "output_dir": str(tmp_path / "out"),
+            "augmentation_types": ["mosaic"],
+            "multiplier": 0,
+            "images_subdir": "train/images",
+            "labels_subdir": "train/labels",
+        })
+        self._make_flat(tmp_path / "in", n=6, images_subdir="train/images",
+                        labels_subdir="train/labels")
+        result = dp.augment_dataset()
+        assert result["success"], result
+        mosaic_label = tmp_path / "out" / "train" / "labels" / "0_mosaic.txt"
+        assert mosaic_label.exists()
+        lines = [l.split() for l in mosaic_label.read_text().splitlines() if l.strip()]
+        # 4 sources x 1 polygon each
+        assert len(lines) == 4
+        # quadrant transform: first source polygon in top-left quadrant
+        first = [float(v) for v in lines[0]]
+        assert first[1] == pytest.approx(0.05)   # 0.1/2 + 0
+        assert first[2] == pytest.approx(0.05)
+
+    def test_mosaic_skips_unreadable_neighbor(self, tmp_path):
+        dp = DataProcessor({
+            "input_dir": str(tmp_path / "in"),
+            "output_dir": str(tmp_path / "out"),
+            "augmentation_types": ["mosaic"],
+            "multiplier": 0,
+        })
+        self._make_flat(tmp_path / "in", n=6)
+        # sorted order 0..5; mosaic groups: 0->(1,2,3), 1->(2,3,4), 2->(3,4,5)
+        (tmp_path / "in" / "images" / "4.png").write_bytes(b"not an image")
+        result = dp.augment_dataset()
+        # mosaic for 1 and 2 (which need image 4) is skipped, group 0 proceeds
+        assert (tmp_path / "out" / "labels" / "0_mosaic.txt").exists()
+        assert not (tmp_path / "out" / "labels" / "1_mosaic.txt").exists()
+        assert not (tmp_path / "out" / "labels" / "2_mosaic.txt").exists()
+        assert any("mosaic" in e for e in result["errors"])
+
+
+class TestRotatePolygonAreaGuard:
+    """Rotated polygons mostly outside the frame are dropped (#3)."""
+
+    def test_mostly_out_of_frame_polygon_dropped(self):
+        dp = DataProcessor({"rotation_range": (45, 45)})
+        img = np.zeros((100, 100, 3), np.uint8)
+        # square flush in the top-right corner; 45deg rotation around the
+        # image center throws all of it above the top edge -> visible area
+        # collapses to ~0 -> dropped
+        poly = ["0", "0.9", "0.0", "1.0", "0.0", "1.0", "0.1", "0.9", "0.1"]
+        _, out = dp.apply_augmentation(img, [poly], "rotate")
+        assert out == []
+
+    def test_centered_polygon_survives_rotation(self):
+        dp = DataProcessor({"rotation_range": (15, 15)})
+        img = np.zeros((100, 100, 3), np.uint8)
+        # centered polygon stays inside the frame after a small rotation
+        poly = ["0", "0.3", "0.3", "0.7", "0.3", "0.7", "0.7", "0.3", "0.7"]
+        _, out = dp.apply_augmentation(img, [poly], "rotate")
+        assert len(out) == 1
+        # still a valid polygon: >= 6 even coords within [0, 1]
+        coords = [float(v) for v in out[0][1:]]
+        assert len(coords) % 2 == 0
+        assert all(-1e-6 <= v <= 1 + 1e-6 for v in coords)
+
 
 # ---------------------------------------------------------------------------
 # COCO -> flat YOLO-seg converter
