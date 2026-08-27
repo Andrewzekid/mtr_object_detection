@@ -1,7 +1,14 @@
 # Object Detection Application
 
-A desktop application and CLI pipeline for object detection / segmentation
-training and inference, built with PyQt6 and Ultralytics YOLO.
+An end-to-end pipeline that turns raw robot footage (Metacam rosbags or
+plain image folders) into a trained instance-segmentation model and
+tracked output videos. Frames are undistorted, sampled and keyframed; a
+Qwen VLM server seeds the initial bounding boxes; then a PyQt6 review
+GUI — the one human step — where you fix boxes, segment them with SAM3
+(bbox prompts, with point prompts as fallback) and propagate labels
+across frames. The reviewed labels are assembled into a YOLO-seg dataset
+(augment + split), trained with Ultralytics YOLO, evaluated per class,
+and run through DeepOCSort tracking.
 
 ---
 
@@ -60,9 +67,11 @@ the **label-review GUI** on the keyframes.
 
 ### Step 3 — review labels in the GUI (the only human step)
 
-Fix/remove wrong boxes, segment with SAM3 (`Re-segment`, point prompt 🎯,
-Propagate), autolabel missing categories, discard bad frames, then **save**
-and close. The pipeline resumes by itself.
+Fix the seeded boxes (delete/draw/adjust), segment them from the box
+prompts with SAM3 (`Re-segment`; adjust the box and re-segment if the
+mask is off, or use the 🎯 point prompt when boxes don't segment well),
+propagate across frames, discard bad frames, then **save** and close.
+The pipeline resumes by itself.
 
 If you closed without saving, re-run just the GUI stage:
 
@@ -920,16 +929,27 @@ frames; the slider scrubs the sequence (progress saved on release).
 
 ### Recommended labeling workflow
 
+The GUI loop is **box first, then segment**:
+
 1. Qwen seeds boxes on keyframes → GUI opens on them.
-2. Per frame: fix/remove wrong boxes (`D`), add missed ones (`A`),
-   re-segment edited boxes (`R`) so masks match the moved boxes.
-3. Sparse footage? Label every ~10th keyframe, then `I` interpolate between
-   anchors, or select a good box and `Propagate →` for masks over long gaps.
-4. Missing a whole category? Highlight it in the category list and
-   **Autolabel ALL frames** with SAM3/Falcon.
-5. 🚫 Discard blurry/broken frames; ✔ mark empty-but-checked ones.
-6. `Ctrl+S` save (or `S` save-and-quit). Discarded frames are excluded from
-   the final COCO; stereo sessions save only timestamp-synced pairs.
+2. Per frame, fix the boxes first: delete wrong ones (`D`), draw missed
+   ones (`A`), move/resize the ones that are off.
+3. Segment from the bbox prompts: **Run SAM3 (all)** segments every box
+   on the frame; **Re-seg sel (`R`)** re-segments just the selected
+   box(es).
+4. Mask not right? Adjust the bbox and segment again (`R`) — the box is
+   the prompt, so a tighter box gives a tighter mask.
+5. Box segment still not working (thin or irregular objects)? Switch to
+   **🎯 Add points**: click +/− points on the object, then **▶ Segment
+   points** to run SAM3 once with all of them.
+6. Sparse footage? Label every ~10th keyframe, then `I` interpolate
+   between anchors, or select a good box and `Propagate →` for masks
+   over long gaps (with a ★ keyframe marked, propagation stops there).
+7. Missing a whole category? Highlight it in the category list and
+   **Autolabel ALL frames**.
+8. 🚫 Discard blurry/broken frames; ✔ mark empty-but-checked ones.
+9. `Ctrl+S` save (or `S` save-and-quit). Discarded frames are excluded
+   from the final COCO; stereo sessions save only timestamp-synced pairs.
 
 ### Settings dialog (⚙ Config / Ctrl+G)
 
