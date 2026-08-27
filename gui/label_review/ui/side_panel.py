@@ -396,9 +396,11 @@ class SidePanel(QWidget):
         self.btn_propagate.setToolTip(
             "Propagate the selected boxes' tracks forward: SAM3 re-detects "
             "each object on every following frame (chained from the "
-            "previous frame's box), keeping the same track id. Each track "
-            "stops when its object is lost; multiple selected tracks run "
-            "one at a time. Select one or more boxes first.")
+            "previous frame's box), keeping the same track id. When a later "
+            "★ keyframe is marked, the run stops at that keyframe instead "
+            "of running to the end. Each track stops when its object is "
+            "lost; multiple selected tracks run one at a time. Select one "
+            "or more boxes first.")
         self.btn_propagate.setEnabled(False)  # needs a selected box
         self.btn_propagate.clicked.connect(self.propagate_clicked.emit)
         layout.addWidget(self.btn_propagate)

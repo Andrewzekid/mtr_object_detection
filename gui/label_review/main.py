@@ -136,7 +136,10 @@ and category. Object identity comes from the memory bank — there is no
 per-frame re-detection or IoU chaining. A track that yields an empty
 mask is reported as lost from that frame on (the memory bank may still
 recover it on later frames); frames that already have a box with that
-track id are skipped. Propagated boxes are ordinary editable boxes with
+track id are skipped. When a later ★ keyframe is marked, the run stops at
+that keyframe instead of running to the end of the index — propagation
+only fills the frames between keyframes. Propagated boxes are ordinary
+editable boxes with
 masks plus ``propagated: true`` / ``confidence`` provenance fields; each
 side's run is one Ctrl+Z step, and edits you make while it runs stay
 separate undo entries. Propagation shares the SAM3 queue and the Cancel
@@ -273,6 +276,15 @@ config override the corresponding CLI flags. Example:
                                       // display only (box/mask coordinates
                                       // stay in original pixels).
                                       // 0 (default) = original resolution.
+      },
+      "pose_db": {
+        "match": "auto"               // how 'Show annotated in Rerun' matches
+                                      // a frame to a pose-DB row:
+                                      // auto (default) = filename column,
+                                      // then filename stem as the `id`
+                                      // column, then nearest timestamp_ns
+                                      // (within 10 s); or force "filename" /
+                                      // "filename_id" / "timestamp".
       },
       "tracking": {
         "sticky_ids": false,          // false (default): every new box gets
@@ -501,16 +513,24 @@ def main():
     # Resolve ReviewWindow through the package at call time (not a module
     # global) so tests can monkeypatch gui.label_review.ReviewWindow.
     ReviewWindow = sys.modules[__package__].ReviewWindow
+    pose_db_cfg = cfg.get("pose_db", {})
+    pose_db_match = pose_db_cfg.get("match", "auto")
+    from .map_view import PoseDb
+    if pose_db_match not in PoseDb.MATCH_MODES:
+        print(f"⚠️ config pose_db.match {pose_db_match!r} invalid "
+              f"({', '.join(PoseDb.MATCH_MODES)}); using 'auto'")
+        pose_db_match = "auto"
     pose_db = None
     if args.pose_db:
-        from .map_view import PoseDb
         try:
-            pose_db = PoseDb(args.pose_db)
-            print(f"🗺️  Pose DB loaded: {len(pose_db._ts):,} image poses")
+            pose_db = PoseDb(args.pose_db, match_mode=pose_db_match)
+            print(f"🗺️  Pose DB loaded: {len(pose_db._ts):,} image poses "
+                  f"(match: {pose_db_match})")
         except Exception as exc:
             print(f"⚠️ Could not load pose DB {args.pose_db}: {exc}")
     win = ReviewWindow(frame_index, coco,
                        pose_db=pose_db,
+                       pose_db_match=pose_db_match,
                        autolabel_detector=autolabel_cfg.get(
                            "detector", "sam3"),
                        owlv2_model=autolabel_cfg.get("owlv2_model"),

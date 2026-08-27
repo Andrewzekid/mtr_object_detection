@@ -312,6 +312,28 @@ class ConfigDialog(QtWidgets.QDialog):
         display_form.addRow("Max image size", self.spin_max_image_dim)
         body.addWidget(display_box)
 
+        # --- Rerun map / pose DB --------------------------------------------
+        map_box = QtWidgets.QGroupBox("Rerun map / pose DB")
+        map_form = QtWidgets.QFormLayout(map_box)
+        self.combo_pose_db_match = QtWidgets.QComboBox()
+        for label, data in (("Auto (filename, then id, then timestamp)",
+                             "auto"),
+                            ("Image filename = DB filename column",
+                             "filename"),
+                            ("Image filename stem = DB id column",
+                             "filename_id"),
+                            ("Image filename stem = timestamp (ns)",
+                             "timestamp")):
+            self.combo_pose_db_match.addItem(label, data)
+        self.combo_pose_db_match.setToolTip(
+            "How 'Show annotated in Rerun' matches each frame to a row in\n"
+            "the pose database. Use 'id column' when your image files are\n"
+            "named by the images-table id (e.g. 1042.jpg), 'timestamp' when\n"
+            "they are named by nanosecond timestamps. Auto tries filename,\n"
+            "then id, then timestamp. Applies to the currently open DB.")
+        map_form.addRow("Pose DB match", self.combo_pose_db_match)
+        body.addWidget(map_box)
+
         # --- Tracking ------------------------------------------------------
         self.track_box = QtWidgets.QGroupBox("Tracking")
         track_form = QtWidgets.QFormLayout(self.track_box)
@@ -429,6 +451,9 @@ class ConfigDialog(QtWidgets.QDialog):
             getattr(win, "propagate_min_seed_iou", 0.2))
         self.spin_opacity.setValue(win.side.opacity_slider.value())
         self.spin_max_image_dim.setValue(win.display_max_dim)
+        idx = self.combo_pose_db_match.findData(
+            getattr(win, "pose_db_match", "auto"))
+        self.combo_pose_db_match.setCurrentIndex(max(0, idx))
         self.check_sticky_ids.setChecked(win.coco.sticky_track_ids)
 
     def _prefill_from_config(self, cfg: Dict[str, Any]) -> None:
@@ -510,6 +535,11 @@ class ConfigDialog(QtWidgets.QDialog):
         if "max_image_dim" in display:
             self.spin_max_image_dim.setValue(
                 max(0, int(display["max_image_dim"])))
+        pose_db = cfg.get("pose_db", {})
+        if pose_db.get("match") in ("auto", "filename", "filename_id",
+                                    "timestamp"):
+            self.combo_pose_db_match.setCurrentIndex(
+                self.combo_pose_db_match.findData(pose_db["match"]))
         tracking = cfg.get("tracking", {})
         if "sticky_ids" in tracking:
             self.check_sticky_ids.setChecked(bool(tracking["sticky_ids"]))
@@ -564,6 +594,9 @@ class ConfigDialog(QtWidgets.QDialog):
             },
             "display": {
                 "max_image_dim": self.spin_max_image_dim.value(),
+            },
+            "pose_db": {
+                "match": self.combo_pose_db_match.currentData(),
             },
             "tracking": {
                 "sticky_ids": self.check_sticky_ids.isChecked(),

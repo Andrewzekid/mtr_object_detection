@@ -1,9 +1,10 @@
 """Pose database support for the Rerun view.
 
 :class:`PoseDb` - Clio inspection DB lookup: per-image ``cam_tf`` /
-lidar ``tf`` poses keyed by ``timestamp_ns`` (with an ``is_left`` side
-column), used to place annotated frames on the map of an opened .rrd
-recording (see rerun_logger.py).
+lidar ``tf`` poses, matched to frames by ``filename`` column, numeric
+filename stem as the ``id`` column, or nearest ``timestamp_ns`` (see
+``PoseDb.MATCH_MODES``), used to place annotated frames on the map of an
+opened .rrd recording (see rerun_logger.py).
 """
 
 from __future__ import annotations
@@ -32,9 +33,19 @@ class PoseDb:
     _QUERY = (
         "SELECT timestamp_ns, "
         "cam_tf_translation_x, cam_tf_translation_y, cam_tf_translation_z, "
-        "tf_translation_x, tf_translation_y, tf_translation_z{filename} "
+        "tf_translation_x, tf_translation_y, tf_translation_z{extra} "
         "FROM images"
     )
+
+    # How a frame is matched to a DB row in pose_for:
+    #   "auto"        — filename column, then numeric filename stem as the
+    #                   `id` column, then nearest timestamp (guarded)
+    #   "filename"    — exact match of the image file name against the
+    #                   DB's `filename` column only
+    #   "filename_id" — numeric filename stem (1042.jpg -> 1042) matched
+    #                   against the DB's `id` column only
+    #   "timestamp"   — nearest timestamp_ns only (guarded)
+    MATCH_MODES = ("auto", "filename", "filename_id", "timestamp")
 
     # Timestamp fallback is only trusted within this window: image folders
     # with sequential names (1000.jpg, ...) get misparsed as nanosecond
@@ -42,14 +53,18 @@ class PoseDb:
     # every frame to the first pose instead of failing loudly.
     MAX_TIMESTAMP_DT_NS = 10_000_000_000  # 10 s
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, match_mode: str = "auto"):
+        if match_mode not in self.MATCH_MODES:
+            raise ValueError(f"match_mode must be one of {self.MATCH_MODES}, "
+                             f"got {match_mode!r}")
+        self.match_mode = match_mode
         self.path = str(db_path)
         con = sqlite3.connect(self.path)
         try:
             cols = {r[1] for r in con.execute("PRAGMA table_info(images)")}
-            has_filename = "filename" in cols
+            extra = [c for c in ("id", "filename") if c in cols]
             rows = con.execute(self._QUERY.format(
-                filename=", filename" if has_filename else "")).fetchall()
+                extra=", " + ", ".join(extra) if extra else "")).fetchall()
         finally:
             con.close()
         if not rows:
@@ -66,15 +81,25 @@ class PoseDb:
         self._pos = self._pos[order]
         self._pos_lidar = self._pos_lidar[order]
         self._valid = self._valid[order]
-        # Exact filename -> sorted row index (DBs from the inspection
-        # pipeline carry the image file name, e.g. '1042.jpg').
+        # Exact-key -> sorted row index maps. DBs from the inspection
+        # pipeline carry the image file name ('1042.jpg') and/or a numeric
+        # `id` that exported image folders use as their file stem.
         self._by_filename = {}
-        if has_filename:
-            names = [r[7] for r in rows]
-            for old_i, name in enumerate(names):
-                if name and os.path.basename(str(name)) not in self._by_filename:
-                    new_i = int(np.flatnonzero(order == old_i)[0])
-                    self._by_filename[os.path.basename(str(name))] = new_i
+        self._by_id = {}
+        if extra:
+            id_col = extra.index("id") if "id" in extra else None
+            name_col = extra.index("filename") if "filename" in extra else None
+            for old_i, r in enumerate(rows):
+                new_i = int(np.flatnonzero(order == old_i)[0])
+                if name_col is not None:
+                    name = r[7 + name_col]
+                    key = os.path.basename(str(name)) if name else None
+                    if key and key not in self._by_filename:
+                        self._by_filename[key] = new_i
+                if id_col is not None:
+                    row_id = r[7 + id_col]
+                    if row_id is not None and int(row_id) not in self._by_id:
+                        self._by_id[int(row_id)] = new_i
         if not self._valid.any():
             raise ValueError(f"{self.path}: no cam_tf poses found")
 
@@ -86,14 +111,10 @@ class PoseDb:
             return lidar
         return None
 
-    def pose_for(self, file_name: Optional[str],
-                 timestamp_ns: Optional[int]) -> Optional[np.ndarray]:
-        """Pose for a frame: exact filename match first, then nearest
-        timestamp (rejected when further than MAX_TIMESTAMP_DT_NS)."""
-        if file_name:
-            i = self._by_filename.get(os.path.basename(str(file_name)))
-            if i is not None:
-                return self._pose_at_row(i)
+    def _pose_by_timestamp(self, timestamp_ns: Optional[int]
+                           ) -> Optional[np.ndarray]:
+        """Nearest pose for a timestamp; None when further than
+        MAX_TIMESTAMP_DT_NS (likely a misparsed sequential filename)."""
         if timestamp_ns is None:
             return None
         i = int(np.searchsorted(self._ts, int(timestamp_ns)))
@@ -110,8 +131,28 @@ class PoseDb:
             return None
         return self._pose_at_row(best)
 
+    def pose_for(self, file_name: Optional[str],
+                 timestamp_ns: Optional[int]) -> Optional[np.ndarray]:
+        """Pose for a frame, matched per ``match_mode`` (see MATCH_MODES)."""
+        mode = self.match_mode
+        if file_name and mode in ("auto", "filename"):
+            i = self._by_filename.get(os.path.basename(str(file_name)))
+            if i is not None:
+                return self._pose_at_row(i)
+            if mode == "filename":
+                return None
+        if file_name and mode in ("auto", "filename_id"):
+            stem = os.path.splitext(os.path.basename(str(file_name)))[0]
+            if stem.isdigit():
+                i = self._by_id.get(int(stem))
+                if i is not None:
+                    return self._pose_at_row(i)
+            if mode == "filename_id":
+                return None
+        if mode in ("auto", "timestamp"):
+            return self._pose_by_timestamp(timestamp_ns)
+        return None
+
     def pose_at(self, timestamp_ns: Optional[int]) -> Optional[np.ndarray]:
         """Nearest pose (3-vector) for a timestamp; None when out of range."""
-        if timestamp_ns is None:
-            return None
-        return self.pose_for(None, timestamp_ns)
+        return self._pose_by_timestamp(timestamp_ns)

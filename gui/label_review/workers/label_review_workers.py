@@ -722,6 +722,11 @@ class SAM3PropagateWorker(QThread):
     own result is consumed but not emitted (those boxes already exist).
     Cancel is cooperative, checked between frames; the temp mp4 (memory
     mode) is removed on every exit.
+
+    ``end_frame_idx`` bounds the run to ``range(start, end)`` (exclusive);
+    the GUI sets it just past the next marked keyframe so propagation only
+    covers the frames between keyframes instead of running to the end of
+    the index.
     """
 
     frame_done_signal = pyqtSignal(int, object)  # frame_idx, [det|None] *
@@ -738,6 +743,7 @@ class SAM3PropagateWorker(QThread):
                  method: str = "memory",
                  min_iou: float = _PROPAGATE_MIN_IOU,
                  min_seed_iou: float = _PROPAGATE_MIN_SEED_IOU,
+                 end_frame_idx: Optional[int] = None,
                  parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
@@ -750,6 +756,7 @@ class SAM3PropagateWorker(QThread):
         self.method = method
         self.min_iou = min_iou
         self.min_seed_iou = min_seed_iou
+        self.end_frame_idx = end_frame_idx  # exclusive; None = end of index
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -837,17 +844,19 @@ class SAM3PropagateWorker(QThread):
             return
         os.makedirs(self.tmp_dir, exist_ok=True)
         n_frames = len(self.frame_index)
-        total = n_frames - self.start_frame_idx - 1
+        end = (min(n_frames, self.end_frame_idx)
+               if self.end_frame_idx is not None else n_frames)
+        total = end - self.start_frame_idx - 1
         if total <= 0:
             self.finished_signal.emit(0, {})
             return
         if self.method == "chain":
-            self._run_chain(n_frames, total)
+            self._run_chain(end, total)
             return
         video_path = os.path.join(self.tmp_dir, "propagate_clip.mp4")
         frame_idx = self.start_frame_idx
         try:
-            if not self._build_clip(video_path, n_frames):
+            if not self._build_clip(video_path, end):
                 self.cancelled_signal.emit()
                 return
             self.stage_signal.emit(
@@ -896,10 +905,10 @@ class SAM3PropagateWorker(QThread):
             except OSError:
                 pass
         lost = {i: last_seen[i] + 1 for i in range(len(self.seeds))
-                if last_seen[i] < n_frames - 1}
+                if last_seen[i] < end - 1}
         self.finished_signal.emit(n_found, lost)
 
-    def _run_chain(self, n_frames: int, total: int) -> None:
+    def _run_chain(self, end: int, total: int) -> None:
         """Frame-by-frame re-detection with IoU chaining (classic method).
 
         Frames outer, seeds inner: each still-alive seed re-detects via
@@ -915,7 +924,7 @@ class SAM3PropagateWorker(QThread):
             prev = [list(s["bbox_xyxy"]) for s in self.seeds]
             lost: Dict[int, int] = {}
             for step, frame_idx in enumerate(
-                    range(self.start_frame_idx + 1, n_frames), start=1):
+                    range(self.start_frame_idx + 1, end), start=1):
                 if self._cancel_requested:
                     self.cancelled_signal.emit()
                     return

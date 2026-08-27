@@ -171,7 +171,10 @@ the assistants below depending on the footage.
   session, can recover after temporary loss) and `chain` (re-detect each
   frame from the previous box, IoU-gated; stops permanently at the first
   miss). Stops being reliable under large camera jumps — re-seed from a
-  later frame.
+  later frame. **Keyframe-bounded:** when a later ★ keyframe (K) is marked,
+  the run only covers the frames between the keyframes — it stops at the
+  next keyframe instead of running to the end of the dataset, so you can
+  annotate keyframe by keyframe and let SAM3 fill each segment.
 - **Re-segment selected** — re-runs SAM3 on a box you moved/resized to get
   a fresh mask. Use after every manual box edit if masks matter.
 - **Point segment (🎯 Add points + ▶ Segment points)** — SAM2-style point
@@ -823,6 +826,22 @@ viewer:
 3. **🗺 Show annotated in Rerun** plots every frame marked
    **✔ Mark as annotated** as a labeled camera position on the map — a
    visual coverage overview of what you labeled along the route.
+
+How a frame is matched to a DB row is configurable under **Settings →
+Rerun map / pose DB → Pose DB match** (config key `pose_db.match`):
+
+| Mode | Matching rule |
+|------|---------------|
+| `auto` (default) | exact match on the DB `filename` column, then numeric filename stem as the DB `id`, then nearest `timestamp_ns` |
+| `filename` | image file name = DB `filename` column only |
+| `filename_id` | numeric filename stem (`1042.jpg` → 1042) = DB `id` column only |
+| `timestamp` | filename stem / frame timestamp = DB `timestamp_ns` (nearest, within 10 s) only |
+
+Use `filename_id` when your image folder is named by the images-table
+`id` (e.g. `Datasets/complete3/outputs/images/1000.jpg`), `timestamp`
+when files are named by nanosecond timestamps. The timestamp rule rejects
+matches further than 10 s away, so sequential file names can no longer
+silently pin every frame to the first pose.
 
 CLI equivalent: `--pose-db` preloads the pose DB at launch.
 

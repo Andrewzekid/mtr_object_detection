@@ -25,6 +25,9 @@
   "display": {
     "max_image_dim": 0
   },
+  "pose_db": {
+    "match": "auto"
+  },
   "tracking": {
     "sticky_ids": false,
     "show_ids": true

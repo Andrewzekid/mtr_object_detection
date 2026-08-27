@@ -92,6 +92,7 @@ class ReviewWindow(QMainWindow):
                    display_max_dim: int = 0,
                    rerun_logger=None,
                    pose_db=None,
+                   pose_db_match: str = "auto",
                    autolabel_detector: str = "sam3",
                    owlv2_model: Optional[str] = None,
                    owlv2_conf: float = 0.3,
@@ -156,6 +157,13 @@ class ReviewWindow(QMainWindow):
         # Optional pose DB (Clio inspection SQLite) used to place marked
         # frames on the point-cloud map (see map_view.py).
         self._pose_db = pose_db
+        # How frames are matched to pose-DB rows: "auto" (filename column,
+        # then filename stem as the `id` column, then timestamp),
+        # "filename", "filename_id" or "timestamp" (config: pose_db.match).
+        from ..map_view import PoseDb as _PoseDb
+        self.pose_db_match: str = (pose_db_match
+                                   if pose_db_match in _PoseDb.MATCH_MODES
+                                   else "auto")
         # Autolabel detector: "sam3" (text-prompt SAM3, boxes+masks),
         # "owlv2" (zero-shot OWLv2 boxes), "owlv2_exemplar" (1-shot
         # image-guided OWLv2 using the selected box as the visual query),
@@ -801,7 +809,7 @@ class ReviewWindow(QMainWindow):
             return
         from ..map_view import PoseDb
         try:
-            self._pose_db = PoseDb(path)
+            self._pose_db = PoseDb(path, match_mode=self.pose_db_match)
         except Exception as exc:
             self._pose_db = None
             QMessageBox.warning(self, "Could not read pose database",
@@ -809,7 +817,8 @@ class ReviewWindow(QMainWindow):
             return
         n = len(self._pose_db._ts)
         self.statusBar().showMessage(
-            f"Pose DB loaded: {n:,} image poses from {path}", 5000)
+            f"Pose DB loaded: {n:,} image poses from {path} "
+            f"(match: {self._pose_db.match_mode})", 5000)
 
     def _load_annotations_dialog(self) -> None:
         """File → Load annotations file…: import boxes/masks from a COCO
@@ -979,6 +988,20 @@ class ReviewWindow(QMainWindow):
                 c.show_track_ids = self.show_track_ids
             self.side.set_track_ids_visible(self.show_track_ids)
             self._refresh_boxes()  # re-render labels without/with the T-ids
+        pose_db_cfg = cfg.get("pose_db", {})
+        match = pose_db_cfg.get("match")
+        from ..map_view import PoseDb as _PoseDb
+        if match in _PoseDb.MATCH_MODES and match != self.pose_db_match:
+            self.pose_db_match = match
+            # Re-open the loaded DB with the new match mode (one cheap
+            # SQL query) so the change applies immediately.
+            if self._pose_db is not None:
+                try:
+                    self._pose_db = _PoseDb(self._pose_db.path,
+                                            match_mode=match)
+                except Exception as exc:
+                    print(f"⚠️ could not reload pose DB with match "
+                          f"{match!r}: {exc}")
 
 
     def _open_image_files(self) -> None:
@@ -2201,7 +2224,8 @@ class ReviewWindow(QMainWindow):
                                          exemplar=job.get("exemplar"))
         elif job.get("kind") == "propagate":
             self._start_propagate_worker(
-                job["start_frame_idx"], job["seeds"], side=job.get("side"))
+                job["start_frame_idx"], job["seeds"], side=job.get("side"),
+                end_frame_idx=job.get("end_frame_idx"))
         elif job.get("kind") == "point":
             self._start_point_seg_worker(job)
         else:
@@ -3027,6 +3051,17 @@ class ReviewWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Seed is on the last frame — nothing to propagate to", 3000)
             return
+        # Keyframe-bounded range: when a later ★ keyframe is marked, only
+        # propagate between the keyframes (up to and including the next
+        # one) instead of running to the end of the index.
+        next_kf = next((k for k in sorted(self.coco.keyframes)
+                        if k > self._current_idx), None)
+        end_frame_idx = next_kf + 1 if next_kf is not None else None
+        if next_kf is not None:
+            range_txt = (f"to the next ★ keyframe (frame {next_kf + 1}; "
+                         f"{next_kf - self._current_idx} frame(s))")
+        else:
+            range_txt = f"to the end ({n - self._current_idx - 1} frame(s))"
         # One seed per (side, track id); track-less boxes are separate
         # seeds. Sides are kept apart: a left and a right box sharing a
         # track id are the same object in two views — both propagate.
@@ -3071,8 +3106,8 @@ class ReviewWindow(QMainWindow):
         ret = QMessageBox.question(
             self, "Propagate track(s) forward?",
             f"Propagate {', '.join(labels)} from frame "
-            f"{self._current_idx + 1} to the end ({n - self._current_idx - 1} "
-            f"frame(s)) with method '{self.propagate_method}'?\n\n"
+            f"{self._current_idx + 1} {range_txt} with method "
+            f"'{self.propagate_method}'?\n\n"
             f"{method_blurb}\n\n"
             f"Frames that already have a box with that track id are skipped. "
             f"Each side runs as one background job "
@@ -3112,7 +3147,8 @@ class ReviewWindow(QMainWindow):
         for side, side_seeds in by_side.items():
             self._start_propagate_worker(
                 self._current_idx, side_seeds, side,
-                seed_tid_changes=seed_tid_changes_by_side.get(side, []))
+                seed_tid_changes=seed_tid_changes_by_side.get(side, []),
+                end_frame_idx=end_frame_idx)
 
     def _propagate_label(self, seeds: List[Dict[str, Any]],
                          side: str) -> str:
@@ -3127,7 +3163,8 @@ class ReviewWindow(QMainWindow):
                                 side: Optional[str] = None,
                                 seed_tid_changes:
                                 Optional[List[Tuple[int, Optional[int],
-                                                    int]]] = None
+                                                    int]]] = None,
+                                end_frame_idx: Optional[int] = None
                                 ) -> None:
         if side is None:
             side = self._active_canvas.side
@@ -3137,6 +3174,7 @@ class ReviewWindow(QMainWindow):
                 "start_frame_idx": start_frame_idx,
                 "seeds": seeds,
                 "side": side,
+                "end_frame_idx": end_frame_idx,
             })
             self._refresh_sam3_status()
             self.statusBar().showMessage(
@@ -3144,7 +3182,9 @@ class ReviewWindow(QMainWindow):
                 f"({len(self._sam3_queue)} in queue)", 2500)
             return
         label = self._propagate_label(seeds, side)
-        total = len(self.frame_index) - start_frame_idx - 1
+        end = (end_frame_idx if end_frame_idx is not None
+               else len(self.frame_index))
+        total = end - start_frame_idx - 1
         self._set_sam3_status(f"propagate {label}: 0/{total} frames…")
         self.side.set_sam3_running(True)
         tmp_dir = str(Path(self.coco.output_json).parent / "_tmp_sam3_imgs")
@@ -3156,6 +3196,7 @@ class ReviewWindow(QMainWindow):
             method=self.propagate_method,
             min_iou=self.propagate_min_iou,
             min_seed_iou=self.propagate_min_seed_iou,
+            end_frame_idx=end_frame_idx,
             parent=self,
         )
         self._sam3_propagate_worker._meta = {

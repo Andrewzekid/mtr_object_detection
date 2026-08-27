@@ -1383,12 +1383,43 @@ def test_propagate_seed_starts_worker(lr, propagate_seeded):
     w = FakePropagateWorker.instances[-1]
     assert w.isRunning()
     assert w.kw["start_frame_idx"] == 0
+    assert w.kw["end_frame_idx"] is None  # no keyframes → runs to the end
     assert w.kw["seeds"] == [{"track_id": seed_tid, "cat_id": 0,
                               "concept": "ceiling light",
                               "bbox_xyxy": [10.0, 10.0, 40.0, 30.0]}]
     assert win._propagate_meta()["seeds"][0]["track_id"] == seed_tid
     assert win.side.sam3_status.text().startswith(
         f"SAM3: propagate T{seed_tid}:")
+
+
+def test_propagate_stops_at_next_keyframe(lr, propagate_win):
+    """With a later ★ keyframe marked, propagation only covers the frames
+    between the keyframes (up to and including the next keyframe)."""
+    win, coco = propagate_win
+    image_id = coco.ensure_image(FakeIdx().frame_at(0), 100, 80)
+    coco.add_box(image_id, 10, 10, 30, 20, 0)
+    win._refresh_boxes()
+    win.canvas._selected_idx = 0
+    win.canvas._multi_selected = {0}
+    coco.keyframes.add(3)
+    win._on_propagate_track()
+    w = FakePropagateWorker.instances[-1]
+    assert w.kw["end_frame_idx"] == 4  # next keyframe is 3, inclusive
+    assert "0/3 frames" in win.side.sam3_status.text()
+
+
+def test_propagate_ignores_past_keyframes(lr, propagate_win):
+    """Keyframes at/before the current frame don't bound the run."""
+    win, coco = propagate_win
+    image_id = coco.ensure_image(FakeIdx().frame_at(0), 100, 80)
+    coco.add_box(image_id, 10, 10, 30, 20, 0)
+    win._refresh_boxes()
+    win.canvas._selected_idx = 0
+    win.canvas._multi_selected = {0}
+    coco.keyframes.add(0)
+    win._on_propagate_track()
+    w = FakePropagateWorker.instances[-1]
+    assert w.kw["end_frame_idx"] is None
 
 
 def test_propagate_queues_behind_running_job(lr, propagate_seeded):
