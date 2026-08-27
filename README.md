@@ -809,7 +809,11 @@ next to the images it is auto-loaded.
 | Config settings… | `Ctrl+G` | same as the ⚙ button |
 
 The **View** menu switches the UI theme at runtime (**dark**, **light**, or
-**pastel** lime); the choice persists across sessions.
+**pastel** lime); the choice persists across sessions. It also carries
+**Switch to Rerun waypoint view**, which swaps the image labeling view for
+the embedded rerun waypoint map (the **Rerun map** dock panel — the menu
+item becomes **Switch back to image view** while the map is shown; see
+below).
 
 ### Rerun viewer & point-cloud map
 
@@ -818,14 +822,23 @@ viewer:
 
 1. **Open rerun file…** (File menu or the sidebar's **🎬 Rerun viewer / map…**
    button) opens a `.rrd` recording — it carries the colored point-cloud
-   map, the camera images and their timestamps — in a windowed rerun
-   viewer. The GUI then streams into that recording.
+   map, the camera images and their timestamps — in a rerun viewer. By
+   default that's a separate window; when the **Rerun map** dock panel is
+   visible (View → **Switch to Rerun waypoint view**, needs
+   `PyQt6-WebEngine` installed) the recording is instead embedded into
+   that panel via the rerun web viewer — handy on one
+   screen, though heavier and slower than the native viewer on big maps.
+   The GUI then streams into that recording.
 2. **Open pose database…** (or **📍 Pose database…**) loads a Clio
    inspection SQLite DB whose `images` table holds per-timestamp
    camera/lidar poses (`--pose-db` does the same at launch).
 3. **🗺 Show annotated in Rerun** plots every frame marked
    **✔ Mark as annotated** as a labeled camera position on the map — a
-   visual coverage overview of what you labeled along the route.
+   visual coverage overview of what you labeled along the route. Markers
+   are labeled with their waypoint ordinal in route order, e.g.
+   `Waypoint #2 (frame 1042)` (both stereo sides of a frame share one
+   waypoint number). **✖ Clear waypoints** removes all markers from the
+   map again (the annotated marks themselves are kept).
 
 How a frame is matched to a DB row is configurable under **Settings →
 Rerun map / pose DB → Pose DB match** (config key `pose_db.match`):
@@ -888,6 +901,7 @@ CLI equivalent: `--pose-db` preloads the pose DB at launch.
 | **✔ Mark as annotated** | count frame as done without boxes (Viewpoint Selection section) |
 | **🚫 Discard image** | drop the frame from the saved COCO entirely (blurry/irrelevant frames never reach training) |
 | **🗺 Show annotated in Rerun** | plot all annotated frames' camera positions on the Rerun map (needs a pose DB + opened `.rrd`) |
+| **✖ Clear waypoints** | remove all waypoint markers from the Rerun map (annotated marks are kept) |
 | **🎬 Rerun viewer / map…** | open a `.rrd` recording in the rerun viewer — see *Rerun viewer & point-cloud map* above |
 | **📍 Pose database…** | load a Clio pose DB to place annotated frames on the map |
 | **★ Keyframe** (`K`) | mark anchor frame for interpolation |

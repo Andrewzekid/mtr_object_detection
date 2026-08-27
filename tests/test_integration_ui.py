@@ -1422,6 +1422,143 @@ def test_propagate_ignores_past_keyframes(lr, propagate_win):
     assert w.kw["end_frame_idx"] is None
 
 
+def test_rerun_markers_labeled_with_waypoint_ids(lr, make_coco,
+                                                 make_window):
+    """Annotated-frame markers on the rerun map are labeled with their
+    waypoint ordinal (sorted by frame index), not just the frame name."""
+    class FakePoseDb:
+        def pose_for(self, file_name, timestamp_ns):
+            return np.array([1.0, 2.0, 3.0])
+
+    class FakeRerun:
+        rrd_path = "map.rrd"
+
+        def __init__(self):
+            self.markers = None
+
+        def log_annotated_markers(self, markers):
+            self.markers = markers
+            return True
+
+    coco = make_coco([{"id": 0, "name": "x"}])
+    rerun = FakeRerun()
+    win = make_window(FakeIdx(6), coco,
+                      pose_db=FakePoseDb(), rerun_logger=rerun)
+    coco.annotated_marks.update({1, 2, 4})
+    coco.discarded_frames.add(2)  # discarded: excluded, no waypoint number
+    win._on_show_annotated_rerun()
+    labels = [lbl for _, lbl in rerun.markers]
+    assert labels == ["Waypoint #1 (frame 2)", "Waypoint #2 (frame 5)"]
+
+
+def test_clear_rerun_waypoints(lr, make_coco, make_window):
+    """'✖ Clear waypoints' logs an empty marker list into the open .rrd."""
+    class FakeRerun:
+        rrd_path = "map.rrd"
+
+        def __init__(self):
+            self.calls = []
+
+        def log_annotated_markers(self, markers):
+            self.calls.append(markers)
+            return True
+
+    coco = make_coco([{"id": 0, "name": "x"}])
+    rerun = FakeRerun()
+    win = make_window(FakeIdx(6), coco, rerun_logger=rerun)
+    win._on_clear_rerun_waypoints()
+    assert rerun.calls == [[]]
+
+
+def test_clear_rerun_waypoints_requires_recording(lr, make_coco, make_window):
+    """Without an open .rrd the clear button only shows a status hint."""
+    class FakeRerun:
+        rrd_path = None
+
+        def log_annotated_markers(self, markers):
+            raise AssertionError("must not log without a recording")
+
+    coco = make_coco([{"id": 0, "name": "x"}])
+    win = make_window(FakeIdx(6), coco, rerun_logger=FakeRerun())
+    win._on_clear_rerun_waypoints()  # no exception, no log call
+
+
+def test_open_rerun_embeds_when_panel_visible(lr, make_coco, make_window,
+                                              monkeypatch):
+    """Opening an .rrd with the "Rerun map" dock visible spawns the viewer
+    embedded (embed=True) and loads its web URL into the dock."""
+    class FakeRerun:
+        def __init__(self):
+            self.rrd_path = None
+            self.web_url = None
+            self.embed_modes = []
+
+        def open_recording(self, path, embed=False):
+            self.embed_modes.append(embed)
+            self.rrd_path = path
+            self.web_url = "http://127.0.0.1:1/?url=x" if embed else None
+            return True
+
+    coco = make_coco([{"id": 0, "name": "x"}])
+    rerun = FakeRerun()
+    win = make_window(FakeIdx(6), coco, rerun_logger=rerun)
+    win._rerun_dock.show()
+    monkeypatch.setattr(lr.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: ("map.rrd", "")))
+    loaded = []
+    monkeypatch.setattr(win, "_load_rerun_embedded",
+                        lambda: loaded.append(win.rerun.web_url))
+    win._open_rerun_file()
+    assert rerun.embed_modes == [True]
+    assert loaded == ["http://127.0.0.1:1/?url=x"]
+
+
+def test_open_rerun_windowed_by_default(lr, make_coco, make_window,
+                                        monkeypatch):
+    """Dock hidden (the default): the .rrd opens in the external windowed
+    viewer (embed=False)."""
+    class FakeRerun:
+        def __init__(self):
+            self.rrd_path = None
+            self.web_url = None
+            self.embed_modes = []
+
+        def open_recording(self, path, embed=False):
+            self.embed_modes.append(embed)
+            self.rrd_path = path
+            return True
+
+    coco = make_coco([{"id": 0, "name": "x"}])
+    rerun = FakeRerun()
+    win = make_window(FakeIdx(6), coco, rerun_logger=rerun)
+    monkeypatch.setattr(lr.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: ("map.rrd", "")))
+    win._open_rerun_file()
+    assert rerun.embed_modes == [False]
+
+
+def test_rerun_view_menu_switch(lr, make_coco, make_window):
+    """View → 'Switch to Rerun waypoint view' toggles the map dock and its
+    own label flips to 'Switch back to image view' while the map is shown
+    (including when the dock is closed via its ✖ button)."""
+    coco = make_coco([{"id": 0, "name": "x"}])
+    win = make_window(FakeIdx(6), coco)
+    act = win._act_rerun_view
+    assert act.text() == "Switch to Rerun waypoint view"
+    assert not win._rerun_dock.isVisible()
+    act.trigger()
+    assert win._rerun_dock.isVisible()
+    assert act.text() == "Switch back to image view"
+    act.trigger()
+    assert not win._rerun_dock.isVisible()
+    assert act.text() == "Switch to Rerun waypoint view"
+    # Closing the dock directly resets the menu label too.
+    win._rerun_dock.show()
+    assert act.text() == "Switch back to image view"
+    win._rerun_dock.hide()
+    assert act.text() == "Switch to Rerun waypoint view"
+
+
 def test_propagate_queues_behind_running_job(lr, propagate_seeded):
     win, coco, seed_ann, seed_tid = propagate_seeded
     win._start_propagate_worker(

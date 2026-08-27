@@ -2,8 +2,10 @@
 
 The map (colored point cloud), images and timestamps live in an .rrd
 produced elsewhere; this app only ADDS annotated-frame camera-position
-markers. "File -> Open rerun file…" opens the recording in a windowed
-viewer (which hosts a gRPC server); "🗺 Show annotated in Rerun" then
+markers. "File -> Open rerun file…" opens the recording in a viewer —
+a windowed one by default, or a headless process hosting the web viewer
+when the GUI embeds it in its "Rerun map" dock panel (embed=True); either
+viewer hosts a gRPC server. "🗺 Show annotated in Rerun" then
 streams the markers into that SAME recording - the stream is initialized
 with the .rrd's own application/recording id (read from the file), so the
 viewer merges the markers into the loaded store instead of showing a
@@ -52,12 +54,21 @@ class RerunLogger:
         self._stream = None
         self._port: Optional[int] = None  # set while connected to a viewer
         self._marker_entity = MARKER_ENTITY
+        # Embedded mode: URL of the hosted web viewer (set when the
+        # recording was opened with embed=True) and the headless viewer
+        # process we spawned for it (terminated via shutdown()).
+        self.web_url: Optional[str] = None
+        self._proc: Optional[subprocess.Popen] = None
+        self._embed = False  # respawn mode once the viewer drops away
 
     # ------------------------------------------------------------------ #
 
-    def open_recording(self, rrd_path: str) -> bool:
-        """Remember an .rrd as the marker target and open it in a windowed
-        rerun viewer."""
+    def open_recording(self, rrd_path: str, embed: bool = False) -> bool:
+        """Remember an .rrd as the marker target and open it in a viewer.
+
+        ``embed=True`` spawns a headless viewer that only hosts the web
+        viewer (for the GUI's embedded panel) instead of a native window.
+        """
         if not self.enabled:
             return False
         app_id, rec_id = self._read_store_id(rrd_path)
@@ -70,7 +81,17 @@ class RerunLogger:
             return False
         self.rrd_path = rrd_path
         self._port = None
-        return self._spawn_viewer()
+        self.web_url = None
+        self._embed = embed
+        self.shutdown()  # an earlier embedded viewer process is useless now
+        return self._spawn_viewer(embed=embed)
+
+    def shutdown(self) -> None:
+        """Terminate the headless viewer process spawned for the embedded
+        panel (a windowed external viewer is left alone on purpose)."""
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
 
     def log_annotated_markers(self, markers: List[Tuple]) -> bool:
         """Replace the annotated-frame markers on the recording's map.
@@ -81,7 +102,7 @@ class RerunLogger:
         if not self.enabled or self._stream is None or not self.rrd_path:
             return False
         try:
-            if self._port is None and not self._spawn_viewer():
+            if self._port is None and not self._spawn_viewer(embed=self._embed):
                 return False
             # Static clear + static points: previous markers disappear even
             # when frames got un-marked, and markers stay visible at every
@@ -106,9 +127,15 @@ class RerunLogger:
 
     # ------------------------------------------------------------------ #
 
-    def _spawn_viewer(self) -> bool:
+    def _spawn_viewer(self, embed: bool = False) -> bool:
         """Launch ``rerun <path> --port <free>`` (windowed, with a gRPC
-        server) and connect once the server accepts connections."""
+        server) and connect once the server accepts connections.
+
+        With ``embed=True`` the viewer runs headless and additionally
+        hosts the web viewer over HTTP (``--serve-web``); ``self.web_url``
+        is then set for the GUI's embedded panel. A generous server memory
+        limit keeps big maps from being dropped from the proxy buffer.
+        """
         try:
             # Grab a free port instead of using the default (9876): with the
             # default port occupied, the CLI "helpfully" streams into the
@@ -116,22 +143,40 @@ class RerunLogger:
             with socket.socket() as s:
                 s.bind(("127.0.0.1", 0))
                 port = s.getsockname()[1]
-            subprocess.Popen(["rerun", self.rrd_path, "--port", str(port)])
+            args = ["rerun", self.rrd_path, "--port", str(port)]
+            web_port = None
+            if embed:
+                with socket.socket() as s2:
+                    s2.bind(("127.0.0.1", 0))
+                    web_port = s2.getsockname()[1]
+                args += ["--serve-web", "--web-viewer-port", str(web_port),
+                         "--headless", "--server-memory-limit", "8GB"]
+            proc = subprocess.Popen(args)
+            if embed:
+                # Headless helper only makes sense with the GUI around.
+                self._proc = proc
             # flush() on an unconnected gRPC sink raises after ~6s, so wait
             # for the viewer's server to accept connections before
             # connecting (the viewer takes a moment to boot).
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                try:
-                    with socket.create_connection(("127.0.0.1", port), 0.5):
-                        break
-                except OSError:
-                    time.sleep(0.2)
-            else:
-                print("WARNING: rerun viewer did not start listening")
-                return False
+            ports = [port] + ([web_port] if embed else [])
+            for p in ports:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    try:
+                        with socket.create_connection(("127.0.0.1", p), 0.5):
+                            break
+                    except OSError:
+                        time.sleep(0.2)
+                else:
+                    print(f"WARNING: rerun viewer did not start listening "
+                          f"on port {p}")
+                    return False
             self._stream.connect_grpc(f"rerun+http://127.0.0.1:{port}/proxy")
             self._port = port
+            self.web_url = (
+                f"http://127.0.0.1:{web_port}"
+                f"?url=rerun%2Bhttp%3A%2F%2Flocalhost%3A{port}%2Fproxy"
+                if embed else None)
             return True
         except Exception as exc:
             print(f"WARNING: could not spawn the rerun viewer: {exc}")

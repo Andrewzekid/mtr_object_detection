@@ -294,6 +294,28 @@ class ReviewWindow(QMainWindow):
         self.side.set_track_ids_visible(self.show_track_ids)
 
         self.setCentralWidget(self._splitter)
+
+        # Embedded rerun viewer dock (View → "Rerun map"): hosts the rerun
+        # web viewer for the opened .rrd recording. Hidden by default; the
+        # QWebEngineView is created lazily on first embed so headless/test
+        # runs never instantiate QtWebEngine.
+        self._rerun_dock = QtWidgets.QDockWidget("Rerun map", self)
+        self._rerun_dock.setObjectName("rerunMapDock")
+        _placeholder = QLabel(
+            "Open an .rrd recording while this panel is visible to embed "
+            "the rerun viewer here.", self._rerun_dock)
+        _placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _placeholder.setWordWrap(True)
+        self._rerun_dock.setWidget(_placeholder)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,
+                           self._rerun_dock)
+        self._rerun_dock.hide()
+        self._rerun_webview = None
+        # Showing the panel AFTER a recording was opened windowed re-opens
+        # the same .rrd embedded into the panel instead.
+        self._rerun_dock.visibilityChanged.connect(
+            self._on_rerun_dock_visibility)
+
         self._build_menu()
 
         # Config-driven UI tweaks: hide button groups, preset mask opacity.
@@ -351,6 +373,8 @@ class ReviewWindow(QMainWindow):
         self.side.toggle_discard_clicked.connect(self._on_toggle_discard)
         self.side.show_annotated_rerun_clicked.connect(
             self._on_show_annotated_rerun)
+        self.side.clear_waypoints_clicked.connect(
+            self._on_clear_rerun_waypoints)
         self.side.point_seg_toggled.connect(self._on_point_seg_toggled)
         self.side.segment_points_clicked.connect(self._on_segment_points)
         self.side.interpolate_clicked.connect(self._on_interpolate)
@@ -702,6 +726,17 @@ class ReviewWindow(QMainWindow):
             theme_group.addAction(act_theme)
             view.addAction(act_theme)
             self._theme_actions[name] = act_theme
+        view.addSeparator()
+        # View switch: image labeling view <-> embedded rerun waypoint map.
+        # The label flips with the dock's visibility (kept in sync from
+        # _on_rerun_dock_visibility, so closing the dock via its ✖ also
+        # resets the menu text).
+        self._act_rerun_view = QAction("Switch to Rerun waypoint view", self)
+        self._act_rerun_view.setToolTip(
+            "Show the embedded rerun waypoint map; switch back to return "
+            "to the image labeling view.")
+        self._act_rerun_view.triggered.connect(self._on_toggle_rerun_view)
+        view.addAction(self._act_rerun_view)
 
         # A visible Config button in the menu bar's top-right corner.
         cfg_btn = QPushButton("⚙ Config")
@@ -785,20 +820,71 @@ class ReviewWindow(QMainWindow):
 
     def _open_rerun_file(self) -> None:
         """File -> Open rerun file…: open an .rrd recording (with the map,
-        images and timestamps) in a windowed rerun viewer. It becomes the
-        target for '🗺 Show annotated in Rerun' markers."""
+        images and timestamps) in a rerun viewer. With the "Rerun map" dock
+        panel visible (View menu) the viewer is embedded into it via the
+        rerun web viewer; otherwise a separate windowed viewer opens. The
+        recording becomes the target for '🗺 Show annotated in Rerun'
+        markers."""
         path, _ = QFileDialog.getOpenFileName(
             self, "Open rerun file", "", "Rerun recording (*.rrd)")
         if not path:
             return
-        if not self.rerun.open_recording(path):
-            QMessageBox.warning(
-                self, "Rerun unavailable",
-                "Could not open the recording (is rerun-sdk / the rerun "
-                "CLI installed?).")
-            return
+        embed = self._rerun_panel_available()
+        if not self.rerun.open_recording(path, embed=embed):
+            if embed and self.rerun.open_recording(path, embed=False):
+                embed = False  # embedded spawn failed — external fallback
+            else:
+                QMessageBox.warning(
+                    self, "Rerun unavailable",
+                    "Could not open the recording (is rerun-sdk / the rerun "
+                    "CLI installed?).")
+                return
+        if embed and self.rerun.web_url:
+            self._load_rerun_embedded()
         self.statusBar().showMessage(
             f"Opened {path} in the rerun viewer", 4000)
+
+    def _rerun_panel_available(self) -> bool:
+        """True when the "Rerun map" dock is visible AND QtWebEngine is
+        installed — only then does opening an .rrd embed the web viewer."""
+        if not self._rerun_dock.isVisible():
+            return False
+        try:
+            from PyQt6 import QtWebEngineWidgets  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def _load_rerun_embedded(self) -> None:
+        """Load (or reload) the recording's web-viewer URL in the dock."""
+        url = self.rerun.web_url
+        if not url:
+            return
+        if self._rerun_webview is None:
+            from PyQt6.QtWebEngineWidgets import QWebEngineView
+            self._rerun_webview = QWebEngineView(self._rerun_dock)
+            self._rerun_dock.setWidget(self._rerun_webview)
+        self._rerun_webview.load(QtCore.QUrl(url))
+
+    def _on_toggle_rerun_view(self) -> None:
+        """View-menu switch between the image labeling view and the
+        embedded rerun waypoint map (the "Rerun map" dock panel)."""
+        self._rerun_dock.setVisible(not self._rerun_dock.isVisible())
+
+    def _on_rerun_dock_visibility(self, visible: bool) -> None:
+        """Keep the View-menu switch label in sync with the dock, and when
+        the panel is shown with a recording already open in an external
+        viewer, re-open the same .rrd embedded into the panel."""
+        act = getattr(self, "_act_rerun_view", None)
+        if act is not None:
+            act.setText("Switch back to image view" if visible
+                        else "Switch to Rerun waypoint view")
+        if not visible or not self.rerun.rrd_path or self.rerun.web_url:
+            return
+        if not self._rerun_panel_available():
+            return
+        if self.rerun.open_recording(self.rerun.rrd_path, embed=True):
+            self._load_rerun_embedded()
 
     def _open_pose_db(self) -> None:
         """File -> Open pose database…: Clio inspection SQLite whose
@@ -1434,22 +1520,47 @@ class ReviewWindow(QMainWindow):
                 return  # user cancelled or the recording failed to open
         marks = sorted(self.coco.annotated_marks - self.coco.discarded_frames)
         markers = []
-        for idx in marks:
+        # Waypoint id = the frame's ordinal among the annotated marks
+        # (sorted by frame index), 1-based; both stereo sides of one frame
+        # share the same waypoint number.
+        for wp, idx in enumerate(marks, start=1):
             for side in self.canvases:
                 frame = self._frame_at_side(idx, side)
                 pos = self._pose_db.pose_for(frame.get("file_name"),
                                              frame.get("timestamp_ns"))
                 if pos is not None:
-                    markers.append((pos, f"frame {idx + 1} ({side})"))
+                    label = f"Waypoint #{wp} (frame {idx + 1})"
+                    if self._stereo:
+                        label += f" ({side})"
+                    markers.append((pos, label))
         if not self.rerun.log_annotated_markers(markers):
             self.statusBar().showMessage(
                 "Rerun marker logging failed (see console)", 5000)
             return
+        # A dropped embedded connection respawns on new ports — reload the
+        # dock's web view so it follows the new server.
+        if self._rerun_webview is not None and self.rerun.web_url:
+            self._load_rerun_embedded()
         self.statusBar().showMessage(
             f"Rerun: showing {len(markers)} annotated viewpoint(s)"
             if markers else
             "No poses found for the annotated frames (markers cleared)",
             6000)
+
+    def _on_clear_rerun_waypoints(self) -> None:
+        """'✖ Clear waypoints' button: remove every annotated-waypoint
+        marker from the rerun viewer's map. The annotated marks on the
+        frames themselves are kept."""
+        if not self.rerun.rrd_path:
+            self.statusBar().showMessage(
+                "Open an .rrd recording first (File → Open rerun file…)",
+                5000)
+            return
+        if self.rerun.log_annotated_markers([]):
+            self.statusBar().showMessage("Rerun waypoints cleared", 4000)
+        else:
+            self.statusBar().showMessage(
+                "Rerun marker logging failed (see console)", 5000)
 
     @staticmethod
     def _ann_to_interp_dict(ann: Dict[str, Any]) -> Dict[str, Any]:
@@ -3783,6 +3894,11 @@ class ReviewWindow(QMainWindow):
             if res:
                 self.coco.save(is_final=False)
         self._shutdown_workers()
+        # Stop an embedded rerun viewer process (external windowed viewers
+        # are deliberately left running).
+        shutdown = getattr(self.rerun, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
         super().closeEvent(ev)
 
     def _shutdown_workers(self) -> None:

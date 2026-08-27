@@ -17,7 +17,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PyQt6 import QtWidgets
+from PyQt6 import QtCore, QtWidgets
+
+# Same as gui.label_review.main: lets QtWebEngineWidgets be imported lazily
+# after the QApplication exists (embedded "Rerun map" panel tests).
+QtCore.QCoreApplication.setAttribute(
+    QtCore.Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:

@@ -62,6 +62,8 @@ class SidePanel(QWidget):
     toggle_discard_clicked = pyqtSignal()    # "🚫 Discard image" button
     # "🗺 Show annotated in Rerun" button
     show_annotated_rerun_clicked = pyqtSignal()
+    # "✖ Clear waypoints" button (removes the rerun map markers)
+    clear_waypoints_clicked = pyqtSignal()
     point_seg_toggled = pyqtSignal(bool)     # "🎯 Add points" toggle
     segment_points_clicked = pyqtSignal()    # "▶ Segment points" button
     interpolate_clicked = pyqtSignal()       # "Interpolate" button (I)
@@ -303,6 +305,16 @@ class SidePanel(QWidget):
         self.btn_show_annotated_rerun.clicked.connect(
             self.show_annotated_rerun_clicked.emit)
         layout.addWidget(self.btn_show_annotated_rerun)
+
+        # Remove every annotated-waypoint marker from the rerun viewer's
+        # map (the annotated marks on frames themselves are kept).
+        self.btn_clear_waypoints = QPushButton("✖ Clear waypoints")
+        self.btn_clear_waypoints.setToolTip(
+            "Remove all annotated-waypoint markers from the rerun viewer "
+            "(the annotated marks themselves are kept).")
+        self.btn_clear_waypoints.clicked.connect(
+            self.clear_waypoints_clicked.emit)
+        layout.addWidget(self.btn_clear_waypoints)
 
         _sep()
 
@@ -743,7 +755,8 @@ class SidePanel(QWidget):
                         "interp_status"],
         "jump": ["jump_buttons"],
         "viewpoint": ["viewpoint_header", "btn_mark_annotated",
-                      "btn_discard_image", "btn_show_annotated_rerun"],
+                      "btn_discard_image", "btn_show_annotated_rerun",
+                      "btn_clear_waypoints"],
         "sam3_run": ["sam3_header", "btn_run_sam3", "btn_reseg",
                      "btn_cancel_sam3", "btn_propagate"],
         "sam3_all_frames": ["btn_sam3_all_frames"],

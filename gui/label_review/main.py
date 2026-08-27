@@ -500,6 +500,12 @@ def main():
     coco.current_idx = coco.load_progress(len(frame_index))
 
     # ---------- 3. Qt app ----------
+    # QtWebEngine (the embedded "Rerun map" dock panel) requires shared
+    # OpenGL contexts; the attribute must be set before a QApplication
+    # exists. Harmless when the panel is never used.
+    from PyQt6.QtCore import QCoreApplication, Qt as _Qt
+    QCoreApplication.setAttribute(
+        _Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Computer Vision Label Review Tool")
 
