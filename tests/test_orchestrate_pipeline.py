@@ -55,7 +55,7 @@ def test_parse_args_defaults():
 
 def test_run_pipeline_requires_input(tmp_path):
     args = parse_args(["--images", str(tmp_path / "nope")])
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(SystemExit, match="images folder not found"):
         run_pipeline(args)
 
 

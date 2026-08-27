@@ -19,7 +19,8 @@
   "ui": {
     "advanced": false,
     "hide": [],
-    "mask_opacity": 47
+    "mask_opacity": 47,
+    "theme": "dark"
   },
   "display": {
     "max_image_dim": 0

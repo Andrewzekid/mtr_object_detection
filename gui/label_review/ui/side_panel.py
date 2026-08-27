@@ -26,7 +26,6 @@ DETECTOR_LABELS = {
     "owlv2": "OWLv2",
     "owlv2_exemplar": "OWLv2 exemplar",
     "grounding_dino": "Grounding DINO",
-    "florence2": "Florence-2",
     "falcon": "Falcon Perception",
 }
 
@@ -298,9 +297,9 @@ class SidePanel(QWidget):
         self.btn_show_annotated_rerun = QPushButton("🗺 Show annotated in Rerun")
         self.btn_show_annotated_rerun.setToolTip(
             "Plot every annotated frame's camera position on the map of "
-            "the opened .rrd recording (open it first: File -> Open rerun "
-            "file…; positions come from the pose DB: File -> Open pose "
-            "database…).")
+            "the opened .rrd recording. Requires both a pose database and "
+            "an .rrd with the colored point cloud — you'll be prompted to "
+            "open whichever is missing.")
         self.btn_show_annotated_rerun.clicked.connect(
             self.show_annotated_rerun_clicked.emit)
         layout.addWidget(self.btn_show_annotated_rerun)
@@ -366,7 +365,8 @@ class SidePanel(QWidget):
             "and right-click a negative point on the canvas. Points only "
             "accumulate — nothing runs until you press ▶ Segment points, "
             "which runs SAM3 once and turns point mode back OFF. Press "
-            "🎯 Add points again to start segmenting a new object. "
+            "🎯 Add points again to refine the same object with more "
+            "points (Enter accepts, Esc cancels). "
             "Toggle off to go back to draw/select.")
         self.btn_add_points.toggled.connect(self.point_seg_toggled.emit)
         point_row.addWidget(self.btn_add_points)
@@ -378,7 +378,7 @@ class SidePanel(QWidget):
             "SAM3 detects all instances of that category and your points "
             "pick which one to keep (falls back to pure point prompting "
             "when nothing matches). Running this ends point mode — press "
-            "🎯 Add points again to segment a new object. "
+            "🎯 Add points again to refine the result with more points. "
             "Category = preselected / last-used.")
         self.btn_segment_points.clicked.connect(
             self.segment_points_clicked.emit)

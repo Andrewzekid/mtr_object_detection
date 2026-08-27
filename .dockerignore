@@ -1,0 +1,43 @@
+# Keep the Docker build context small — none of these belong in the image.
+.git
+.git.backup-*
+.github
+.claude/
+.devcontainer/
+.superpowers/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Large local data — mount at runtime instead
+Datasets/
+runs/
+output/
+cvat_local/
+20260821_Centen_Clio-n-Metacam_Data/
+
+# Large model weights already excluded from git; fetched via HF_TOKEN at
+# build time or mounted at runtime.
+*.pt
+*.gguf
+*.engine
+*.onnx
+core/sam3/models/sam3-model/sam3.pt
+core/sam3/models/sam3.1-model/sam3.1_multiplex.pt
+
+# Build artefacts / env
+dist/
+build/
+.venv/
+.env
+*.log
+*.mp4
+*.avi
+*.zip
+
+# Editor / OS clutter
+.vscode/
+.idea/
+.DS_Store
+opencode.json
+untitled_labels_coco*

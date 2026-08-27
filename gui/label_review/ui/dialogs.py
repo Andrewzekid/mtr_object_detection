@@ -10,6 +10,7 @@ from ..qt_compat import (  # noqa: F401
 )
 
 from .side_panel import SidePanel  # noqa: F401  (hide-group metadata)
+from . import theme as ui_theme
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +36,8 @@ class ConfigDialog(QtWidgets.QDialog):
         "keyframe": "Keyframe controls",
         "interpolate": "Interpolate controls",
         "jump": "Jump buttons (−10/−5/+5/+10)",
+        "viewpoint": "Viewpoint selection buttons",
+        "rerun": "Rerun viewer / map buttons",
         "sam3_run": "SAM3 run buttons",
         "sam3_all_frames": "SAM3 all-frames button",
         "autolabel": "Autolabel buttons",
@@ -58,6 +61,18 @@ class ConfigDialog(QtWidgets.QDialog):
         body = QVBoxLayout(content)
         scroll.setWidget(content)
         root.addWidget(scroll, 1)
+
+        # --- Appearance ------------------------------------------------------
+        appear_box = QtWidgets.QGroupBox("Appearance")
+        appear_form = QtWidgets.QFormLayout(appear_box)
+        self.combo_theme = QtWidgets.QComboBox()
+        for name in ui_theme.THEMES:
+            self.combo_theme.addItem(name.capitalize(), name)
+        self.combo_theme.setToolTip(
+            "UI theme (same choices as the View menu). Applied immediately\n"
+            "when you press Apply / Load / Save, and persisted.")
+        appear_form.addRow("Theme", self.combo_theme)
+        body.addWidget(appear_box)
 
         # --- UI visibility -------------------------------------------------
         ui_box = QtWidgets.QGroupBox("Hide UI elements")
@@ -208,8 +223,6 @@ class ConfigDialog(QtWidgets.QDialog):
         self.combo_autolabel_detector.addItem(
             "Grounding DINO (zero-shot boxes)", "grounding_dino")
         self.combo_autolabel_detector.addItem(
-            "Florence-2 (phrase-grounding boxes)", "florence2")
-        self.combo_autolabel_detector.addItem(
             "Falcon Perception (boxes + masks)", "falcon")
         self.combo_autolabel_detector.setToolTip(
             "Which model the 'Autolabel frame' / 'Autolabel ALL frames'\n"
@@ -223,9 +236,6 @@ class ConfigDialog(QtWidgets.QDialog):
             "  visual query; matching objects get its category.\n"
             "- Grounding DINO: zero-shot text-prompt boxes (no masks).\n"
             "  Default checkpoint: IDEA-Research/grounding-dino-base.\n"
-            "- Florence-2: phrase-grounding boxes, one prompt per\n"
-            "  category (no masks, no confidence scores).\n"
-            "  Default checkpoint: microsoft/Florence-2-large.\n"
             "- Falcon Perception: open-vocabulary grounding with real\n"
             "  instance masks (no confidence scores).\n"
             "  Default checkpoint: tiiuae/Falcon-Perception.")
@@ -242,8 +252,18 @@ class ConfigDialog(QtWidgets.QDialog):
         self.spin_owlv2_conf.setSingleStep(0.05)
         self.spin_owlv2_conf.setDecimals(2)
         self.spin_owlv2_conf.setToolTip(
-            "OWLv2 detection confidence threshold.")
+            "OWLv2 detection confidence threshold (text-prompted).")
         al_form.addRow("OWLv2 confidence", self.spin_owlv2_conf)
+        self.spin_owlv2_exemplar_conf = QtWidgets.QDoubleSpinBox()
+        self.spin_owlv2_exemplar_conf.setRange(0.0, 1.0)
+        self.spin_owlv2_exemplar_conf.setSingleStep(0.05)
+        self.spin_owlv2_exemplar_conf.setDecimals(2)
+        self.spin_owlv2_exemplar_conf.setToolTip(
+            "OWLv2 exemplar (1-shot image-guided) confidence threshold.\n"
+            "Image-guided scores run much hotter than text-prompt scores,\n"
+            "so this needs a higher value than the text threshold (~0.6).")
+        al_form.addRow("OWLv2 exemplar confidence",
+                       self.spin_owlv2_exemplar_conf)
         self.edit_gdino_model = QtWidgets.QLineEdit()
         self.edit_gdino_model.setPlaceholderText(
             "default: IDEA-Research/grounding-dino-base")
@@ -258,13 +278,6 @@ class ConfigDialog(QtWidgets.QDialog):
         self.spin_gdino_conf.setToolTip(
             "Grounding DINO box threshold (detection confidence).")
         al_form.addRow("Grounding DINO confidence", self.spin_gdino_conf)
-        self.edit_florence2_model = QtWidgets.QLineEdit()
-        self.edit_florence2_model.setPlaceholderText(
-            "default: microsoft/Florence-2-large")
-        self.edit_florence2_model.setToolTip(
-            "Florence-2 checkpoint (HuggingFace model id or local path).\n"
-            "Takes effect on the next autolabel run.")
-        al_form.addRow("Florence-2 model", self.edit_florence2_model)
         self.edit_falcon_model = QtWidgets.QLineEdit()
         self.edit_falcon_model.setPlaceholderText(
             "default: tiiuae/Falcon-Perception")
@@ -375,6 +388,8 @@ class ConfigDialog(QtWidgets.QDialog):
         """Fill the widgets from the live window state."""
         win = self.win
         self.check_advanced.setChecked(win.advanced_ui)
+        idx = self.combo_theme.findData(ui_theme.current_theme())
+        self.combo_theme.setCurrentIndex(max(0, idx))
         for key, cb in self.hide_checks.items():
             cb.setChecked(self._is_group_hidden(key))
         self.combo_flow.setCurrentText(win.interp_flow_method)
@@ -395,12 +410,12 @@ class ConfigDialog(QtWidgets.QDialog):
             getattr(win, "owlv2_model", "") or "")
         self.spin_owlv2_conf.setValue(
             getattr(win, "owlv2_conf", 0.3))
+        self.spin_owlv2_exemplar_conf.setValue(
+            getattr(win, "owlv2_exemplar_conf", 0.6))
         self.edit_gdino_model.setText(
             getattr(win, "gdino_model", "") or "")
         self.spin_gdino_conf.setValue(
             getattr(win, "gdino_conf", 0.35))
-        self.edit_florence2_model.setText(
-            getattr(win, "florence2_model", "") or "")
         self.edit_falcon_model.setText(
             getattr(win, "falcon_model", "") or "")
         idx = self.combo_propagate_method.findData(
@@ -457,7 +472,7 @@ class ConfigDialog(QtWidgets.QDialog):
                 max(0.0, min(1.0, float(sam3["propagate_min_seed_iou"]))))
         autolabel = cfg.get("autolabel", {})
         if autolabel.get("detector") in ("sam3", "owlv2", "owlv2_exemplar",
-                                         "grounding_dino", "florence2",
+                                         "grounding_dino",
                                          "falcon"):
             self.combo_autolabel_detector.setCurrentIndex(
                 self.combo_autolabel_detector.findData(
@@ -467,20 +482,23 @@ class ConfigDialog(QtWidgets.QDialog):
         if "owlv2_conf" in autolabel:
             self.spin_owlv2_conf.setValue(
                 max(0.0, min(1.0, float(autolabel["owlv2_conf"]))))
+        if "owlv2_exemplar_conf" in autolabel:
+            self.spin_owlv2_exemplar_conf.setValue(
+                max(0.0, min(1.0, float(autolabel["owlv2_exemplar_conf"]))))
         if autolabel.get("gdino_model"):
             self.edit_gdino_model.setText(str(autolabel["gdino_model"]))
         if "gdino_conf" in autolabel:
             self.spin_gdino_conf.setValue(
                 max(0.0, min(1.0, float(autolabel["gdino_conf"]))))
-        if autolabel.get("florence2_model"):
-            self.edit_florence2_model.setText(
-                str(autolabel["florence2_model"]))
         if autolabel.get("falcon_model"):
             self.edit_falcon_model.setText(str(autolabel["falcon_model"]))
         ui = cfg.get("ui", {})
         if "advanced" in ui:
             self.check_advanced.setChecked(bool(ui["advanced"]))
             self._update_advanced_visibility()
+        if ui.get("theme") in ui_theme.THEMES:
+            self.combo_theme.setCurrentIndex(
+                self.combo_theme.findData(ui["theme"]))
         if "hide" in ui:
             hidden = set(ui["hide"] or [])
             for key, cb in self.hide_checks.items():
@@ -533,16 +551,16 @@ class ConfigDialog(QtWidgets.QDialog):
                 "detector": self.combo_autolabel_detector.currentData(),
                 "owlv2_model": self.edit_owlv2_model.text().strip() or None,
                 "owlv2_conf": self.spin_owlv2_conf.value(),
+                "owlv2_exemplar_conf": self.spin_owlv2_exemplar_conf.value(),
                 "gdino_model": self.edit_gdino_model.text().strip() or None,
                 "gdino_conf": self.spin_gdino_conf.value(),
-                "florence2_model":
-                    self.edit_florence2_model.text().strip() or None,
                 "falcon_model": self.edit_falcon_model.text().strip() or None,
             },
             "ui": {
                 "advanced": advanced,
                 "hide": hidden,
                 "mask_opacity": self.spin_opacity.value(),
+                "theme": self.combo_theme.currentData(),
             },
             "display": {
                 "max_image_dim": self.spin_max_image_dim.value(),

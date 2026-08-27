@@ -135,6 +135,10 @@ QWidget {{
     color: {p['text']};
     font-size: 13px;
 }}
+/* Text widgets never paint their own background: otherwise labels pick up
+   the window color and show as mismatched boxes on panel-colored surfaces
+   (group boxes, status bar, menus). */
+QLabel {{ background: transparent; }}
 
 /* ---------- menus ---------- */
 QMenuBar {{

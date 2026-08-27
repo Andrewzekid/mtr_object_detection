@@ -95,9 +95,9 @@ class ReviewWindow(QMainWindow):
                    autolabel_detector: str = "sam3",
                    owlv2_model: Optional[str] = None,
                    owlv2_conf: float = 0.3,
+                   owlv2_exemplar_conf: float = 0.6,
                    gdino_model: Optional[str] = None,
                    gdino_conf: float = 0.35,
-                   florence2_model: Optional[str] = None,
                    falcon_model: Optional[str] = None,
                    parent=None):
         super().__init__(parent)
@@ -159,20 +159,23 @@ class ReviewWindow(QMainWindow):
         # Autolabel detector: "sam3" (text-prompt SAM3, boxes+masks),
         # "owlv2" (zero-shot OWLv2 boxes), "owlv2_exemplar" (1-shot
         # image-guided OWLv2 using the selected box as the visual query),
-        # or a generic open-set backend: "grounding_dino" / "florence2"
-        # (boxes) / "falcon" (boxes + real masks).
+        # or a generic open-set backend: "grounding_dino" (boxes) /
+        # "falcon" (boxes + real masks).
         # Config: autolabel.detector / autolabel.owlv2_model /
-        # autolabel.owlv2_conf / autolabel.gdino_model /
-        # autolabel.gdino_conf / autolabel.florence2_model /
-        # autolabel.falcon_model.
+        # autolabel.owlv2_conf / autolabel.owlv2_exemplar_conf /
+        # autolabel.gdino_model /
+        # autolabel.gdino_conf / autolabel.falcon_model.
         self.autolabel_detector: str = (
             autolabel_detector if autolabel_detector in AUTOLABEL_DETECTORS
             else "sam3")
         self.owlv2_model = owlv2_model
         self.owlv2_conf = float(owlv2_conf)
+        # Image-guided (exemplar) OWLv2 scores run much hotter than
+        # text-prompt scores — HF's recipe thresholds them at ~0.6, so this
+        # gets its own, higher default than owlv2_conf.
+        self.owlv2_exemplar_conf = float(owlv2_exemplar_conf)
         self.gdino_model = gdino_model
         self.gdino_conf = float(gdino_conf)
-        self.florence2_model = florence2_model
         self.falcon_model = falcon_model
 
         self.setWindowTitle("Computer Vision Label Review Tool")
@@ -901,13 +904,14 @@ class ReviewWindow(QMainWindow):
         if "owlv2_conf" in autolabel_cfg:
             self.owlv2_conf = max(
                 0.0, min(1.0, float(autolabel_cfg["owlv2_conf"])))
+        if "owlv2_exemplar_conf" in autolabel_cfg:
+            self.owlv2_exemplar_conf = max(
+                0.0, min(1.0, float(autolabel_cfg["owlv2_exemplar_conf"])))
         if autolabel_cfg.get("gdino_model"):
             self.gdino_model = str(autolabel_cfg["gdino_model"])
         if "gdino_conf" in autolabel_cfg:
             self.gdino_conf = max(
                 0.0, min(1.0, float(autolabel_cfg["gdino_conf"])))
-        if autolabel_cfg.get("florence2_model"):
-            self.florence2_model = str(autolabel_cfg["florence2_model"])
         if autolabel_cfg.get("falcon_model"):
             self.falcon_model = str(autolabel_cfg["falcon_model"])
         sam3_cfg = cfg.get("sam3", {})
@@ -1141,6 +1145,7 @@ class ReviewWindow(QMainWindow):
                 "mask": self.coco.ensure_mask(ann),
                 "track_id": ann.get("track_id"),
                 "interp": ann.get("interp", False),
+                "conf": ann.get("confidence"),
             })
         return boxes
 
@@ -1156,6 +1161,7 @@ class ReviewWindow(QMainWindow):
             self._point_seg_pending = None
             for c in self.canvases.values():
                 c.clear_point_prompts()
+            self._update_segment_points_btn()
         self._last_loaded_idx = idx
         ts_real = getattr(self.frame_index, "timestamps_real", True)
         # Decode + fill one canvas per side (just "left" in mono). Frame
@@ -1382,25 +1388,34 @@ class ReviewWindow(QMainWindow):
     def _on_show_annotated_rerun(self) -> None:
         """'🗺 Show annotated in Rerun' button: plot every annotated
         frame's camera position (pose DB lookup by image timestamp) on the
-        map of the opened .rrd recording."""
+        map of the opened .rrd recording. Requires both a pose database and
+        an .rrd with the colored point cloud — the user is walked through
+        opening whichever is missing."""
         if self._pose_db is None:
-            QMessageBox.warning(
-                self, "No pose database",
-                "Open a pose database first "
-                "(File -> Open pose database…).")
-            return
+            QMessageBox.information(
+                self, "Pose database required",
+                "Showing annotated frames on the map requires a pose "
+                "database. Please open one now "
+                "(SQLite DB with per-timestamp poses).")
+            self._open_pose_db()
+            if self._pose_db is None:
+                return  # user cancelled or the DB failed to load
         if not self.rerun.rrd_path:
-            QMessageBox.warning(
-                self, "No rerun recording",
-                "Open the .rrd recording first (File -> Open rerun "
-                "file…).")
-            return
+            QMessageBox.information(
+                self, "Rerun recording required",
+                "Showing annotated frames on the map also requires an .rrd "
+                "rerun recording with the colored point cloud. Please open "
+                "one now.")
+            self._open_rerun_file()
+            if not self.rerun.rrd_path:
+                return  # user cancelled or the recording failed to open
         marks = sorted(self.coco.annotated_marks - self.coco.discarded_frames)
         markers = []
         for idx in marks:
             for side in self.canvases:
                 frame = self._frame_at_side(idx, side)
-                pos = self._pose_db.pose_at(frame.get("timestamp_ns"))
+                pos = self._pose_db.pose_for(frame.get("file_name"),
+                                             frame.get("timestamp_ns"))
                 if pos is not None:
                     markers.append((pos, f"frame {idx + 1} ({side})"))
         if not self.rerun.log_annotated_markers(markers):
@@ -2483,14 +2498,16 @@ class ReviewWindow(QMainWindow):
     def _autolabel_model_id(self, detector: str) -> Optional[str]:
         """The configured checkpoint for one autolabel backend."""
         return {"grounding_dino": self.gdino_model,
-                "florence2": self.florence2_model,
                 "falcon": self.falcon_model}.get(detector, self.owlv2_model)
 
     def _autolabel_conf(self, detector: str) -> float:
-        """The configured threshold for one autolabel backend (Florence-2 /
-        Falcon emit no scores — the value is ignored there)."""
-        return self.gdino_conf if detector == "grounding_dino" \
-            else self.owlv2_conf
+        """The configured threshold for one autolabel backend (Falcon
+        emits no scores — the value is ignored there)."""
+        if detector == "grounding_dino":
+            return self.gdino_conf
+        if detector == "owlv2_exemplar":
+            return self.owlv2_exemplar_conf
+        return self.owlv2_conf
 
     def _exemplar_from_selection(self):
         """(crop_rgb, label, cat_id) from the selected box on the ACTIVE
@@ -2634,11 +2651,11 @@ class ReviewWindow(QMainWindow):
                 image_id=image_id,
                 model_id=self.owlv2_model,
                 device=self.sam3_device,
-                conf=self.owlv2_conf,
+                conf=self.owlv2_exemplar_conf,
                 parent=self,
             )
         elif detector in GENERIC_DETECTORS:
-            # Grounding DINO / Florence-2 / Falcon — same signal shape;
+            # Grounding DINO / Falcon — same signal shape;
             # Falcon detections carry real masks.
             self._sam3_autolabel_worker = GenericAutolabelWorker(
                 detector=detector,
@@ -2692,12 +2709,21 @@ class ReviewWindow(QMainWindow):
         nms_dropped = len(ordered) - len(kept)
         n_unknown = len(dets) - len(ordered)  # no cat_id — undetectable
         existing = list(self.coco.anns_for_image(image_id))
+        img_size = self.coco.image_size(image_id)
         added = 0
         skipped = nms_dropped + n_unknown
         with self.coco.undo_stack.group("autolabel"):
             for d in kept:
                 cat_id = d["cat_id"]
                 x1, y1, x2, y2 = d["bbox_xyxy"]
+                # Detector backends don't clip to the image — clamp here so
+                # out-of-bounds predictions can't become off-canvas boxes.
+                if img_size is not None:
+                    w_img, h_img = img_size
+                    x1 = max(0.0, min(x1, w_img))
+                    x2 = max(0.0, min(x2, w_img))
+                    y1 = max(0.0, min(y1, h_img))
+                    y2 = max(0.0, min(y2, h_img))
                 w, h = x2 - x1, y2 - y1
                 if w < 2 or h < 2:
                     skipped += 1
@@ -2713,6 +2739,12 @@ class ReviewWindow(QMainWindow):
                     skipped += 1
                     continue
                 ann_id = self.coco.add_box(image_id, x1, y1, w, h, cat_id)
+                ann = self.coco.get_box(ann_id)
+                if ann is not None and d.get("confidence") is not None:
+                    # Keep the detector's score on the annotation (saved to
+                    # the COCO json, shown on the canvas) so weak detections
+                    # can be told apart from confident ones.
+                    ann["confidence"] = round(float(d["confidence"]), 4)
                 if d.get("mask") is not None:
                     self.coco.set_mask(ann_id, d["mask"])
                 existing.append(self.coco.get_box(ann_id))
@@ -2839,11 +2871,11 @@ class ReviewWindow(QMainWindow):
                 crop, label, cat_id, tmp_dir,
                 model_id=self.owlv2_model,
                 device=self.sam3_device,
-                conf=self.owlv2_conf,
+                conf=self.owlv2_exemplar_conf,
                 parent=self,
             )
         elif detector in GENERIC_DETECTORS:
-            # Grounding DINO / Florence-2 / Falcon — same signal shape;
+            # Grounding DINO / Falcon — same signal shape;
             # Falcon detections carry real masks.
             self._sam3_autolabel_batch_worker = GenericAutolabelBatchWorker(
                 detector, self._side_worker_index(side), list(range(n)),
@@ -3464,10 +3496,12 @@ class ReviewWindow(QMainWindow):
 
     def _on_point_seg_toggled(self, on: bool) -> None:
         """Side panel "🎯 Add points" toggle — switch both canvases between
-        point-prompt clicks and normal draw/select."""
+        point-prompt clicks and normal draw/select. The pending session is
+        NOT cleared here: launching a run auto-exits point mode, and
+        re-entering it adds refinement points for the same object (the
+        session ends on Enter-accept, Esc-cancel, or frame change)."""
         for c in self.canvases.values():
             c.set_point_mode(on)
-        self._point_seg_pending = None
         self._update_segment_points_btn()
         if on:
             self.statusBar().showMessage(
@@ -3476,10 +3510,16 @@ class ReviewWindow(QMainWindow):
                 "Esc cancels (category = preselected / last-used)", 6000)
 
     def _update_segment_points_btn(self) -> None:
-        """Enable "▶ Segment points" while any point-mode canvas holds
-        accumulated points."""
-        enabled = any(c._point_mode and c._point_prompts
-                      for c in self.canvases.values())
+        """Enable "▶ Segment points" while any canvas holds accumulated
+        points, or while a point-seg session is pending on the current
+        frame (a launched run auto-exits point mode, but the button stays
+        clickable so the result can be refined or re-run)."""
+        pending = getattr(self, "_point_seg_pending", None)
+        enabled = (
+            any(c._point_prompts for c in self.canvases.values())
+            or (pending is not None
+                and pending.get("image_id")
+                == getattr(self, "_current_image_id", None)))
         self.side.btn_segment_points.setEnabled(enabled)
 
     def _point_seg_cat(self) -> Optional[int]:
@@ -3509,7 +3549,10 @@ class ReviewWindow(QMainWindow):
 
     def _on_segment_points(self) -> None:
         """"▶ Segment points" button: run SAM3 once with every accumulated
-        point on the canvas that holds them ([[x, y, label], ...])."""
+        point on the canvas that holds them ([[x, y, label], ...]). A
+        launched run consumes the points and auto-exits point mode (the
+        🎯 Add points toggle switches off); the button stays clickable via
+        the pending session so the result can be refined."""
         if not _SAM3_AVAILABLE:
             QMessageBox.warning(self, "SAM3 unavailable",
                                 "core.models_inference.run_sam3 not importable.")
@@ -3526,10 +3569,14 @@ class ReviewWindow(QMainWindow):
         prompts = [list(p) for p in canvas._point_prompts]
         side = canvas.side
         # Category is fixed when the session's first run happens; reuse the
-        # pending session's category for refinement runs.
+        # pending session's category for refinement runs. The reuse target
+        # travels with the job because launching auto-exits point mode,
+        # which clears _point_seg_pending before the worker finishes.
         pending = getattr(self, "_point_seg_pending", None)
+        reuse_ann_id = None
         if pending and pending.get("image_id") == image_id:
             cat_id = pending["cat_id"]
+            reuse_ann_id = pending["ann_id"]
         else:
             cat_id = self._point_seg_cat()
         if cat_id is None:
@@ -3551,6 +3598,7 @@ class ReviewWindow(QMainWindow):
             "labels": [int(p[2]) for p in prompts],
             "cat_id": cat_id,
             "image_id": image_id,
+            "reuse_ann_id": reuse_ann_id,
         }
         if self._sam3_busy():
             self._sam3_queue.append(job)
@@ -3558,8 +3606,11 @@ class ReviewWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"SAM3 busy — point segment queued "
                 f"({len(self._sam3_queue)} in queue)", 2500)
-            return
-        self._start_point_seg_worker(job)
+        else:
+            self._start_point_seg_worker(job)
+        # Launching a run consumes the accumulated points and ends point
+        # mode — the user is taken back to normal draw/select.
+        self.side.btn_add_points.setChecked(False)
 
     def _start_point_seg_worker(self, job: Dict[str, Any]) -> None:
         n_pos = sum(1 for l in job["labels"] if l == 1)
@@ -3595,28 +3646,32 @@ class ReviewWindow(QMainWindow):
         if not result.get("success"):
             self._set_sam3_status(
                 f"point segment failed — {result.get('error', 'no mask')}")
+            self._update_segment_points_btn()
             QTimer.singleShot(0, self._start_next_queued_sam3)
             return
         bbox = result.get("bbox_xyxy")
         mask = result.get("mask")
         if bbox is None or image_id is None or cat_id is None:
             self._set_sam3_status("point segment: nothing found at that point")
+            self._update_segment_points_btn()
             QTimer.singleShot(0, self._start_next_queued_sam3)
             return
         x1, y1, x2, y2 = bbox
         w, h = x2 - x1, y2 - y1
         if w < 2 or h < 2:
             self._set_sam3_status("point segment: mask too small — ignored")
+            self._update_segment_points_btn()
             QTimer.singleShot(0, self._start_next_queued_sam3)
             return
-        # Refinement clicks update the session's existing annotation; the
-        # first successful run of a session creates it.
-        pending = getattr(self, "_point_seg_pending", None)
-        reuse = (pending and pending.get("image_id") == image_id
-                 and self.coco.get_box(pending["ann_id"]) is not None)
+        # Refinement runs update the session's existing annotation (the
+        # reuse target rides in the job because launching auto-exited point
+        # mode, clearing _point_seg_pending); a first run creates it.
+        reuse_ann_id = job.get("reuse_ann_id")
+        reuse = (reuse_ann_id is not None
+                 and self.coco.get_box(reuse_ann_id) is not None)
         with self.coco.undo_stack.group("point segment"):
             if reuse:
-                ann_id = pending["ann_id"]
+                ann_id = reuse_ann_id
                 self.coco.move_box(ann_id, x1, y1, w, h)
                 if mask is not None:
                     self.coco.set_mask(ann_id, mask)
@@ -3624,8 +3679,9 @@ class ReviewWindow(QMainWindow):
                 ann_id = self.coco.add_box(image_id, x1, y1, w, h, cat_id)
                 if mask is not None:
                     self.coco.set_mask(ann_id, mask)
-                self._point_seg_pending = {"image_id": image_id,
-                                           "ann_id": ann_id, "cat_id": cat_id}
+            self._point_seg_pending = {"image_id": image_id,
+                                       "ann_id": ann_id, "cat_id": cat_id}
+        self._update_segment_points_btn()
         self._last_cat_id = cat_id
         if image_id == self._current_image_id:
             self._refresh_boxes()
@@ -3642,6 +3698,7 @@ class ReviewWindow(QMainWindow):
         canvas = self.sender()
         if isinstance(canvas, CanvasWidget):
             canvas.clear_point_prompts()
+        self._update_segment_points_btn()
         self.statusBar().showMessage(
             "Point segment: accepted — next click starts a new object", 2500)
 
@@ -3652,6 +3709,7 @@ class ReviewWindow(QMainWindow):
         if isinstance(canvas, CanvasWidget):
             canvas.clear_point_prompts()
         self._point_seg_pending = None
+        self._update_segment_points_btn()
         if pending and self.coco.get_box(pending["ann_id"]) is not None:
             self.coco.remove_box(pending["ann_id"])
             self._refresh_boxes()

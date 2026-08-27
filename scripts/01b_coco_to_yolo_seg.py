@@ -15,7 +15,8 @@ The full post-annotation chain is:
       -> 03_split_dataset.py       (train/val/test + dataset.yaml)
       -> 04_train_model.py --task segment
 
-or run all of them at once with scripts/run_seg_dataset_pipeline.py.
+or run all of them at once with
+`python scripts/orchestrate_pipeline.py --coco-json ... --images-dir ...`.
 
 USAGE:
     # Mono session: images all in one folder

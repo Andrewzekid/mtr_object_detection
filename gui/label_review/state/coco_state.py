@@ -1131,6 +1131,12 @@ class CocoState:
         # (e.g. append/remove/sort) and silently corrupt the cache.
         return list(self._anns_by_image.get(image_id, []))
 
+    def image_size(self, image_id: int) -> Optional[Tuple[int, int]]:
+        """(width, height) of an image record, or None when unknown."""
+        img = self._img_by_id.get(image_id) or {}
+        w, h = img.get("width"), img.get("height")
+        return (int(w), int(h)) if w and h else None
+
     def _resolve_cat_id(self, label: str) -> int:
         # If the label parses as an int matching an existing cat id, use it.
         try:

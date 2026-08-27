@@ -35,7 +35,7 @@ def _load_script(name):
 
 
 converter = _load_script("01b_coco_to_yolo_seg.py")
-runner = _load_script("run_seg_dataset_pipeline.py")
+runner = _load_script("orchestrate_pipeline.py")
 
 
 # ---------------------------------------------------------------------------
@@ -274,11 +274,11 @@ def test_full_chain_end_to_end(tmp_path):
     coco_json, images_dir = _make_coco_session(tmp_path, stereo=True, n=6)
     out = tmp_path / "pipeline_out"
     result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "run_seg_dataset_pipeline.py"),
+        [sys.executable, str(ROOT / "scripts" / "orchestrate_pipeline.py"),
          "--coco-json", str(coco_json), "--images-dir", str(images_dir),
-         "--output-dir", str(out),
+         "--output-root", str(out),
          "--augmentations", "flip_horizontal", "--multiplier", "1",
-         "--ratios", "0.5", "0.25", "0.25", "--seed", "42"],
+         "--ratios", "0.5", "0.25", "0.25", "--split-seed", "42"],
         capture_output=True, text=True, cwd=str(ROOT), timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -313,10 +313,10 @@ def test_chain_skip_augment(tmp_path):
     coco_json, images_dir = _make_coco_session(tmp_path, stereo=False, n=4)
     out = tmp_path / "pipeline_out"
     result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "run_seg_dataset_pipeline.py"),
+        [sys.executable, str(ROOT / "scripts" / "orchestrate_pipeline.py"),
          "--coco-json", str(coco_json), "--images-dir", str(images_dir),
-         "--output-dir", str(out), "--skip-augment",
-         "--ratios", "0.5", "0.5", "0.0", "--seed", "1"],
+         "--output-root", str(out), "--skip-augment",
+         "--ratios", "0.5", "0.5", "0.0", "--split-seed", "1"],
         capture_output=True, text=True, cwd=str(ROOT), timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr

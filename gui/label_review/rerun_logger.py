@@ -12,8 +12,11 @@ of the timeline) under
 
     world/map/annotated_frames
 
+(or, when the recording's map point cloud lives elsewhere, as a sibling of
+that cloud - e.g. ``world/leveled/camera_init/annotated_frames`` - so the
+markers inherit the same Transform3D chain as the map and land on it).
 Marker positions come from a pose database (PoseDb in map_view.py), keyed
-by each frame's ``timestamp_ns``.
+by each frame's ``timestamp_ns`` or matched by image filename.
 """
 
 from __future__ import annotations
@@ -30,8 +33,9 @@ except Exception:  # pragma: no cover - rerun is optional
     rr = None  # type: ignore[assignment]
     _HAS_RERUN = False
 
-# Entity path of the markers inside the recording (sits next to the map,
-# conventionally logged at world/map).
+# Default entity path of the markers inside the recording; the actual path
+# is derived per recording (sibling of the map point cloud, see
+# _find_marker_entity) and this is only the fallback.
 MARKER_ENTITY = "world/map/annotated_frames"
 
 
@@ -47,6 +51,7 @@ class RerunLogger:
         self.rrd_path: Optional[str] = None
         self._stream = None
         self._port: Optional[int] = None  # set while connected to a viewer
+        self._marker_entity = MARKER_ENTITY
 
     # ------------------------------------------------------------------ #
 
@@ -56,6 +61,7 @@ class RerunLogger:
         if not self.enabled:
             return False
         app_id, rec_id = self._read_store_id(rrd_path)
+        self._marker_entity = self._find_marker_entity(rrd_path, rec_id)
         try:
             self._stream = rr.RecordingStream(app_id, recording_id=rec_id)
         except Exception as exc:
@@ -80,11 +86,12 @@ class RerunLogger:
             # Static clear + static points: previous markers disappear even
             # when frames got un-marked, and markers stay visible at every
             # timeline position.
-            self._stream.log(MARKER_ENTITY, rr.Clear(recursive=False),
+            self._stream.log(self._marker_entity,
+                             rr.Clear(recursive=False),
                              static=True)
             if markers:
                 self._stream.log(
-                    MARKER_ENTITY,
+                    self._marker_entity,
                     rr.Points3D([m[0] for m in markers], radii=0.15,
                                 colors=[(255, 60, 60)] * len(markers),
                                 labels=[m[1] for m in markers]),
@@ -129,6 +136,45 @@ class RerunLogger:
         except Exception as exc:
             print(f"WARNING: could not spawn the rerun viewer: {exc}")
             return False
+
+    @staticmethod
+    def _find_marker_entity(rrd_path: str, rec_id: Optional[str]) -> str:
+        """Entity path for the markers: sibling of the recording's map
+        point cloud, so markers inherit the same Transform3D chain (e.g. a
+        leveling rotation on an ancestor) as the map itself.
+
+        Finds Points3D entities in the data store, prefers names containing
+        "map" (the aggregated clouds rather than per-frame scans), and
+        returns ``<parent>/annotated_frames``. Falls back to MARKER_ENTITY.
+        """
+        try:
+            import rerun_bindings
+            reader = rerun_bindings.RrdReaderInternal(rrd_path)
+            entry = next(
+                (e for e in reader.store_entries()
+                 if getattr(e, "application_id", None)
+                 and getattr(e, "recording_id", None) == rec_id), None)
+            if entry is None:
+                return MARKER_ENTITY
+            clouds = []
+            for chunk in reader.stream(store=entry):
+                comps = {f.name for f in chunk.to_record_batch().schema}
+                if any(c.startswith("Points3D:") for c in comps):
+                    clouds.append(chunk.entity_path.strip("/"))
+            if not clouds:
+                return MARKER_ENTITY
+            clouds.sort(key=lambda p: ("map" not in p.lower(), p))
+            parent, _, _ = clouds[0].rpartition("/")
+            entity = f"{parent}/annotated_frames" if parent else \
+                MARKER_ENTITY
+            if entity != MARKER_ENTITY:
+                print(f"Rerun markers will be logged at '{entity}' "
+                      f"(next to the map '{clouds[0]}')")
+            return entity
+        except Exception as exc:
+            print(f"WARNING: could not inspect {rrd_path} for the map "
+                  f"point cloud: {exc}")
+            return MARKER_ENTITY
 
     @staticmethod
     def _read_store_id(rrd_path: str) -> Tuple[str, Optional[str]]:

@@ -394,7 +394,9 @@ class CanvasWidget(QWidget):
             ttxt = (f"T{tid} " if (tid is not None and self.show_track_ids)
                     else "")
             itxt = "~" if box.get("interp") else ""
-            label = f"{itxt}{ttxt}{box.get('cat_name','?')} (id:{box['id']})"
+            conf = box.get("conf")
+            ctxt = f" {conf:.2f}" if conf is not None else ""
+            label = f"{itxt}{ttxt}{box.get('cat_name','?')}{ctxt} (id:{box['id']})"
             p.fillRect(
                 int(tl.x()), max(0, int(tl.y() - 16)),
                 8 * len(label) + 6, 16, QColor(0, 0, 0, 160)

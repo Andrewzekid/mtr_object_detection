@@ -1215,13 +1215,13 @@ class Owlv2AutolabelBatchWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Generic open-set autolabel backends (Grounding DINO, Florence-2, Falcon)
+# Generic open-set autolabel backends (Grounding DINO, Falcon)
 # plus OWLv2 exemplar (1-shot image-guided) detection.
 # Same worker/signal shape as the OWLv2 workers so the MainWindow apply path
 # is shared. Falcon detections carry real masks; the others mask=None.
 # ---------------------------------------------------------------------------
 
-GENERIC_DETECTORS = ("grounding_dino", "florence2", "falcon")
+GENERIC_DETECTORS = ("grounding_dino", "falcon")
 
 
 def _generic_detect(detector: str, img, concepts: List[str],
@@ -1229,19 +1229,15 @@ def _generic_detect(detector: str, img, concepts: List[str],
                     state: Optional[dict]) -> List[Dict[str, Any]]:
     """Dispatch one detection call to the selected open-set backend.
 
-    ``conf`` maps to Grounding DINO's box_threshold; Florence-2 and Falcon
-    emit no scores so it is ignored there. Import errors surface as
-    exceptions so the worker can report them via failed_signal.
+    ``conf`` maps to Grounding DINO's box_threshold; Falcon emits no scores
+    so it is ignored there. Import errors surface as exceptions so the
+    worker can report them via failed_signal.
     """
     if detector == "grounding_dino":
         from core.detectors import grounding_dino_detect
         return grounding_dino_detect(img, concepts, model_id=model_id,
                                      device=device, box_threshold=conf,
                                      _state=state)
-    if detector == "florence2":
-        from core.detectors import florence2_detect
-        return florence2_detect(img, concepts, model_id=model_id,
-                                device=device, _state=state)
     if detector == "falcon":
         from core.detectors import falcon_detect
         return falcon_detect(img, concepts, model_id=model_id,

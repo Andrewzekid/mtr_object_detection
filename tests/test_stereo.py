@@ -341,8 +341,8 @@ def test_autolabel_frame_runs_both_sides_in_stereo(lr, make_coco, make_window,
     from gui.label_review.ui import main_window as mw
     win, coco, idx, _l, _r = _stereo_setup(lr, make_coco, make_window,
                                            tmp_path, name="alframe")
-    # Patch the generic autolabel single-frame worker (falcon/grounding_dino/
-    # florence2 share it) so we can observe both dispatches.
+    # Patch the generic autolabel single-frame worker (falcon/grounding_dino
+    # share it) so we can observe both dispatches.
     monkeypatch.setattr(mw, "GenericAutolabelWorker", FakeAutolabelSingle)
     FakeAutolabelSingle.instances.clear()
     win.autolabel_detector = "falcon"

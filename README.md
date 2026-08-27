@@ -125,12 +125,11 @@ Settings → Autolabel (persisted as `autolabel.detector` in the GUI config):
 | `owlv2` | boxes | zero-shot, `google/owlv2-large-patch14-ensemble` (HF) |
 | `owlv2_exemplar` | boxes | 1-shot: select an existing box first — its crop becomes the visual query (`image_guided_detection`) |
 | `grounding_dino` | boxes | zero-shot; default `IDEA-Research/grounding-dino-base` (the `-large` checkpoint is not published in transformers format) |
-| `florence2` | boxes | phrase grounding per category via `microsoft/Florence-2-large`; no confidence scores (all 1.0) |
 | `falcon` | boxes + masks | `tiiuae/Falcon-Perception`; free-form text query per category |
 
 Per-backend config keys (Settings dialog or config JSON): `owlv2_model` /
 `owlv2_conf` (default 0.3), `gdino_model` / `gdino_conf` (0.35, maps to the
-box threshold), `florence2_model`, `falcon_model`. First use downloads the
+box threshold), `falcon_model`. First use downloads the
 checkpoint from Hugging Face; models are cached per session.
 
 Two compatibility notes for the HF backends (handled automatically in
@@ -138,9 +137,7 @@ Two compatibility notes for the HF backends (handled automatically in
 memory of consumer GPUs (RTX 4090), so they are recompiled with smaller
 blocks at load (BLOCK=128, 1 stage; tunable via `FALCON_FLEX_BLOCK_M` /
 `FALCON_FLEX_BLOCK_N` / `FALCON_FLEX_STAGES`), and per-category queries are
-batched into one `generate` call; Florence-2 runs its 2023-era remote
-code under transformers 5.x via shims plus a local beam search
-(`model.generate` is unusable there — see `core/detectors.py`).
+batched into one `generate` call.
 
 ### Labelling assist features (when and how to use them)
 
@@ -246,7 +243,8 @@ GUI annotate (SAM3 masks) → COCO labels_coco.json (discard unwanted frames
 ```
 
 See "Segmentation dataset pipeline (GUI → YOLO seg)" below for commands, or
-run all post-GUI steps at once with `scripts/run_seg_dataset_pipeline.py`.
+run all post-GUI steps at once with
+`python scripts/orchestrate_pipeline.py --coco-json ... --images-dir ...`.
 
 **Orchestrated pipeline** — the whole keyframe workflow with one command.
 Input is either a Metacam rosbag (adds the fisheye undistortion stage) or a
@@ -378,7 +376,7 @@ Qwen3.8 vision GGUF + its `mmproj` (e.g. `Qwen3.8-27B-Q4_K_M.gguf` +
 `Qwen3.8-mmproj-F16.gguf`) into `~/code/llama/llama.cpp/` and start it
 yourself (see Step 1 of the Quickstart).
 
-**HF autolabel backends** (`owlv2`, `grounding-dino`, `florence2`,
+**HF autolabel backends** (`owlv2`, `grounding-dino`,
 `falcon`) download automatically on first use in the GUI's
 Settings → Autolabel, into `~/.cache/huggingface/`. YOLO pretrained base
 weights (`yolo26n.pt`, …) are fetched by Ultralytics on first training
@@ -479,7 +477,7 @@ python -m gui.label_review.main --help
 | SAM3 (`sam3.pt`) | `facebook/sam3` (gated) | `core/sam3/models/sam3-model/sam3.pt` | `install.sh` / manual / Docker build |
 | SAM3.1 (`sam3.1_multiplex.pt`) | `facebook/sam3.1` (gated) | `core/sam3/models/sam3.1-model/sam3.1_multiplex.pt` | same |
 | YOLO base weights (`yolo26n.pt` …) | Ultralytics | `models/` | Ultralytics on first training run |
-| OWLv2 / Grounding-DINO / Florence-2 / Falcon | HuggingFace | `~/.cache/huggingface/` | `transformers.from_pretrained` on first GUI use |
+| OWLv2 / Grounding-DINO / Falcon | HuggingFace | `~/.cache/huggingface/` | `transformers.from_pretrained` on first GUI use |
 | Qwen VLM (GGUF) | user-supplied | `~/code/llama/llama.cpp/` | you (install.sh `--llamacpp` builds the server only) |
 
 ### Standalone bundle (no Python needed on the target)
@@ -835,26 +833,29 @@ GUI annotate (SAM3 masks on every frame, discard bad frames with the
 
 Runs all three post-GUI steps and validates the dataset format after each
 step (image/label pairing, label syntax, coordinate range, class ids), so a
-format mismatch fails at the step that introduced it:
+format mismatch fails at the step that introduced it. This is the
+orchestrator's dataset-only mode (`--coco-json`):
 
 ```bash
-python scripts/run_seg_dataset_pipeline.py \
+python scripts/orchestrate_pipeline.py \
   --coco-json /data/run/labels_coco.json \
   --images-dir /data/run/camera \
-  --output-dir output/my_dataset \
+  --output-root output/my_dataset \
   --augmentations flip_horizontal rotate brightness hue blur \
-  --multiplier 2 --ratios 0.7 0.15 0.15 --seed 42
+  --multiplier 2 --ratios 0.7 0.15 0.15 --split-seed 42
 
 # skip augmentation entirely:
-python scripts/run_seg_dataset_pipeline.py \
+python scripts/orchestrate_pipeline.py \
   --coco-json /data/run/labels_coco.json --images-dir /data/run/camera \
-  --output-dir output/my_dataset --skip-augment
+  --output-root output/my_dataset --skip-augment
 ```
 
 `--images-dir` is the plain image folder for mono sessions, or the parent
 folder containing `left/` + `right/` for stereo sessions (the GUI writes a
 `side` field per image; output filenames get `left_`/`right_` prefixes so the
-identical timestamp names don't collide). The runner prints the exact
+identical timestamp names don't collide). The dataset-only mode is also
+reachable via the shell wrapper: `./scripts/run_pipeline.sh --coco-json <coco>
+--images-dir <dir> --output-root <out>`. The runner prints the exact
 `04_train_model.py --config .../dataset.yaml --task segment` command at the end.
 
 Output layout:
@@ -921,9 +922,9 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | `09_create_seg_dataset.py` | **Superseded by GUI SAM3 segmentation + `01b`** (moved to `tests/`). | — | — |
 | `04_train_model.py` | Train a YOLO detect/segment model (Ultralytics). | `--config` (data.yaml), `--model-type`, `--task`, `--epochs`, `--batch-size`, `--device`, `--loss-type` | `runs/.../weights/best.pt` |
 | `05_evaluate_model.py` | Evaluate a trained model on one or more splits (default `test train`) with per-class precision/recall/F1/AP50/AP50-95 (box + mask), or compare pred vs GT COCO JSON. | `--model`, `--data`, `--split`, `--conf`, `--iou`, `--csv` (or `--pred-json`/`--gt-json`) | Metrics report (stdout) + per-class CSV |
-| `11_run_tracking.py` | YOLO tracking (ByteTrack / BoT-SORT / Deep OC-SORT / detect-then-SAM3) + a no-output benchmark mode. Pre-tracker class-agnostic NMS; optional TensorRT engine export (`--trt`, replaces the standalone `15_export_trt.py` step). | `--tracker`, `--model`, `--data`, `--output`, `--conf`, `--device`, `--warmup-frames`, `--nms-iou`, `--trt`, `--no-masks`, `--no-vis`, `--postprocess-workers` | `tracked_*.jpg`, `results.json`, `tracking_result.mp4` |
-| `orchestrate_pipeline.py` | End-to-end keyframe pipeline: undistort → sample → keyframes → stats → Qwen → COCO combine → GUI review → 01b COCO→YOLO-seg → 03 split → 02 augment (train only) → assemble final dataset + stats CSV → 04 train → 05 evaluate → 11 tracking. Stage markers make it resumable. | `--rosbag`/`--images`, `--camera`, `--stage`, `--skip-stage`, `--force`, per-stage args (`--sample-size`, `--ratios`, `--augmentations`, `--epochs`, `--tracker`, ...) | `<input>_pipeline/` output tree |
-| `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`LLAMACPP_URL`, `QWEN_MODEL`, `QWEN_MMPROJ`). | `<rosbag_path>` + any orchestrator args | same as orchestrator |
+| `11_run_tracking.py` | YOLO tracking (ByteTrack / BoT-SORT / Deep OC-SORT / detect-then-SAM3) + a no-output benchmark mode. Pre-tracker class-agnostic NMS; | `--tracker`, `--model`, `--data`, `--output`, `--conf`, `--device`, `--warmup-frames`, `--nms-iou`, `--trt`, `--no-masks`, `--no-vis`, `--postprocess-workers` | `tracked_*.jpg`, `results.json`, `tracking_result.mp4` |
+| `orchestrate_pipeline.py` | End-to-end keyframe pipeline: undistort → sample → keyframes → stats → Qwen → COCO combine → GUI review → 01b COCO→YOLO-seg → 03 split → 02 augment (train only) → assemble final dataset + stats CSV → 04 train → 05 evaluate → 11 tracking. Stage markers make it resumable. Also supports a dataset-only mode (`--coco-json` + `--images-dir`) that runs just 01b convert → 02 augment → 03 split on an already-reviewed COCO file. | `--rosbag`/`--images`/`--coco-json`, `--camera`, `--stage`, `--skip-stage`, `--force`, per-stage args (`--sample-size`, `--ratios`, `--augmentations`, `--epochs`, `--tracker`, ...) | `<input>_pipeline/` output tree (or `{yolo_flat,augmented,dataset}/` in dataset-only mode) |
+| `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`LLAMACPP_URL`, `QWEN_MODEL`, `QWEN_MMPROJ`). Pass `--coco-json ...` for the dataset-only mode. | `<rosbag_path>` (or `--coco-json <coco> --images-dir <dir>`) + any orchestrator args | same as orchestrator |
 
 ### Keyframe pipeline
 
@@ -942,7 +943,6 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | `01b_coco_to_yolo_seg.py` | Convert label-review GUI COCO output into a flat YOLO segmentation dataset (input for `02`). Stereo-aware (`left_`/`right_` prefixes); mask-less boxes skipped unless `--bbox-as-rect`. | `--coco-json`, `--images-dir`, `--output-dir`, `--bbox-as-rect`, `--symlink` | `images/`, `labels/`, `classes.txt`, `conversion_summary.json` |
 | `02_augment_data.py` | Augment a labeled YOLO dataset (flip/rotate/brightness/contrast/hue/blur/resize/mosaic); polygon labels are transformed with the image. | `--input-dir`, `--output-dir`, `--augmentations`, `--multiplier`, `--hue-range`, `--blur-range`, `--resize` | Augmented images + labels (+ `classes.txt` passthrough) |
 | `03_split_dataset.py` | Split a labeled YOLO dataset into train/val/test + `data.yaml`. Class names fall back to `classes.txt` when `--class-names` is omitted. | `--input-dir`, `--output-dir`, `--ratios`, `--generate-yaml` | `images/labels/{train,val,test}/`, `data.yaml` |
-| `run_seg_dataset_pipeline.py` | One-command chain: GUI COCO → `01b` convert → `02` augment → `03` split, with dataset-format validation after each step. | `--coco-json`, `--images-dir`, `--output-dir`, `--augmentations`, `--ratios`, `--skip-augment` | `<out>/{yolo_flat,augmented,dataset}/` + `dataset.yaml` |
 | `10_qwen_json_to_yolo.py` | Convert `07 --split-by-class` JSON into a YOLO detection dataset. | `--annotations-dir`, `--image-folder`, `--output-dir`, `--data-yaml` | YOLO detect dataset (`images/`, `labels/`, `data.yaml`) |
 
 ### Standalone tools
@@ -950,7 +950,6 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | Script | Purpose | Key inputs | Outputs |
 |-------|---------|------------|---------|
 | `06_run_sam3.py` | Run SAM3 segmentation on an image/folder, optionally with bbox exemplars. | `--image`/`--image-folder`, `--bbox`/`--bbox-json`, `--concept`, `--model` | Masks / overlay images (`--output`, `--save-overlay`) |
-| `15_export_trt.py` | Standalone TensorRT engine export from a `.pt` checkpoint (FP16, fixed imgsz; also available inline via `11_run_tracking.py --trt`). | `--model`, `--imgsz`, `--workspace`, `--device` | `<model>.engine` next to the checkpoint |
 | `undistort_rosbag.py` | Fisheye-undistort a folder of images using a calibration JSON. | `--images-root`, `--output-root`, `--calibration`, `--camera-name` | Undistorted images |
 | `visualize.py` | Visualize Qwen annotations / YOLO detect / YOLO seg / model predictions. | `--mode`, `--dataset`/`--annotations-folder`, `--output`, `--model` | Annotated images |
 | `tracking_utils.py` | Shared helpers (tracker YAML, IoU, mask→polygon, summary video). | — (library, not a CLI) | — |
@@ -1118,6 +1117,8 @@ frames; the slider scrubs the sequence (progress saved on release).
 
 ### Settings dialog (⚙ Config / Ctrl+G)
 
+- **Appearance** — UI theme: `dark`, `light`, or `pastel` lime (same as the
+  View menu; applied on Apply and persisted, config key `ui.theme`).
 - **Hide UI elements** — hide panel groups you don't use (`ui.hide`).
 - **Advanced settings** — enables Interpolation/Tracking sections.
   - Interpolation: flow method (`dis`/`klt`/`farneback`), camera model,
@@ -1128,7 +1129,7 @@ frames; the slider scrubs the sequence (progress saved on release).
   (`sam3.*`).
 - **Autolabel detector**: `sam3`, `owlv2`, `owlv2_exemplar` (1-shot — select
   an existing box first; its crop becomes the visual query),
-  `grounding_dino`, `florence2`, `falcon`, plus per-backend model/conf keys
+  `grounding_dino`, `falcon`, plus per-backend model/conf keys
   (`autolabel.*`). First use downloads HF checkpoints.
 - **Masks / Display**: overlay opacity (`ui.mask_opacity`), max image size
   (`display.max_image_dim`, 0 = original).

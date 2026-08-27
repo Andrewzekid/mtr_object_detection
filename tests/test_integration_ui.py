@@ -1151,8 +1151,8 @@ def test_autolabel_header_follows_detector(lr, make_coco, make_window,
     win._apply_runtime_config({"autolabel": {"detector": "owlv2_exemplar"}})
     assert win.side.autolabel_header.text() == "OWLv2 exemplar Autolabel:"
     assert "visual query" in win.side.btn_autolabel_frame.toolTip()
-    win._apply_runtime_config({"autolabel": {"detector": "florence2"}})
-    assert win.side.autolabel_header.text() == "Florence-2 Autolabel:"
+    win._apply_runtime_config({"autolabel": {"detector": "owlv2"}})
+    assert win.side.autolabel_header.text() == "OWLv2 Autolabel:"
     assert "with masks" not in win.side.btn_autolabel_frame.toolTip()
 
 
@@ -1739,7 +1739,7 @@ def test_discard_image_button(lr, make_coco, make_window, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# open-set autolabel backends (grounding_dino / florence2 / falcon) and
+# open-set autolabel backends (grounding_dino / falcon) and
 # OWLv2 exemplar — routing, config roundtrip, exemplar crop extraction.
 # ---------------------------------------------------------------------------
 
@@ -1750,17 +1750,16 @@ def test_autolabel_detector_config_roundtrip(lr, make_coco, make_window,
     win = make_window(lr.EmptyIndex(), make_coco(AL_CATS))
     dlg = lr.ConfigDialog(win)
     assert dlg._collect()["autolabel"]["detector"] == "sam3"
-    for det in ("owlv2", "owlv2_exemplar", "grounding_dino", "florence2",
+    for det in ("owlv2", "owlv2_exemplar", "grounding_dino",
                 "falcon"):
         dlg._prefill_from_config({"autolabel": {
             "detector": det, "owlv2_model": "m/ow", "owlv2_conf": 0.55,
             "gdino_model": "m/gd", "gdino_conf": 0.45,
-            "florence2_model": "m/fl", "falcon_model": "m/fa"}})
+            "falcon_model": "m/fa"}})
         out = dlg._collect()["autolabel"]
         assert out["detector"] == det
         assert out["owlv2_model"] == "m/ow" and out["owlv2_conf"] == 0.55
         assert out["gdino_model"] == "m/gd" and out["gdino_conf"] == 0.45
-        assert out["florence2_model"] == "m/fl"
         assert out["falcon_model"] == "m/fa"
     # _apply_runtime_config on the live window
     win._apply_runtime_config({"autolabel": {"detector": "falcon",

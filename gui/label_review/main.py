@@ -516,10 +516,11 @@ def main():
                        owlv2_model=autolabel_cfg.get("owlv2_model"),
                        owlv2_conf=float(autolabel_cfg.get(
                            "owlv2_conf", 0.3)),
+                       owlv2_exemplar_conf=float(autolabel_cfg.get(
+                           "owlv2_exemplar_conf", 0.6)),
                        gdino_model=autolabel_cfg.get("gdino_model"),
                        gdino_conf=float(autolabel_cfg.get(
                            "gdino_conf", 0.35)),
-                       florence2_model=autolabel_cfg.get("florence2_model"),
                        falcon_model=autolabel_cfg.get("falcon_model"),
                        sam3_model=sam3_cfg.get("model") or args.sam3_model,
                        sam3_device=sam3_device,

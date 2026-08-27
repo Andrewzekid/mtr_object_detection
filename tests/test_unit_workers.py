@@ -634,7 +634,7 @@ def test_propagate_worker_chain_passes_iou_thresholds(sam3_on, workers,
 
 
 # ---------------------------------------------------------------------------
-# Generic open-set autolabel backends (Grounding DINO / Florence-2 / Falcon)
+# Generic open-set autolabel backends (Grounding DINO / Falcon)
 # and OWLv2 exemplar workers — detector fns monkeypatched, no HF downloads.
 # ---------------------------------------------------------------------------
 
@@ -667,20 +667,12 @@ def test_generic_detect_dispatch_grounding_dino(workers, monkeypatch):
     assert calls["state"] is state and calls["model_id"] == "m/gd"
 
 
-def test_generic_detect_dispatch_florence2_and_falcon(workers, monkeypatch):
+def test_generic_detect_dispatch_falcon(workers, monkeypatch):
     import core.detectors as fa
-    import core.detectors as fl
-    monkeypatch.setattr(
-        fl, "florence2_detect",
-        lambda *a, **k: [{"label": "x", "bbox_xyxy": [0, 0, 1, 1],
-                          "mask": None, "confidence": 1.0}])
     monkeypatch.setattr(
         fa, "falcon_detect",
         lambda *a, **k: [{"label": "y", "bbox_xyxy": [0, 0, 2, 2],
                           "mask": None, "confidence": 1.0}])
-    assert workers._generic_detect(
-        "florence2", "/i.png", ["x"], None, "cpu", 0.3, None
-    )[0]["label"] == "x"
     assert workers._generic_detect(
         "falcon", "/i.png", ["y"], None, "cpu", 0.3, None
     )[0]["label"] == "y"
@@ -713,12 +705,12 @@ def test_generic_autolabel_worker_failure_reported(workers, monkeypatch):
         raise RuntimeError("model missing")
 
     monkeypatch.setattr(workers, "_generic_detect", boom)
-    w = workers.GenericAutolabelWorker("florence2", "/img/x.png", ["a"], [0],
-                                       7, None, "cpu", 0.3)
+    w = workers.GenericAutolabelWorker("grounding_dino", "/img/x.png",
+                                       ["a"], [0], 7, None, "cpu", 0.3)
     got = {}
     w.failed_signal.connect(lambda e: got.update(error=e))
     w.run()
-    assert "florence2" in got["error"] and "model missing" in got["error"]
+    assert "grounding_dino" in got["error"] and "model missing" in got["error"]
 
 
 def test_generic_autolabel_batch_worker(workers, monkeypatch, tmp_path):
