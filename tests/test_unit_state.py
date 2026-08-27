@@ -351,7 +351,11 @@ def test_legacy_base64_mask_migrates_to_segmentation(lr, tmp_path):
     }, open(path, "w"))
     coco = lr.CocoState(path, [{"id": 0, "name": "a"}])
     coco.load_existing()
-    m3 = coco.annotations[0].get("_mask")
+    # Legacy base64 masks load as lazy PNG bytes (_mask_png) and are
+    # materialized on demand — eager decoding of a whole dataset would
+    # exhaust RAM.
+    assert coco.annotations[0].get("_mask") is None
+    m3 = coco.ensure_mask(coco.annotations[0])
     assert m3 is not None and m3.shape == (100, 100) and m3[30, 30]
     # re-saving a legacy-loaded file writes segmentation, not mask
     coco.save(is_final=True)

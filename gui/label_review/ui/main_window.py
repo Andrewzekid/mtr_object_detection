@@ -826,24 +826,42 @@ class ReviewWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Load annotations", str(e))
             return
-        if getattr(self.frame_index, "stereo", False):
-            # Stereo: match imported images by (basename, side).
-            file_to_frame = {}
-            for side, files in (("left", self.frame_index.files_left),
-                                ("right", self.frame_index.files_right)):
-                for i, fp in enumerate(files):
-                    file_to_frame[(os.path.basename(fp), side)] = i
-        else:
-            file_to_frame = {
-                os.path.basename(fp): i
-                for i, fp in enumerate(getattr(self.frame_index, "files", []))
-            }
-        n_frames, n_ok, n_skip, n_merged = self.coco.import_coco(
-            data, file_to_frame, self.frame_index)
-        self.side._rebuild_cat_list()  # import may have added categories
-        self._refresh_boxes()
-        self._update_progress()
-        self.coco.save(is_final=False)
+        # An unhandled exception inside a Qt slot aborts the whole process
+        # (PyQt's qFatal), which looks exactly like "the GUI crashed" —
+        # e.g. a MemoryError while parsing a multi-GB annotations file.
+        # Contain everything here instead and report via dialog/status bar.
+        try:
+            QtWidgets.QApplication.setOverrideCursor(
+                Qt.CursorShape.BusyCursor)
+            try:
+                if getattr(self.frame_index, "stereo", False):
+                    # Stereo: match imported images by (basename, side).
+                    file_to_frame = {}
+                    for side, files in (("left", self.frame_index.files_left),
+                                        ("right",
+                                         self.frame_index.files_right)):
+                        for i, fp in enumerate(files):
+                            file_to_frame[(os.path.basename(fp), side)] = i
+                else:
+                    file_to_frame = {
+                        os.path.basename(fp): i
+                        for i, fp in enumerate(
+                            getattr(self.frame_index, "files", []))
+                    }
+                n_frames, n_ok, n_skip, n_merged = self.coco.import_coco(
+                    data, file_to_frame, self.frame_index)
+                del data  # free the source dict before the full save
+                self.side._rebuild_cat_list()  # import may add categories
+                self._refresh_boxes()
+                self._update_progress()
+                self.coco.save(is_final=False)
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Load annotations",
+                f"Import failed: {type(e).__name__}: {e}")
+            return
         merged_txt = (f", {n_merged} mask(s) merged into existing boxes"
                       if n_merged else "")
         self.statusBar().showMessage(
@@ -927,6 +945,9 @@ class ReviewWindow(QMainWindow):
             self.propagate_min_seed_iou = max(
                 0.0, min(1.0, float(sam3_cfg["propagate_min_seed_iou"])))
         ui_cfg = cfg.get("ui", {})
+        if ui_cfg.get("theme") in ui_theme.THEMES:
+            # Same path as the View menu (persists the choice).
+            self._apply_theme(ui_cfg["theme"])
         if "advanced" in ui_cfg:
             self.advanced_ui = bool(ui_cfg["advanced"])
         if "hide" in ui_cfg or "advanced" in ui_cfg:
@@ -2276,7 +2297,8 @@ class ReviewWindow(QMainWindow):
             if img_id is None:
                 continue  # never visited → no annotations possible
             anns = [a for a in self.coco.anns_for_image(img_id)
-                    if a.get("_mask") is None and not a.get("_poly")]
+                    if a.get("_mask") is None and not a.get("_poly")
+                    and not a.get("_mask_png")]
             if not anns:
                 continue
             bboxes, concepts, ann_ids = [], [], []

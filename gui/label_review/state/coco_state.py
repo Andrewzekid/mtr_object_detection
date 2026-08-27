@@ -1,14 +1,17 @@
 """COCO state — in-memory COCO dataset, mirroring 08_click_review_coco.py's
 schema, with undo-stack integration."""
 
+import base64
 import json
 import os
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from ..utils.mask_utils import (
-    _decode_mask_png, _mask_to_polygons, _polygons_to_mask,
+    _decode_mask_png, _encode_mask_png, _mask_to_polygons,
+    _polygons_to_mask,
 )
 from .undo_stack import UndoStack
 
@@ -20,13 +23,27 @@ def _imported_mask(ann: Dict[str, Any], h: int, w: int):
     try:
         if ann.get("segmentation"):
             return _polygons_to_mask(ann["segmentation"], h, w)
-        mask_b64 = ann.get("mask")
-        if isinstance(mask_b64, str) and mask_b64:
-            import base64
-            return _decode_mask_png(base64.b64decode(mask_b64))
+        blob = _imported_mask_png_bytes(ann)
+        if blob is not None:
+            return _decode_mask_png(blob)
     except Exception:
         pass
     return None
+
+
+def _imported_mask_png_bytes(ann: Dict[str, Any]) -> Optional[bytes]:
+    """The legacy base64 ``mask`` field as raw PNG bytes, or None.
+
+    Decoding to a full-size boolean array is deferred to ensure_mask() —
+    eagerly materializing 50k legacy masks at load exhausts RAM just like
+    polygon datasets do."""
+    mask_b64 = ann.get("mask")
+    if not isinstance(mask_b64, str) or not mask_b64:
+        return None
+    try:
+        return base64.b64decode(mask_b64)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +156,28 @@ class CocoState:
         # Image-record-by-id index so ensure_image's size-update path is
         # O(1) instead of scanning self.images linearly every tick.
         self._img_by_id: Dict[int, Dict[str, Any]] = {}
+        # Bounded LRU of materialized masks (ann ids, most-recent last).
+        # ensure_mask() rasterizes a polygon/PNG into a full-size HxW bool
+        # array (~2 MB at 1080p, ~8 MB at 4K); caching every visited frame's
+        # masks without eviction grew RSS by ~100 GB on 50k-annotation
+        # datasets and OOM-killed / swap-thrashed the machine. When the cap
+        # is exceeded the OLDEST masks are evicted: annotations that still
+        # hold polygons (_poly) just drop the array (re-rasterize on
+        # demand), others are losslessly spilled to compressed PNG bytes
+        # (_mask_png). The currently displayed frame is always touched
+        # last, so eviction never touches what's on screen.
+        self.max_cached_masks: int = 128
+        self._mask_lru: "OrderedDict[int, None]" = OrderedDict()
+        # Lazy ann-id -> ann index for O(1) LRU eviction lookups (a linear
+        # scan per eviction would be O(n²) across a long session). None =
+        # stale; rebuilt on demand by _ann_index(). Invalidate whenever an
+        # annotation object is appended or the list is replaced.
+        self._ann_by_id: Optional[Dict[int, Dict[str, Any]]] = None
+
+    def _ann_index(self) -> Dict[int, Dict[str, Any]]:
+        if self._ann_by_id is None:
+            self._ann_by_id = {a["id"]: a for a in self.annotations}
+        return self._ann_by_id
 
     # ------------------------- persistence ---------------------------- #
 
@@ -179,6 +218,7 @@ class CocoState:
                 data = json.load(f)
             self.images = data.get("images", [])
             self.annotations = data.get("annotations", [])
+            self._ann_by_id = None
             # Merge categories instead of replacing: the saved file may
             # predate categories added later via the side panel or --json
             # seed, so union by id and name rather than clobbering.
@@ -197,8 +237,6 @@ class CocoState:
                 self.categories = merged
             self.cat_map = {c["id"]: c["name"] for c in self.categories}
             self.cat_name_to_id = {c["name"]: c["id"] for c in self.categories}
-            img_dims = {i["id"]: (i.get("height", 0), i.get("width", 0))
-                        for i in self.images}
             for ann in self.annotations:
                 self._ann_id_next = max(self._ann_id_next, ann["id"] + 1)
                 # Rebuild the global track-id counter so new boxes continue
@@ -211,12 +249,15 @@ class CocoState:
                 # are kept AS polygons in "_poly" and rasterized lazily via
                 # ensure_mask() — eagerly rasterizing a whole dataset to
                 # full-size boolean masks hangs the UI and can exhaust RAM.
-                # A corrupt entry must not kill the whole load.
+                # The same applies to legacy base64 masks: keep the raw PNG
+                # bytes (_mask_png) and decode lazily. A corrupt entry must
+                # not kill the whole load.
                 if ann.get("segmentation"):
                     ann["_poly"] = ann["segmentation"]
                 else:
-                    h, w = img_dims.get(ann["image_id"], (0, 0))
-                    ann["_mask"] = _imported_mask(ann, h, w)
+                    blob = _imported_mask_png_bytes(ann)
+                    if blob is not None:
+                        ann["_mask_png"] = blob
             for img in self.images:
                 # Images saved before the stereo feature have no "side"
                 # field — they are treated as left.
@@ -322,14 +363,15 @@ class CocoState:
                 # box, but DO merge the mask when the live box has none
                 # (otherwise re-loading a SAM3-annotated file over existing
                 # boxes silently drops every mask).
-                if dup.get("_mask") is None and not dup.get("_poly"):
+                if dup.get("_mask") is None and not dup.get("_poly") \
+                        and not dup.get("_mask_png"):
                     if ann.get("segmentation"):
                         dup["_poly"] = ann["segmentation"]
                         n_merged += 1
                     else:
-                        mask = _imported_mask(ann, h, w)
-                        if mask is not None:
-                            dup["_mask"] = mask
+                        blob = _imported_mask_png_bytes(ann)
+                        if blob is not None:
+                            dup["_mask_png"] = blob
                             n_merged += 1
                 n_skipped += 1
                 continue
@@ -342,11 +384,15 @@ class CocoState:
                 "area": float(ann.get("area", bbox[2] * bbox[3])),
                 "iscrowd": int(ann.get("iscrowd", 0)),
             }
-            # Polygons stay polygons (lazy rasterization via ensure_mask).
+            # Polygons stay polygons (lazy rasterization via ensure_mask);
+            # legacy base64 masks stay PNG bytes (_mask_png) for the same
+            # reason — decoding 50k of them eagerly exhausts RAM.
             if ann.get("segmentation"):
                 new_ann["_poly"] = ann["segmentation"]
             else:
-                new_ann["_mask"] = _imported_mask(ann, h, w)
+                blob = _imported_mask_png_bytes(ann)
+                if blob is not None:
+                    new_ann["_mask_png"] = blob
             # Keep the source track id when it parses as an int; otherwise
             # assign a fresh one so tracking stays consistent.
             try:
@@ -356,6 +402,7 @@ class CocoState:
             except (KeyError, TypeError, ValueError):
                 new_ann["track_id"] = self._fresh_track_id()
             self.annotations.append(new_ann)
+            self._ann_by_id = None
             existing.setdefault(image_id, {})[key] = new_ann
             self._ann_id_next += 1
             n_imported += 1
@@ -413,6 +460,17 @@ class CocoState:
                 polys = _mask_to_polygons(mask, self.min_polygon_area)
                 if polys:
                     out["segmentation"] = polys
+            else:
+                # Mask evicted to PNG bytes by the LRU — decode + polygonize
+                # so the saved file is identical to the non-evicted case.
+                blob = ann.get("_mask_png")
+                if blob:
+                    decoded = _decode_mask_png(blob)
+                    if decoded is not None:
+                        polys = _mask_to_polygons(decoded,
+                                                  self.min_polygon_area)
+                        if polys:
+                            out["segmentation"] = polys
             final_anns.append(out)
         # Convenience index: image ids that count as annotated — images with
         # at least one annotation, plus frames the user explicitly marked
@@ -533,6 +591,7 @@ class CocoState:
             "track_id": self._fresh_track_id(),
         }
         self.annotations.append(ann)
+        self._ann_by_id = None
         self._ann_id_next += 1
         self.dirty = True
         self._invalidate_ann_caches()
@@ -558,6 +617,7 @@ class CocoState:
             "track_id": track_id,
         }
         self.annotations.append(ann)
+        self._ann_by_id = None
         self._ann_id_next += 1
         self.dirty = True
         self._invalidate_ann_caches()
@@ -600,8 +660,11 @@ class CocoState:
                 ann.pop("_poly", None)
                 if mask is None:
                     ann.pop("_mask", None)
+                    ann.pop("_mask_png", None)
+                    self._mask_lru.pop(ann_id, None)
                 else:
                     ann["_mask"] = mask
+                    self._remember_mask(ann)
                 self.dirty = True
                 if self.undo_stack.muted:
                     # The push would be dropped — skip the two full-res
@@ -781,6 +844,7 @@ class CocoState:
         if track_id is not None:
             ann["track_id"] = int(track_id)
         self.annotations.append(ann)
+        self._ann_by_id = None
         self._ann_id_next += 1
         self.dirty = True
         new_id = ann["id"]
@@ -892,11 +956,14 @@ class CocoState:
         if ann_id in self.removed_ids:
             self.removed_ids.discard(ann_id)
         else:
-            # Append a fresh copy (mask included if present).
+            # Re-append a copy (mask included if present).
             new = dict(ann_snapshot)
             if "_mask" in new and isinstance(new["_mask"], np.ndarray):
                 new["_mask"] = new["_mask"].copy()
             self.annotations.append(new)
+            self._ann_by_id = None
+            if isinstance(new.get("_mask"), np.ndarray):
+                self._remember_mask(new)
         self.dirty = True
         self._invalidate_ann_caches()
 
@@ -913,6 +980,9 @@ class CocoState:
             if "_mask" in new and isinstance(new["_mask"], np.ndarray):
                 new["_mask"] = new["_mask"].copy()
             self.annotations.append(new)
+            self._ann_by_id = None
+            if isinstance(new.get("_mask"), np.ndarray):
+                self._remember_mask(new)
         self.dirty = True
         self._invalidate_ann_caches()
 
@@ -940,8 +1010,11 @@ class CocoState:
             if ann["id"] == ann_id:
                 if prev_mask is None:
                     ann.pop("_mask", None)
+                    ann.pop("_mask_png", None)
+                    self._mask_lru.pop(ann_id, None)
                 else:
                     ann["_mask"] = prev_mask.copy() if isinstance(prev_mask, np.ndarray) else prev_mask
+                    self._remember_mask(ann)
                 self.dirty = True
                 return
 
@@ -963,25 +1036,69 @@ class CocoState:
 
     def ensure_mask(self, ann: Dict[str, Any]) -> Optional[np.ndarray]:
         """Materialize an annotation's mask, rasterizing imported polygons
-        (``_poly``) on first use.
+        (``_poly``) or decoding spilled PNG bytes (``_mask_png``) on first
+        use.
 
         Loading/importing keeps COCO polygon ``segmentation`` as polygons
         instead of eagerly converting every annotation to a full-size
         boolean mask — with tens of thousands of masks that is both
         prohibitively slow and exhausts RAM (each HxW bool array is MBs).
+        Materialized masks are tracked in a bounded LRU (see
+        max_cached_masks): the oldest are evicted back to their compact
+        representation so browsing a large dataset stays flat in RSS.
         """
         mask = ann.get("_mask")
         if mask is not None:
+            aid = ann.get("id")
+            if aid in self._mask_lru:
+                self._mask_lru.move_to_end(aid)
             return mask
         polys = ann.get("_poly")
-        if not polys:
-            return None
-        img = self._img_by_id.get(ann["image_id"]) or {}
-        mask = _polygons_to_mask(polys, int(img.get("height", 0)),
-                                 int(img.get("width", 0)))
+        if polys:
+            img = self._img_by_id.get(ann["image_id"]) or {}
+            mask = _polygons_to_mask(polys, int(img.get("height", 0)),
+                                     int(img.get("width", 0)))
+        else:
+            blob = ann.get("_mask_png")
+            mask = _decode_mask_png(blob) if blob else None
         if mask is not None:
             ann["_mask"] = mask
+            self._remember_mask(ann)
         return mask
+
+    def _remember_mask(self, ann: Dict[str, Any]) -> None:
+        """Register an annotation's just-assigned ``_mask`` in the LRU and
+        evict the oldest materialized masks while over the cap.
+
+        Call after every site that assigns ``ann["_mask"] = <ndarray>`` —
+        assignments that bypass this would grow unbounded again."""
+        aid = ann.get("id")
+        if aid is None:
+            return
+        self._mask_lru[aid] = None
+        self._mask_lru.move_to_end(aid)
+        cap = max(8, int(self.max_cached_masks))
+        while len(self._mask_lru) > cap:
+            victim_id, _ = self._mask_lru.popitem(last=False)
+            self._evict_mask(victim_id)
+
+    def _evict_mask(self, ann_id: int) -> None:
+        """Drop ann `ann_id`'s materialized array, keeping it recoverable:
+        polygons are re-rasterizable for free; anything else is spilled to
+        compressed PNG bytes (_mask_png) so no SAM3 result is ever lost."""
+        ann = self._ann_index().get(ann_id)
+        if ann is None:
+            return
+        mask = ann.get("_mask")
+        if mask is None or not isinstance(mask, np.ndarray):
+            return
+        if not ann.get("_poly"):
+            blob = ann.get("_mask_png")
+            if blob is None:
+                blob = _encode_mask_png(mask)
+            if blob is not None:
+                ann["_mask_png"] = blob
+        ann.pop("_mask", None)
 
     def _invalidate_ann_caches(self) -> None:
         """Mark the anns_for_image / labeled_frame_idxs caches stale.
