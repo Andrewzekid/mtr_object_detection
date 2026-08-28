@@ -59,7 +59,6 @@ class SidePanel(QWidget):
     toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
     toggle_annotated_clicked = pyqtSignal()  # "✔ Mark as annotated" button
     nav_annotated = pyqtSignal(int)          # -1 prev / +1 next annotated frame
-    nav_annotated = pyqtSignal(int)          # -1 prev / +1 next annotated frame
     toggle_discard_clicked = pyqtSignal()    # "🚫 Discard image" button
     # "🗺 Show annotated in Rerun" button
     show_annotated_rerun_clicked = pyqtSignal()
@@ -286,29 +285,15 @@ class SidePanel(QWidget):
         nav_ann_row = QHBoxLayout()
         self.btn_prev_annotated = QPushButton("◀ Prev annotated")
         self.btn_prev_annotated.setToolTip(
-            "Jump to the previous frame marked ✔ annotated (wraps around).")
+            "Jump to the previous annotated frame — has boxes or is "
+            "✔-marked (wraps around). Discarded frames are skipped.")
         self.btn_prev_annotated.clicked.connect(
             lambda _c=False: self.nav_annotated.emit(-1))
         nav_ann_row.addWidget(self.btn_prev_annotated)
         self.btn_next_annotated = QPushButton("Next annotated ▶")
         self.btn_next_annotated.setToolTip(
-            "Jump to the next frame marked ✔ annotated (wraps around).")
-        self.btn_next_annotated.clicked.connect(
-            lambda _c=False: self.nav_annotated.emit(+1))
-        nav_ann_row.addWidget(self.btn_next_annotated)
-        layout.addLayout(nav_ann_row)
-
-        # Jump between annotated frames (both directions, wraps around).
-        nav_ann_row = QHBoxLayout()
-        self.btn_prev_annotated = QPushButton("◀ Prev annotated")
-        self.btn_prev_annotated.setToolTip(
-            "Jump to the previous frame marked ✔ annotated (wraps around).")
-        self.btn_prev_annotated.clicked.connect(
-            lambda _c=False: self.nav_annotated.emit(-1))
-        nav_ann_row.addWidget(self.btn_prev_annotated)
-        self.btn_next_annotated = QPushButton("Next annotated ▶")
-        self.btn_next_annotated.setToolTip(
-            "Jump to the next frame marked ✔ annotated (wraps around).")
+            "Jump to the next annotated frame — has boxes or is "
+            "✔-marked (wraps around). Discarded frames are skipped.")
         self.btn_next_annotated.clicked.connect(
             lambda _c=False: self.nav_annotated.emit(+1))
         nav_ann_row.addWidget(self.btn_next_annotated)

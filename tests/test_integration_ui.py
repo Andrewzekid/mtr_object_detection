@@ -2066,3 +2066,57 @@ def test_exemplar_autolabel_routing(lr, autolabel_win, monkeypatch):
     assert win._sam3_queue[0]["exemplar"] == (crop, "monitor", 1)
     win._sam3_queue.clear()
     FakeAutolabelSingle.instances[-1].stop()
+
+
+
+def test_nav_annotated_buttons(lr, make_coco, make_window, fake_sam3,
+                               auto_yes):
+    """Prev/next annotated buttons jump between annotated frames (boxed or
+    ✔-marked, discarded skipped), wrapping around at the ends; with none
+    the view stays put."""
+    coco = make_coco(CATS)
+    win = make_window(FakeIdx(6), coco)
+
+    # No annotated marks yet → nothing happens.
+    win._on_nav_annotated(+1)
+    assert win._current_idx == 0
+
+    coco.annotated_marks.update({1, 4})
+    win.side.btn_next_annotated.click()
+    assert win._current_idx == 1  # nearest mark forward
+    win.side.btn_next_annotated.click()
+    assert win._current_idx == 4
+    win.side.btn_next_annotated.click()
+    assert win._current_idx == 1  # wraps to the first mark
+    win.side.btn_prev_annotated.click()
+    assert win._current_idx == 4  # wraps back to the last mark
+    win.side.btn_prev_annotated.click()
+    assert win._current_idx == 1
+
+    # A single mark: both directions land on it from any other frame.
+    coco.annotated_marks.discard(4)
+    win._current_idx = 3
+    win.side.btn_prev_annotated.click()
+    assert win._current_idx == 1
+    win._current_idx = 3
+    win.side.btn_next_annotated.click()
+    assert win._current_idx == 1  # wraps
+
+    # Frames with boxes count as annotated too (same semantics as the
+    # output JSON's annotated_image_ids) — even without a ✔ mark.
+    coco.annotated_marks.clear()
+    win._current_idx = 3
+    win._load_current()  # creates frame 3's image record
+    coco.add_box(win._current_image_id, 0, 0, 2, 2, 0)
+    win._current_idx = 0
+    win.side.btn_next_annotated.click()
+    assert win._current_idx == 3  # boxed frame is a jump target
+
+    # Discarded frames are skipped even when ✔-marked or boxed.
+    coco.annotated_marks.update({1, 5})
+    coco.discarded_frames.add(1)
+    win._current_idx = 0
+    win.side.btn_next_annotated.click()
+    assert win._current_idx == 3  # frame 1 is discarded → skipped
+    win.side.btn_next_annotated.click()
+    assert win._current_idx == 5

@@ -2221,12 +2221,17 @@ class ReviewWindow(QMainWindow):
         self.statusBar().showMessage("No unlabeled frames left 🎉", 3000)
 
     def _on_nav_annotated(self, direction: int) -> None:
-        """Jump to the next (+1) / previous (-1) frame marked ✔ annotated,
-        wrapping around at the ends."""
-        marks = sorted(self.coco.annotated_marks)
+        """Jump to the next (+1) / previous (-1) annotated frame, wrapping
+        around at the ends. "Annotated" matches the output JSON's
+        ``annotated_image_ids`` semantics: frames with at least one box OR
+        explicitly ✔-marked, excluding discarded frames."""
+        marks = sorted(
+            (set(self.coco.labeled_frame_idxs())
+             | self.coco.annotated_marks)
+            - self.coco.discarded_frames)
         if not marks:
             self.statusBar().showMessage(
-                "No annotated frames marked yet", 3000)
+                "No annotated frames yet", 3000)
             return
         cur = self._current_idx
         if direction > 0:
