@@ -8,7 +8,6 @@
 
 # --- GUI framework -----------------------------------------------------------
 PyQt6>=6.4.0
-PyQt6-WebEngine>=6.5.0            # gui.label_review embedded viewer
 
 # --- Rerun (gui.label_review — review .rrd recordings + label) ----------------
 rerun-sdk>=0.34.0
@@ -25,9 +24,8 @@ pyarrow>=14.0.0
 ultralytics>=8.4.83              # ships ultralytics.models.sam.SAM3* (older 8.x does not)
 transformers>=4.51                # HF autolabel backends; code has transformers-5.x shims
 accelerate>=0.34                 # from_pretrained device placement for HF backends
-einops>=0.8                       # SAM3 / Falcon attention reshapes
+einops>=0.8                       # SAM3 attention reshapes
 huggingface_hub>=0.25            # huggingface-cli download for SAM3 weights
-sentencepiece>=0.1.99             # some HF tokenizers (Qwen/Falcon)
 
 # Ultralytics SAM3 text encoder imports the ultralytics CLIP fork.
 # (ultralytics checks this itself via check_requirements, but listing it
@@ -44,8 +42,8 @@ numpy>=1.24.0
 pillow>=9.0.0
 
 # --- HTTP / API clients -------------------------------------------------------
-requests>=2.28.0                 # Ollama API
-openai>=1.0.0                    # Aliyun DashScope (OpenAI-compatible)
+requests>=2.28.0                 # Ollama API (default Qwen seed-label backend)
+openai>=1.0.0                    # llama.cpp server + Aliyun DashScope (OpenAI-compatible)
 python-dotenv>=1.0.0             # .env loading
 
 # --- Data / config / utils ----------------------------------------------------

@@ -169,6 +169,19 @@ Per-backend config keys (Settings dialog or config JSON): `owlv2_model` /
 box threshold). First use downloads the
 checkpoint from Hugging Face; models are cached per session.
 
+### SAM3 speed knobs (precision / imgsz)
+
+SAM3 re-segment, point-segment, autolabel and propagate all honour two
+speed settings (Settings → SAM3, or the `sam3.imgsz` / `sam3.quantize`
+config keys):
+
+- **Precision** (`sam3.quantize`): FP16 (default in the example config)
+  runs ~1.5-2x faster on GPU with no visible quality loss; FP8 is
+  experimental; FP32 matches the checkpoint exactly.
+- **Inference imgsz** (`sam3.imgsz`): square inference size in pixels;
+  0 = library default. Lower (e.g. 768) is faster; boxes/masks are always
+  rescaled back to the original image size.
+
 ### Labelling assist features (when and how to use them)
 
 The review GUI is built so a human never labels every frame by hand. Typical
@@ -583,12 +596,10 @@ Notes:
 
 
 - **Qwen3.8 labeling** runs locally with Ollama by default (requires
-  Ollama 0.32.15+; `ollama serve` + `ollama pull qwen3.8`) or via the
-  DashScope API. The examples below use the DashScope API. Set your key first:
-
-  ```bash
-  export API_KEY=your_dashscope_key
-  ```
+  Ollama 0.32.15+; `ollama serve` + `ollama pull qwen3.8`). llama.cpp is
+  also usable as a local backend (`--qwen-backend llamacpp`, see the
+  Quickstart's alternative), and the DashScope cloud API is a third option
+  (`--use-api`; set your key first: `export API_KEY=your_dashscope_key`).
 
 - **SAM3 segmentation** needs the Ultralytics SAM checkpoint. Place it at
   `core/sam3/models/sam3-model/sam3.pt` (or pass `--model` explicitly).
