@@ -1,4 +1,4 @@
-#    core/models_inference.py - SAM3 (local) + Qwen3.6 (via Ollama) + Gemini wrappers.
+#    core/models_inference.py - SAM3 (local) + Qwen3.8 (via Ollama) + Gemini wrappers.
 #
 #    USAGE (SAM3 - local):
 #        from core.models_inference import run_sam3
@@ -14,7 +14,7 @@
 #        # r["mask_overlay"] - BGR image with green mask overlay
 #        # r["segmented_regions"] - list of {contour, bbox, area, center}
 #
-#    USAGE (Qwen3.6 - via Ollama):
+#    USAGE (Qwen3.8 - via Ollama):
 #        from core.models_inference import run_qwen
 #        r = run_qwen(
 #            prompt="Detect the cars in this scene",
@@ -22,7 +22,7 @@
 #            output_format="json",            # json | yaml | bbox | text
 #            image_path="./image.jpg",        # optional multimodal image
 #            ollama_base_url="http://localhost:11434",
-#            model_name="qwen3.6",
+#            model_name="qwen3.8",
 #            timeout=120,
 #        )
 #        # r["response"]       - raw model text
@@ -48,7 +48,7 @@
 #
 #    PREREQUISITES:
 #        SAM3 weights go in ./core/sam3/models/ (sam_vit_h_4b8939.pth or similar)
-#        Qwen3.6 needs: ollama serve    ollama pull qwen3.6
+#        Qwen3.8 needs: ollama serve    ollama pull qwen3.8
 #        Gemini needs: access to HKU Gemini API proxy (no authentication required)
 #
 #    REQUIREMENTS:
@@ -56,7 +56,7 @@
 #        pip install segment-anything   # optional, only needed for SAM3
 
 """
-Model inference wrappers for SAM3 (local), Qwen3.6 (via Ollama), and Gemini (via HKU API proxy).
+Model inference wrappers for SAM3 (local), Qwen3.8 (via Ollama), and Gemini (via HKU API proxy).
 All functions are headless and return structured results.
 """
 
@@ -815,7 +815,7 @@ def run_qwen(
     image_path: Optional[str | Path | List[str | Path]] = None,
     conditioning_images: Optional[List[Dict[str, str]]] = None,
     ollama_base_url: str = "http://localhost:11434",
-    model_name: str = "qwen3.6",
+    model_name: str = "qwen3.8",
     timeout: int = 120,
     progress_callback: Optional[Callable[[int], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
@@ -826,7 +826,7 @@ def run_qwen(
     bbox_order: str = "xyxy",
 ) -> Dict:
     """
-    Run Qwen3.6 inference via Ollama API.
+    Run Qwen3.8 inference via Ollama API.
     
     Args:
         prompt: Text prompt for the model
@@ -858,7 +858,7 @@ def run_qwen(
             - format: Output format used
     """
     if status_callback:
-        status_callback("Preparing Qwen3.6 request...")
+        status_callback("Preparing Qwen3.8 request...")
     
     if log_callback:
         log_callback(f"Prompt: {prompt[:100]}...")
@@ -1030,7 +1030,7 @@ def run_qwen(
     except Exception as e:
         return {
             "success": False,
-            "error": f"Qwen3.6 inference failed: {str(e)}",
+            "error": f"Qwen3.8 inference failed: {str(e)}",
         }
 
 
@@ -1041,7 +1041,7 @@ def run_qwen_llamacpp(
     image_path: Optional[str | Path | List[str | Path]] = None,
     conditioning_images: Optional[List[Dict[str, str]]] = None,
     llamacpp_base_url: str = "http://127.0.0.1:8089",
-    model_name: str = "./Qwen3.6-27B-Q5_K_M.gguf",
+    model_name: str = "./Qwen3.8-27B-Q5_K_M.gguf",
     api_key: str = "local",
     timeout: int = 600,
     progress_callback: Optional[Callable[[int], None]] = None,
@@ -1051,7 +1051,7 @@ def run_qwen_llamacpp(
     bbox_field: str = "bbox_2d",
     bbox_order: str = "xyxy",
 ) -> Dict:
-    """Run Qwen3.6 inference via a llama.cpp server (OpenAI-compatible API).
+    """Run Qwen3.8 inference via a llama.cpp server (OpenAI-compatible API).
 
     llama.cpp's server (started with `--mmproj <mmproj.gguf>`) exposes the
     OpenAI-compatible ``/v1/chat/completions`` endpoint and reads images through

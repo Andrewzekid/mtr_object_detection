@@ -18,19 +18,25 @@
 #       --images-dir /data/run/camera --output-root output/my_dataset --skip-augment
 #
 # Environment overrides:
-#   LLAMACPP_URL   llama.cpp server URL  (default http://127.0.0.1:8089)
-#   QWEN_MODEL     Qwen GGUF weights     (default Qwen3.8-27B-Q4_K_M.gguf)
-#   QWEN_MMPROJ    Qwen mmproj file      (default Qwen3.8-mmproj-F16.gguf)
+#   QWEN_BACKEND   Qwen serving backend: ollama | llamacpp (default ollama)
+#   OLLAMA_URL     Ollama API base URL  (default http://localhost:11434)
+#   QWEN_MODEL     Qwen model served    (default: qwen3.8 for ollama,
+#                                         Qwen3.8-27B-Q4_K_M.gguf for llamacpp)
+#   LLAMACPP_URL   llama.cpp server URL (default http://127.0.0.1:8089)
+#   QWEN_MMPROJ    Qwen mmproj file     (default Qwen3.8-mmproj-F16.gguf)
 #
-# The qwen stage needs the llama.cpp server running first:
-#   llama-server -m Qwen3.8-27B-Q4_K_M.gguf \
-#       --mmproj Qwen3.8-mmproj-F16.gguf --image-min-tokens 2048 --port 8089
+# The qwen stage needs the Ollama server running first (Ollama 0.32.15+
+# for qwen3.8):
+#   ollama serve
+#   ollama pull qwen3.8     # once
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+QWEN_BACKEND="${QWEN_BACKEND:-ollama}"
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+QWEN_MODEL="${QWEN_MODEL:-}"
 LLAMACPP_URL="${LLAMACPP_URL:-http://127.0.0.1:8089}"
-QWEN_MODEL="${QWEN_MODEL:-Qwen3.8-27B-Q4_K_M.gguf}"
 QWEN_MMPROJ="${QWEN_MMPROJ:-Qwen3.8-mmproj-F16.gguf}"
 
 # Dataset-only mode (--coco-json ...): no rosbag, pass everything straight
@@ -67,9 +73,16 @@ if [[ ! -f "${ROSBAG}/info/calibration.json" ]]; then
     exit 1
 fi
 
+EXTRA=()
+# Empty QWEN_MODEL lets the orchestrator pick the per-backend default
+# (qwen3.8 for ollama, the GGUF name for llamacpp).
+[[ -n "${QWEN_MODEL}" ]] && EXTRA+=(--qwen-model "${QWEN_MODEL}")
+
 exec python3 "${SCRIPT_DIR}/orchestrate_pipeline.py" \
     --rosbag "${ROSBAG}" \
+    --qwen-backend "${QWEN_BACKEND}" \
+    --ollama-url "${OLLAMA_URL}" \
     --llamacpp-url "${LLAMACPP_URL}" \
-    --qwen-model "${QWEN_MODEL}" \
     --qwen-mmproj "${QWEN_MMPROJ}" \
+    "${EXTRA[@]}" \
     "$@"

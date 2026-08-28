@@ -3,15 +3,18 @@
 # install.sh — one-shot installer for the Object Detection Application.
 #
 # Sets up a Python environment, installs all pip dependencies, downloads
-# the required AI model weights (SAM3 + SAM3.1), and (optionally) builds
-# llama.cpp to serve the Qwen VLM used by the seed-labelling pipeline.
+# the required AI model weights (SAM3 + SAM3.1), and installs Ollama —
+# the default server for the Qwen VLM used by the seed-labelling
+# pipeline (requires Ollama 0.32.15+ for qwen3.8). llama.cpp can still be
+# built optionally as an alternative Qwen server.
 #
 # Usage:
-#   ./install.sh                       # auto: venv, detect GPU, fetch SAM3 weights
+#   ./install.sh                       # auto: venv, detect GPU, fetch SAM3 weights, install Ollama
 #   ./install.sh --gpu                 # force CUDA torch
 #   ./install.sh --cpu                 # force CPU torch
 #   ./install.sh --conda NAME          # use/create a conda env instead of venv
-#   ./install.sh --llamacpp            # also build llama.cpp for the Qwen server
+#   ./install.sh --skip-ollama         # don't install Ollama / pull qwen3.8
+#   ./install.sh --llamacpp            # also build llama.cpp (alternative Qwen server)
 #   ./install.sh --skip-models         # skip SAM3 weight download
 #   ./install.sh --skip-apt            # skip apt-get (assume system libs present)
 #   ./install.sh --hf-token TOKEN      # HuggingFace token for the gated SAM3 repo
@@ -28,10 +31,15 @@ GPU="auto"            # auto | yes | no
 VENV_DIR=".venv"
 CONDA_ENV=""
 BUILD_LLAMACPP=0
+SKIP_OLLAMA=0
 SKIP_MODELS=0
 SKIP_APT=0
 HF_TOKEN="${HF_TOKEN:-}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Default Qwen VLM served by Ollama for the seed-labelling stage; qwen3.8
+# requires Ollama 0.32.15+.
+OLLAMA_MIN_VERSION="0.32.15"
+QWEN_OLLAMA_MODEL="${QWEN_OLLAMA_MODEL:-qwen3.8}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -55,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --cpu)        GPU="no" ;;
     --conda)      CONDA_ENV="${2:?--conda needs a name}"; shift ;;
     --llamacpp)   BUILD_LLAMACPP=1 ;;
+    --skip-ollama) SKIP_OLLAMA=1 ;;
     --skip-models) SKIP_MODELS=1 ;;
     --skip-apt)   SKIP_APT=1 ;;
     --hf-token)   HF_TOKEN="${2:?--hf-token needs a value}"; shift ;;
@@ -224,7 +233,42 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Optional: build llama.cpp for the Qwen VLM server
+# 7. Ollama (default Qwen VLM server for the seed-labelling stage)
+# ---------------------------------------------------------------------------
+if [[ "$SKIP_OLLAMA" -eq 1 ]]; then
+  warn "--skip-ollama: leaving Ollama install + qwen3.8 pull to the user."
+elif command -v ollama >/dev/null; then
+  ok "Ollama already installed: $(ollama --version 2>/dev/null || echo '?')"
+else
+  log "Installing Ollama (official installer; sets up ollama.service)"
+  curl -fsSL https://ollama.com/install.sh | sh
+  ok "Ollama installed: $(ollama --version 2>/dev/null || echo '?')"
+fi
+
+if [[ "$SKIP_OLLAMA" -eq 0 ]] && command -v ollama >/dev/null; then
+  # Version floor: qwen3.8 needs Ollama 0.32.15+.
+  OLLAMA_VER="$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  if [[ -n "$OLLAMA_VER" ]] && \
+     [[ "$(printf '%s\n%s\n' "$OLLAMA_MIN_VERSION" "$OLLAMA_VER" | sort -V | head -1)" != "$OLLAMA_MIN_VERSION" ]]; then
+    warn "Ollama $OLLAMA_VER is older than $OLLAMA_MIN_VERSION — qwen3.8 needs $OLLAMA_MIN_VERSION+; upgrade: curl -fsSL https://ollama.com/install.sh | sh"
+  fi
+  # Pull the default seed-label model. `ollama pull` needs the daemon; the
+  # official installer starts ollama.service on systemd hosts — otherwise
+  # start `ollama serve` manually and re-run the pull.
+  if ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$QWEN_OLLAMA_MODEL"; then
+    ok "Ollama model already present: $QWEN_OLLAMA_MODEL"
+  elif ! ollama pull "$QWEN_OLLAMA_MODEL"; then
+    warn "Could not pull '$QWEN_OLLAMA_MODEL' (is the daemon running?). Do it manually:
+      ollama serve          # leave running in its own terminal, or:
+      sudo systemctl start ollama
+      ollama pull $QWEN_OLLAMA_MODEL"
+  else
+    ok "Ollama model ready: $QWEN_OLLAMA_MODEL"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Optional: build llama.cpp (alternative Qwen VLM server)
 # ---------------------------------------------------------------------------
 if [[ "$BUILD_LLAMACPP" -eq 1 ]]; then
   LLAMA_DIR="${LLAMA_DIR:-$HOME/code/llama/llama.cpp}"
@@ -252,7 +296,7 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Final summary
+# 9. Final summary
 # ---------------------------------------------------------------------------
 cat <<EOF
 
@@ -263,13 +307,21 @@ cat <<EOF
   Python env:    ${CONDA_ENV:-$REPO_ROOT/$VENV_DIR}
   GPU torch:     $([[ "$GPU" == "yes" ]] && echo "yes (CUDA)" || echo "no (CPU)")
   SAM3 weights:  $([[ -f core/sam3/models/sam3-model/sam3.pt ]] && echo "present" || echo "MISSING — re-run with --hf-token")
+  Ollama:        $(command -v ollama >/dev/null && echo "installed ($(ollama --version 2>/dev/null || echo '?'))" || echo "MISSING — re-run without --skip-ollama")
 
   Launch the GUI (label review app):
     python -m gui.label_review.main --images /path/to/frames
 
-  Or run the full orchestrated pipeline (needs the Qwen server running
-  on http://127.0.0.1:8089 — see the llama.cpp step above):
+  Start the Qwen VLM server for seed labels (default: Ollama —
+  requires Ollama ${OLLAMA_MIN_VERSION}+ for qwen3.8):
+    ollama serve                  # usually already running (ollama.service)
+    ollama pull ${QWEN_OLLAMA_MODEL}   # once
+
+  Then run the full orchestrated pipeline:
     python scripts/orchestrate_pipeline.py --images Datasets/YourData --camera both
+
+  (Alternative Qwen server: re-run with --llamacpp to build llama.cpp's
+  llama-server and serve a Qwen3.8 GGUF + mmproj on port 8089 instead.)
 
   The HF autolabel backends (owlv2 / grounding-dino / falcon)
   download automatically on first use in the GUI's Settings → Autolabel.

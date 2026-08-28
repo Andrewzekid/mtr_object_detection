@@ -22,21 +22,47 @@ See **[Installation](#installation)** below for the one-command setup
 (`./install.sh`), the Docker image, or manual steps. The short version:
 
 ```bash
-./install.sh                # venv + pip + SAM3 weights (GPU auto-detected)
-# or with the Qwen VLM server too:
-./install.sh --llamacpp --hf-token hf_xxx
+./install.sh                # venv + pip + SAM3 weights + Ollama (GPU auto-detected)
+# if Ollama is already installed (or not wanted):
+./install.sh --skip-ollama --hf-token hf_xxx
 ```
 
-Then start the Qwen VLM server (seed labels): 
-
+Then start the Qwen VLM server (seed labels):
 
 ### Step 1 — start the Qwen VLM server (seed labels)
-Note: you must download the qwen3.8 gguf from huggingface and check that the path is correct before running.
+
+The default serving backend is **Ollama** — it is the easiest to install
+(`install.sh` already did it, including the model pull). **Qwen3.8 requires
+Ollama 0.32.15+** — check with `ollama --version`.
+
+```bash
+ollama serve            # usually already running as ollama.service (systemd)
+ollama pull qwen3.8     # once; downloads the seed-label model
+```
+
+The pipeline talks to Ollama at `http://localhost:11434` and uses the
+`qwen3.8` model for autolabelling by default. To use a different Ollama
+model, pull it (`ollama pull <tag>`) and point the pipeline at it with
+`--qwen-model <tag>` (orchestrator), `QWEN_MODEL=<tag>` (`run_pipeline.sh`),
+or `--model <tag>` (`scripts/07_run_qwen.py` directly).
+
+<details>
+<summary>Alternative: llama.cpp server (GGUF + mmproj)</summary>
+
+Note: you must download the qwen3.8 GGUF (and its mmproj) from HuggingFace
+first and check that the paths below are correct before running.
+
 ```bash
 llama-server -m Qwen3.8-27B-Q4_K_M.gguf \
     --mmproj Qwen3.8-mmproj-F16.gguf \
     --image-min-tokens 2048 --port 8089
 ```
+
+and pass `--qwen-backend llamacpp --llamacpp-url http://127.0.0.1:8089` to
+the orchestrator. `install.sh --llamacpp` builds the server (weights are
+user-supplied).
+
+</details>
 
 ### Step 2 — run the orchestrator (blocks at the GUI)
 
@@ -47,12 +73,14 @@ python scripts/orchestrate_pipeline.py \
   --rosbag 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 \
   --camera both \
   --sample-size 1000 --keyframe-stride 10 \
-  --llamacpp-url http://127.0.0.1:8089 \
   --ratios 0.7 0.15 0.15 --split-seed 42 \
   --augmentations flip_horizontal rotate brightness --multiplier 2 \
   --epochs 100 --batch-size 16 --model-type yolo26n --task segment --imgsz 768 \
   --eval-splits test train --tracker deepocsort --device 0
 ```
+
+(The Qwen seed stage defaults to the Ollama server at
+`http://localhost:11434` with model `qwen3.8` — no extra flags needed.)
 
 Or from an existing image folder (mono; for stereo point `--images` at the
 parent containing `left/` + `right/` and pass `--camera both`):
@@ -263,8 +291,10 @@ Input is either a Metacam rosbag (adds the fisheye undistortion stage) or a
 plain image folder:
 
 ```bash
-# 1. Start the llama.cpp server with the Qwen GGUF + mmproj:
-#    llama-server -m Qwen3.8-27B-Q4_K_M.gguf --mmproj Qwen3.8-mmproj-F16.gguf --port 8089
+# 1. Start the Qwen VLM server (default: Ollama — requires Ollama
+#    0.32.15+ for qwen3.8):
+#    ollama serve              # usually already running (ollama.service)
+#    ollama pull qwen3.8       # once
 
 # 2. Run the orchestrator (blocks at the GUI stage; resumes when you close
 #    the GUI after saving):
@@ -272,8 +302,6 @@ python scripts/orchestrate_pipeline.py \
   --rosbag 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 \
   --camera both \
   --sample-size 1000 --keyframe-stride 10 \
-  --llamacpp-url http://127.0.0.1:8089 \
-  --qwen-model Qwen3.8-27B-Q4_K_M.gguf --qwen-mmproj Qwen3.8-mmproj-F16.gguf \
   --ratios 0.7 0.15 0.15 --split-seed 42 \
   --augmentations flip_horizontal rotate brightness --multiplier 2 \
   --epochs 100 --batch-size 16 --model-type yolo26n --task segment --imgsz 768 \
@@ -283,9 +311,14 @@ python scripts/orchestrate_pipeline.py \
 # --images at the parent of left/ + right/ and pass --camera both):
 python scripts/orchestrate_pipeline.py --images Datasets/HKU_GH --camera both
 
-# Or via the shell wrapper (env overrides: LLAMACPP_URL, QWEN_MODEL,
-# QWEN_MMPROJ; all extra args pass through):
+# Or via the shell wrapper (env overrides: QWEN_BACKEND, OLLAMA_URL,
+# QWEN_MODEL, LLAMACPP_URL, QWEN_MMPROJ; all extra args pass through):
 ./scripts/run_pipeline.sh 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 --camera both
+
+# Alternative llama.cpp backend (GGUF + mmproj on port 8089):
+python scripts/orchestrate_pipeline.py --images Datasets/HKU_GH \
+  --qwen-backend llamacpp --llamacpp-url http://127.0.0.1:8089 \
+  --qwen-model Qwen3.8-27B-Q4_K_M.gguf --qwen-mmproj Qwen3.8-mmproj-F16.gguf
 ```
 
 Stages: `undistort`, `sample`, `keyframes`, `stats`, `qwen`, `qwen_coco`,
@@ -297,7 +330,10 @@ stage launches the label-review GUI on the keyframes (`--gui-on all` loads
 every sampled frame instead) and waits — the pipeline continues after you
 save and close. Useful per-stage knobs:
 
-- llama.cpp / Qwen: `--llamacpp-url`, `--qwen-model`, `--qwen-mmproj`,
+- Qwen VLM: `--qwen-backend ollama|llamacpp` (default ollama),
+  `--ollama-url`, `--qwen-model` (Ollama tag or GGUF name; default
+  `qwen3.8` / `Qwen3.8-27B-Q4_K_M.gguf`), `--llamacpp-url`,
+  `--qwen-mmproj` (llamacpp only),
   `--prompt` (class list is parsed from it; or `--classes`), `--resume-from`
 - sampling/keyframes: `--sample-size` (stereo: right side is synced to the
   sampled left timestamps), `--sample-seed`, `--keyframe-stride`
@@ -343,18 +379,22 @@ ways to install; pick one.
 ### Option A — one-command installer (`install.sh`)
 
 `install.sh` (repo root) sets up a Python venv, installs system Qt/X
-libraries, installs all pip dependencies (CUDA torch auto-detected), and
-downloads the SAM3 + SAM3.1 weights from HuggingFace.
+libraries, installs all pip dependencies (CUDA torch auto-detected),
+downloads the SAM3 + SAM3.1 weights from HuggingFace, and installs
+**Ollama** + pulls the `qwen3.8` model used for Qwen seed labels.
 
 ```bash
-# default: venv at ./.venv, auto-detect GPU, fetch SAM3 weights
+# default: venv at ./.venv, auto-detect GPU, fetch SAM3 weights, install Ollama
 ./install.sh --hf-token hf_xxx          # token for the gated facebook/sam3 repo
 
 # use a conda env instead of a venv
 ./install.sh --conda objdet --hf-token hf_xxx
 
-# also build llama.cpp for the Qwen seed-label VLM server
+# also build llama.cpp (alternative Qwen server; Ollama is the default)
 ./install.sh --llamacpp --hf-token hf_xxx
+
+# skip the Ollama install / qwen3.8 pull (e.g. you'll serve Qwen elsewhere)
+./install.sh --skip-ollama --hf-token hf_xxx
 
 # force CPU torch (no NVIDIA GPU)
 ./install.sh --cpu --hf-token hf_xxx
@@ -366,7 +406,8 @@ Flags:
 |------|--------|
 | `--gpu` / `--cpu` | Force CUDA / CPU torch (default: auto-detect via `nvidia-smi`) |
 | `--conda NAME` | Use/create a conda env `NAME` instead of `./.venv` |
-| `--llamacpp` | Also clone + build llama.cpp (`~/code/llama/llama.cpp`) for the Qwen server |
+| `--skip-ollama` | Skip installing Ollama and pulling `qwen3.8` (Ollama is installed by default) |
+| `--llamacpp` | Also clone + build llama.cpp (`~/code/llama/llama.cpp`) — alternative Qwen server |
 | `--skip-models` | Skip SAM3 weight download (GUI still starts, SAM3 features off until you place the weights) |
 | `--skip-apt` | Skip the `apt-get` system-lib step (you've already installed them) |
 | `--hf-token TOKEN` | HuggingFace token for the gated `facebook/sam3` repo (or `export HF_TOKEN=…`) |
@@ -382,11 +423,26 @@ or `HF_TOKEN`. The script downloads:
 | `sam3.pt` (SAM3) | `core/sam3/models/sam3-model/sam3.pt` | ~3.4 GB |
 | `sam3.1_multiplex.pt` (SAM3.1, Propagate→) | `core/sam3/models/sam3.1-model/sam3.1_multiplex.pt` | ~3.4 GB |
 
-**Qwen VLM weights are NOT bundled** — they're ~18 GB and user-supplied.
-With `--llamacpp` the script builds `llama-server`; you then download a
-Qwen3.8 vision GGUF + its `mmproj` (e.g. `Qwen3.8-27B-Q4_K_M.gguf` +
-`Qwen3.8-mmproj-F16.gguf`) into `~/code/llama/llama.cpp/` and start it
-yourself (see Step 1 of the Quickstart).
+**Qwen seed labels run on Ollama by default** — `install.sh` installs it
+and pulls `qwen3.8` (override with `QWEN_OLLAMA_MODEL=<tag>`). **Qwen3.8
+requires Ollama 0.32.15+.** If you skipped it (`--skip-ollama`), install it
+manually:
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve            # or: sudo systemctl start ollama
+ollama pull qwen3.8     # the default seed-label model
+```
+
+To autolabel with a different Ollama model: `ollama pull <tag>`, then pass
+it to the pipeline via `--qwen-model <tag>` (orchestrator), `QWEN_MODEL`
+(`run_pipeline.sh`), or `--model <tag>` (`scripts/07_run_qwen.py`).
+
+With `--llamacpp` the script instead builds llama.cpp's `llama-server` as
+an alternative backend; you then download a Qwen3.8 vision GGUF + its
+`mmproj` (e.g. `Qwen3.8-27B-Q4_K_M.gguf` + `Qwen3.8-mmproj-F16.gguf`) into
+`~/code/llama/llama.cpp/` and start it yourself (see the llama.cpp
+alternative in Step 1 of the Quickstart).
 
 **HF autolabel backends** (`owlv2`, `grounding-dino`,
 `falcon`) download automatically on first use in the GUI's
@@ -397,9 +453,11 @@ run into `models/`. Neither needs an install step.
 ### Option B — Docker (GPU + GUI + full pipeline)
 
 The `Dockerfile` (repo root) builds an image with the CUDA runtime, all
-Python deps, the label-review GUI, and (optionally) a built `llama-server`
-for the Qwen VLM. GPU + X11 are forwarded to the host so the GUI shows
-on your desktop.
+Python deps, and the label-review GUI. GPU + X11 are forwarded to the host
+so the GUI shows on your desktop. The Qwen VLM seed-label server runs
+separately — **Ollama** by default (requires Ollama 0.32.15+ for qwen3.8),
+with an optional llama.cpp `llama-server` build inside the image as an
+alternative.
 
 ```bash
 # build (fetch SAM3 weights at build time with a token):
@@ -412,23 +470,24 @@ docker run --gpus all --rm -it --net=host \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v "$PWD":/work -w /work \
   -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
-  -p 8089:8089 \
   object-detection-app \
   --images /work/Datasets/YourData
 ```
 
-Run the **Qwen VLM server** in a second container (mount your GGUFs):
+Run the **Qwen VLM server** as a second container (the official Ollama
+image; `--net=host` on the app container means `localhost:11434` just
+works):
 
 ```bash
-docker run --gpus all --rm -it --net=host \
-  -v "$HOME/code/llama/llama.cpp":/llama.cpp \
-  -v "$HOME/models/qwen":/models/qwen:ro \
-  object-detection-app \
-  /llama.cpp/build/bin/llama-server \
-    -m /models/qwen/Qwen3.8-27B-Q4_K_M.gguf \
-    --mmproj /models/qwen/Qwen3.8-mmproj-F16.gguf \
-    --port 8089 --host 0.0.0.0
+docker run --gpus all -d --name ollama \
+  -v ollama:/root/.ollama -p 11434:11434 \
+  ollama/ollama
+docker exec -it ollama ollama pull qwen3.8
 ```
+
+(Alternative: build the image with `BUILD_LLAMACPP=1` and serve a Qwen3.8
+GGUF + mmproj with llama-server on port 8089, then run the pipeline with
+`--qwen-backend llamacpp`.)
 
 Build-args:
 
@@ -468,11 +527,13 @@ huggingface-cli download facebook/sam3     sam3.pt             \
 huggingface-cli download facebook/sam3.1 sam3.1_multiplex.pt  \
   --local-dir core/sam3/models/sam3.1-model    --token "$HF_TOKEN"
 
-# 6. (optional) Qwen VLM server — build llama.cpp + supply GGUFs
-git clone https://github.com/ggerganov/llama.cpp ~/code/llama/llama.cpp
-cd ~/code/llama/llama.cpp && mkdir build && cd build
-cmake .. -DLLAMA_CUDA=on -DLLAMA_BUILD_SERVER=on && cmake --build . --config Release -j
-# download Qwen3.8-27B-Q4_K_M.gguf + Qwen3.8-mmproj-F16.gguf into ~/code/llama/llama.cpp/
+# 6. Qwen VLM server for seed labels — Ollama (0.32.15+ for qwen3.8)
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &          # or: sudo systemctl start ollama
+ollama pull qwen3.8
+# (alternative: llama.cpp — clone https://github.com/ggerganov/llama.cpp,
+#  build llama-server, and serve a Qwen3.8 GGUF + mmproj on port 8089;
+#  run the pipeline with --qwen-backend llamacpp)
 ```
 
 Verify:
@@ -490,7 +551,8 @@ python -m gui.label_review.main --help
 | SAM3.1 (`sam3.1_multiplex.pt`) | `facebook/sam3.1` (gated) | `core/sam3/models/sam3.1-model/sam3.1_multiplex.pt` | same |
 | YOLO base weights (`yolo26n.pt` …) | Ultralytics | `models/` | Ultralytics on first training run |
 | OWLv2 / Grounding-DINO / Falcon | HuggingFace | `~/.cache/huggingface/` | `transformers.from_pretrained` on first GUI use |
-| Qwen VLM (GGUF) | user-supplied | `~/code/llama/llama.cpp/` | you (install.sh `--llamacpp` builds the server only) |
+| Qwen VLM (`qwen3.8`) | Ollama model registry | Ollama's store (`~/.ollama`) | `install.sh` / `ollama pull qwen3.8` (needs Ollama 0.32.15+) |
+| Qwen VLM (GGUF, llamacpp alternative) | user-supplied | `~/code/llama/llama.cpp/` | you (install.sh `--llamacpp` builds the server only) |
 
 ### Standalone bundle (no Python needed on the target)
 
@@ -526,8 +588,9 @@ Notes:
   `sudo apt install libgl1 libegl1 libxkbcommon0 libdbus-1-3`.
 
 
-- **Qwen3.6 labeling** can run locally with Ollama or via DashScope API.
-  The examples below use the DashScope API. Set your key first:
+- **Qwen3.8 labeling** runs locally with Ollama by default (requires
+  Ollama 0.32.15+; `ollama serve` + `ollama pull qwen3.8`) or via the
+  DashScope API. The examples below use the DashScope API. Set your key first:
 
   ```bash
   export API_KEY=your_dashscope_key
@@ -547,12 +610,13 @@ Metacam rosbag; for a plain image folder use `--images <dir>` instead of
 
 ```bash
 # 0. Install (once) — see Installation for Docker / manual options
-./install.sh --llamacpp --hf-token hf_xxx
+#    (installs Ollama and pulls qwen3.8 by default)
+./install.sh --hf-token hf_xxx
 
-# 1. Start the Qwen VLM server (seeds the initial boxes)
-llama-server -m Qwen3.8-27B-Q4_K_M.gguf \
-    --mmproj Qwen3.8-mmproj-F16.gguf \
-    --image-min-tokens 2048 --port 8089
+# 1. Start the Qwen VLM server (seeds the initial boxes; requires Ollama
+#    0.32.15+ for qwen3.8)
+ollama serve              # usually already running as ollama.service
+ollama pull qwen3.8       # once, if install.sh didn't already
 
 # 2. Run the whole pipeline (blocks at the GUI review stage and resumes
 #    automatically once you save and close the GUI)
@@ -560,7 +624,6 @@ python scripts/orchestrate_pipeline.py \
   --rosbag Datasets/MTR/rosbags/2026-06-11_16-50-08_rosbag \
   --camera both \
   --sample-size 1000 --keyframe-stride 10 \
-  --llamacpp-url http://127.0.0.1:8089 \
   --ratios 0.7 0.15 0.15 --split-seed 42 \
   --augmentations flip_horizontal rotate brightness --multiplier 2 \
   --epochs 100 --batch-size 16 --model-type yolo26n --task segment --imgsz 768 \
@@ -730,7 +793,7 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | `12_extract_keyframes.py` | Select every Nth frame as a keyframe + write a manifest for the interpolator. | `--image-folder`/`--video`, `--output-dir`, `--every`, `--mode` | Keyframe images + `keyframe_manifest.json` |
 | `13_interpolate_tracks.py` | Propagate reviewed keyframe boxes to every frame via anchored optical flow. An optional per-frame RANSAC camera model (`--camera-model global`) can absorb non-linear camera shake (tracking/anchoring on the residual, KLT dropouts re-seeded); off by default — accuracy testing on the re-reviewed MTR 4k frames showed no net gain on this fisheye camera. New objects at a keyframe are back-tracked. Each output box carries a `source`/`confidence` provenance field. | `--keyframes-coco`, `--manifest`, `--image-folder`, `--output-coco`, `--match-max-dist`, `--flow-method`, `--interp-method`, `--camera-model` | COCO annotations for every frame (+ optional vis) |
 | `orchestrate_pipeline.py` | End-to-end keyframe pipeline: undistort → sample → keyframes → stats → Qwen → COCO combine → GUI review → 01b COCO→YOLO-seg → 03 split → 02 augment (train only) → assemble final dataset + stats CSV → 04 train → 05 evaluate → 11 tracking. Stage markers make it resumable. Also supports a dataset-only mode (`--coco-json` + `--images-dir`) that runs just 01b convert → 02 augment → 03 split on an already-reviewed COCO file. | `--rosbag`/`--images`/`--coco-json`, `--camera`, `--stage`, `--skip-stage`, `--force`, per-stage args (`--sample-size`, `--ratios`, `--augmentations`, `--epochs`, `--tracker`, ...) | `<input>_pipeline/` output tree (or `{yolo_flat,augmented,dataset}/` in dataset-only mode) |
-| `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`LLAMACPP_URL`, `QWEN_MODEL`, `QWEN_MMPROJ`). Pass `--coco-json ...` for the dataset-only mode. | `<rosbag_path>` (or `--coco-json <coco> --images-dir <dir>`) + any orchestrator args | same as orchestrator |
+| `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`QWEN_BACKEND`, `OLLAMA_URL`, `QWEN_MODEL`, `LLAMACPP_URL`, `QWEN_MMPROJ`). Pass `--coco-json ...` for the dataset-only mode. | `<rosbag_path>` (or `--coco-json <coco> --images-dir <dir>`) + any orchestrator args | same as orchestrator |
 
 ### Data prep & conversion
 

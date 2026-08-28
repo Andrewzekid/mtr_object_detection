@@ -49,11 +49,11 @@ Output layout under `<input>_pipeline/`:
 
 Examples:
 
-    # From a Metacam rosbag, stereo:
+    # From a Metacam rosbag, stereo (Qwen seed labels via Ollama —
+    # `ollama serve` + `ollama pull qwen3.8` must be running/done):
     python scripts/orchestrate_pipeline.py \
         --rosbag 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 \
         --camera both --sample-size 1000 --keyframe-stride 10 \
-        --llamacpp-url http://127.0.0.1:8089 \
         --epochs 100 --batch-size 16 --model-type yolo26n --imgsz 768 \
         --tracker deepocsort
 
@@ -178,12 +178,22 @@ def parse_args(argv=None):
 
     # ---- qwen seed labels ---------------------------------------------------
     g = parser.add_argument_group("qwen (07 + 08c)")
-    g.add_argument("--qwen-model", default="Qwen3.8-27B-Q4_K_M.gguf",
-                   help="Qwen GGUF weights name/path served by llama.cpp")
+    g.add_argument("--qwen-backend", default="ollama",
+                   choices=["ollama", "llamacpp"],
+                   help="VLM serving backend for the seed labels (default: "
+                        "ollama — `ollama serve` + `ollama pull qwen3.8`; "
+                        "requires Ollama 0.32.15+). 'llamacpp' targets a "
+                        "llama.cpp server started with --mmproj.")
+    g.add_argument("--ollama-url", default="http://localhost:11434",
+                   help="Ollama API base URL (backend=ollama)")
+    g.add_argument("--qwen-model", default=None,
+                   help="Qwen model served by the backend (default: 'qwen3.8' "
+                        "for ollama, 'Qwen3.8-27B-Q4_K_M.gguf' for llamacpp)")
     g.add_argument("--qwen-mmproj", default="Qwen3.8-mmproj-F16.gguf",
-                   help="Qwen mmproj file (must be loaded by the server)")
+                   help="Qwen mmproj file (llamacpp backend only; must be "
+                        "loaded by the server)")
     g.add_argument("--llamacpp-url", default="http://127.0.0.1:8089",
-                   help="llama.cpp server URL")
+                   help="llama.cpp server URL (backend=llamacpp)")
     g.add_argument("--prompt", type=str, default=DEFAULT_PROMPT,
                    help="Detection prompt for Qwen")
     g.add_argument("--classes", nargs="+", default=None,
@@ -417,6 +427,24 @@ def check_llamacpp_server(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
+def check_ollama_server(url: str, timeout: float = 2.0) -> bool:
+    """Return True if the Ollama server /api/tags endpoint responds."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/tags",
+                                    timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def resolve_qwen_model(args) -> str:
+    """The Qwen model identifier for the selected serving backend."""
+    if args.qwen_model:
+        return args.qwen_model
+    return ("Qwen3.8-27B-Q4_K_M.gguf"
+            if args.qwen_backend == "llamacpp" else "qwen3.8")
+
+
 def should_run(stage: str, args) -> bool:
     if args.skip_stage and stage in args.skip_stage:
         return False
@@ -634,23 +662,34 @@ def stage_stats(args, paths: CamPaths):
 
 
 def stage_qwen(args, paths: CamPaths):
+    ollama = args.qwen_backend == "ollama"
     for cam in paths.cameras:
         marker = paths.qwen(cam) / "stage_completed.json"
-        if not (args.force or read_marker(marker)) \
-                and not check_llamacpp_server(args.llamacpp_url):
-            raise RuntimeError(
-                f"llama.cpp server not reachable at {args.llamacpp_url}. "
-                "Start it with: llama-server -m <model> --mmproj <mmproj> "
-                "--image-min-tokens 2048 --port 8089")
+        if not (args.force or read_marker(marker)):
+            if ollama and not check_ollama_server(args.ollama_url):
+                raise RuntimeError(
+                    f"Ollama server not reachable at {args.ollama_url}. "
+                    "Start it with: ollama serve  (and pull the model once: "
+                    f"ollama pull {resolve_qwen_model(args)}; requires "
+                    "Ollama 0.32.15+)")
+            if not ollama and not check_llamacpp_server(args.llamacpp_url):
+                raise RuntimeError(
+                    f"llama.cpp server not reachable at {args.llamacpp_url}. "
+                    "Start it with: llama-server -m <model> --mmproj <mmproj> "
+                    "--image-min-tokens 2048 --port 8089")
         cmd = [sys.executable, SCRIPTS_DIR / "07_run_qwen.py",
-               "--backend", "llamacpp",
-               "--llamacpp-url", args.llamacpp_url,
-               "--llamacpp-model", args.qwen_model,
+               "--backend", "ollama" if ollama else "llamacpp",
                "--prompt", NO_THINK_PREFIX + args.prompt,
                "--template", "object_detection",
                "--format", "json",
                "--image-folder", paths.keyframes(cam),
                "--annotations-output", paths.qwen(cam)]
+        if ollama:
+            cmd += ["--ollama-url", args.ollama_url,
+                    "--model", resolve_qwen_model(args)]
+        else:
+            cmd += ["--llamacpp-url", args.llamacpp_url,
+                    "--llamacpp-model", resolve_qwen_model(args)]
         if args.resume_from is not None:
             cmd.extend(["--resume-from", str(args.resume_from)])
         run_stage(f"qwen[{cam}]", cmd, get_project_root(), marker, args.force)

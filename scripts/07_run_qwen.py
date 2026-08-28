@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Run Qwen3.6 inference via Ollama, llama.cpp, or the Aliyun DashScope API.
+Run Qwen3.8 inference via Ollama, llama.cpp, or the Aliyun DashScope API.
 
-This script sends a prompt (with optional image) to Qwen3.6 and returns
+This script sends a prompt (with optional image) to Qwen3.8 and returns
 structured output in the requested format.
 
 BACKENDS:
     --backend ollama     Local Ollama server (default).
-                         Prereq: ollama serve  +  ollama pull qwen3.6
+                         Prereq: ollama serve  +  ollama pull qwen3.8
     --backend llamacpp   Local llama.cpp server with an mmproj vision projector
                          (OpenAI-compatible /v1/chat/completions endpoint).
                          Prereq: llama-server -m <model.gguf> --mmproj <mmproj.gguf> --port 8089
@@ -25,9 +25,9 @@ USAGE:
 
     # llama.cpp backend (mmproj vision projector reads the image files)
     # First start the server:
-    #   llama-server -m Qwen3.6-27B-Q5_K_M.gguf --mmproj mmproj.gguf --port 8089
+    #   llama-server -m Qwen3.8-27B-Q5_K_M.gguf --mmproj mmproj.gguf --port 8089
     python scripts/07_run_qwen.py --backend llamacpp --llamacpp-url http://127.0.0.1:8089 \\
-        --llamacpp-model ./Qwen3.6-27B-Q5_K_M.gguf \\
+        --llamacpp-model ./Qwen3.8-27B-Q5_K_M.gguf \\
         --prompt "Detect all: Ceiling light, Exit Sign" --template object_detection \\
         --format json --image ./sample.jpg --vis-output ./vis.jpg
 
@@ -74,8 +74,8 @@ USAGE:
         --conditioning-images ./Datasets/MTR/ref_images/
 
 PREREQUISITES:
-    - Ollama backend:  ollama serve  &&  ollama pull qwen3.6
-    - llama.cpp backend: llama-server -m Qwen3.6-27B-Q5_K_M.gguf --mmproj mmproj.gguf --port 8089
+    - Ollama backend:  ollama serve  &&  ollama pull qwen3.8
+    - llama.cpp backend: llama-server -m Qwen3.8-27B-Q5_K_M.gguf --mmproj mmproj.gguf --port 8089
     - API backend:     API_KEY env var (or --api-key)
 
     OUTPUT:
@@ -646,7 +646,7 @@ def run_qwen_for_image(args, prompt, image_path, conditioning_images):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run Qwen3.6 inference via Ollama API",
+        description="Run Qwen3.8 inference via Ollama API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -755,8 +755,8 @@ Templates:
     parser.add_argument(
         "--model", "-m",
         type=str,
-        default="qwen3.6:27b",
-        help="Model name in Ollama (default: qwen3.6:27b)",
+        default="qwen3.8",
+        help="Model name in Ollama (default: qwen3.8)",
     )
     parser.add_argument(
         "--ollama-url",
@@ -786,9 +786,9 @@ Templates:
     parser.add_argument(
         "--llamacpp-model",
         type=str,
-        default="./Qwen3.6-27B-Q5_K_M.gguf",
+        default="./Qwen3.8-27B-Q5_K_M.gguf",
         help="Model identifier passed to the llama.cpp server (the .gguf path "
-             "or alias it was started with). Default: ./Qwen3.6-27B-Q5_K_M.gguf",
+             "or alias it was started with). Default: ./Qwen3.8-27B-Q5_K_M.gguf",
     )
     parser.add_argument(
         "--llamacpp-api-key",
@@ -1080,7 +1080,7 @@ def generate_visualization(image_path, vis_path, parsed_output):
 
 
 def process_single_image(args, image_path, output_dir=None, vis_dir=None, conditioning_images=None):
-    """Process a single image with Qwen3.6.
+    """Process a single image with Qwen3.8.
     
     Args:
         args: Parsed command line arguments
@@ -1280,7 +1280,7 @@ def split_annotations_by_class(parsed_output, image_path, annotations_dir, img_w
 
 
 def process_image_folder(args):
-    """Process all images in a folder with Qwen3.6.
+    """Process all images in a folder with Qwen3.8.
     
     Args:
         args: Parsed command line arguments
@@ -1467,7 +1467,7 @@ def main():
             print(f"  Mode: llama.cpp (local, mmproj vision)")
             print(f"  Server: {args.llamacpp_url}")
         else:
-            print(f"Running Qwen3.6 batch inference...")
+            print(f"Running Qwen3.8 batch inference...")
             print(f"  Model: {args.model}")
             print(f"  Mode: Ollama (local)")
         print(f"  Template: {args.template or 'none'}")
@@ -1476,7 +1476,7 @@ def main():
         print(f"  Image folder: {args.image_folder}")
         
         process_image_folder(args)
-        print("\nQwen3.6 batch inference completed successfully!")
+        print("\nQwen3.8 batch inference completed successfully!")
         return
     
     # Single image mode
@@ -1498,7 +1498,7 @@ def main():
         print(f"  Mode: llama.cpp (local, mmproj vision)")
         print(f"  Server: {args.llamacpp_url}")
     else:
-        print(f"Running Qwen3.6 inference...")
+        print(f"Running Qwen3.8 inference...")
         print(f"  Model: {args.model}")
         print(f"  Mode: Ollama (local)")
     
@@ -1596,7 +1596,7 @@ def main():
         if generate_visualization(Path(args.image), vis_path, parsed_output):
             print(f"\nVisualization saved to: {vis_path}")
     
-    print("\nQwen3.6 inference completed successfully!")
+    print("\nQwen3.8 inference completed successfully!")
 
 
 if __name__ == "__main__":
