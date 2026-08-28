@@ -30,17 +30,20 @@ post-processing dominate):
     --mask-max-dim      contour resolution cap (masks are pre-scaled on the
                         GPU before the D2H transfer; TRK_NO_GPU_PRESCALE=1
                         reverts to CPU-side resizing)
-    --half / --trt      faster model stage
+    --half 
 
---trt exports the --model .pt to a TensorRT engine once (FP16, at --imgsz)
-and tracks with the engine; the cached .engine next to the checkpoint is
-reused on later runs. It only accelerates the model-inference stage, so the
-end-to-end gain depends on how inference-bound the run is (measured on
-HKU_GH, yolo26l-seg @ 768, light scenes: ~7% wall-clock; bigger on
-detection-heavy scenes). Same settings as scripts/15_export_trt.py. Delete
-the .engine after changing --imgsz.
 
 USAGE:
+    RECOMMENDED (DeepOCSORT, no visualizations, with nms, 4 postprocess threads):
+    python scripts/11_run_tracking.py \\
+    --tracker deepocsort \\
+    --model models/yolov26segn.pt \\
+    --data Datasets/HKU_GH/rosbags/2026-08-25_22-34-54/camera/undistort/right \\
+    --output output/tracking/HKU_GF/run7/right \\
+    --conf 0.6 \\
+    --device 0 \\
+    --no-vis
+    
     python scripts/11_run_tracking.py \\
     --tracker botsort \\
     --model runs/segment/output/training/iw_segmentation/weights/best.pt \\
@@ -48,12 +51,6 @@ USAGE:
     --conf 0.5 --device 0 \\
     --warmup-frames 3 \\
     --output output/tracking/iw/IWrun2
-
-    # TensorRT engine (export once, reuse after)
-    python scripts/11_run_tracking.py --tracker deepocsort \\
-        --model runs/segment/.../weights/best.pt \\
-        --data HKU_GH_left --output output/tracking/hku_gh_left \\
-        --trt --imgsz 768 --no-vis
     
     # ByteTrack on segmentation model
     python scripts/11_run_tracking.py --tracker bytetrack \\
@@ -72,12 +69,12 @@ USAGE:
         --sam3-model core/sam3/models/sam3-model/sam3.pt \\
         --data MTR_dataset --output output/tracking/detect_then_sam3
 
-    # Per-class confidence: 0.4 for all classes except Sprinkler (floor 0.1)
+    # Per-class confidence: 0.4 for all classes except Sprinkler (floor 0.2)
     python scripts/11_run_tracking.py --tracker deepocsort \\
         --model runs/segment/.../weights/best.pt \\
         --data HKU_GH_left --output output/tracking/hku_gh_left \\
-        --conf 0.4 --conf-exempt-class 'Sprinkler -on the ceiling-' \\
-        --conf-exempt-min 0.1 --imgsz 768
+        --conf 0.4 \\
+        --imgsz 768
 """
 
 import argparse
@@ -1313,7 +1310,7 @@ def parse_args():
     parser.add_argument(
         "--conf-exempt-min",
         type=float,
-        default=0.1,
+        default=0.2,
         help="Confidence floor for --conf-exempt-class detections (default: 0.1)",
     )
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold")
@@ -1326,7 +1323,7 @@ def parse_args():
              "higher-confidence one, so the same object can't be tracked "
              "twice (default: 0.5; >= 1.0 disables)",
     )
-    parser.add_argument("--imgsz", type=int, default=640, help="Inference image size")
+    parser.add_argument("--imgsz", type=int, default=768, help="Inference image size")
     parser.add_argument("--fps", type=int, default=10, help="Output video FPS")
     parser.add_argument("--max-frames", type=int, default=None, help="Process only first N frames")
     parser.add_argument(

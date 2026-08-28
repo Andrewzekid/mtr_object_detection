@@ -4,7 +4,8 @@ The map (colored point cloud), images and timestamps live in an .rrd
 produced elsewhere; this app only ADDS annotated-frame camera-position
 markers. "File -> Open rerun file…" opens the recording in a viewer —
 a standalone windowed one by default, or a native viewer process whose
-X11 window the GUI reparents into its in-app waypoint view (embed=True);
+top-level window the GUI reparents into its in-app waypoint view
+(embed=True; X11 window id on Linux, Win32 HWND on Windows);
 either viewer hosts a gRPC server. A blueprint is sent on connect so the
 viewer opens on the 3D map (camera image/depth views left out). "🗺 Show
 annotated in Rerun" then
@@ -38,6 +39,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import time
 from typing import List, Optional, Tuple
 
@@ -47,6 +49,8 @@ try:
 except Exception:  # pragma: no cover - rerun is optional
     rr = None  # type: ignore[assignment]
     _HAS_RERUN = False
+
+_ON_WINDOWS = sys.platform.startswith("win")
 
 # Default entity path of the markers inside the recording; the actual path
 # is derived per recording (sibling of the map point cloud, see
@@ -79,10 +83,10 @@ class RerunLogger:
         # level the map's ground plane, derived on open; None when the map
         # is already level or no ground plane could be fitted.
         self._level_transform: Optional[Tuple] = None
-        # Embedded mode: X11 window id of the native viewer process we
-        # spawned (set when opened with embed=True; the GUI reparents that
-        # window into its waypoint view; the process is terminated via
-        # shutdown()).
+        # Embedded mode: native window id of the viewer process we spawned
+        # (set when opened with embed=True; the GUI reparents that window
+        # into its waypoint view: X11 window id on Linux, HWND on Windows;
+        # the process is terminated via shutdown()).
         self.win_id: Optional[int] = None
         self._proc: Optional[subprocess.Popen] = None
         self._embed = False  # respawn mode once the viewer drops away
@@ -98,10 +102,11 @@ class RerunLogger:
         # window's _NET_WM_PID property, and kill that.
         self._viewer_pid: Optional[int] = None      # embedded viewer
         self._ext_viewer_pid: Optional[int] = None  # windowed viewer
-        # Incremented on every open_recording: X11 recycles window ids, so
-        # a re-open can legitimately yield the SAME win_id for a NEW viewer
-        # process — the GUI must compare (win_id, open_seq), not win_id
-        # alone, to decide whether to rebuild its container.
+        # Incremented on every open_recording: window ids are recycled (X11
+        # window ids and Win32 HWNDs both), so a re-open can legitimately
+        # yield the SAME win_id for a NEW viewer process — the GUI must
+        # compare (win_id, open_seq), not win_id alone, to decide whether
+        # to rebuild its container.
         self.open_seq = 0
 
     # ------------------------------------------------------------------ #
@@ -110,9 +115,10 @@ class RerunLogger:
         """Remember an .rrd as the marker target and open it in a viewer.
 
         ``embed=True`` spawns the native viewer and sets ``self.win_id``
-        to its X11 window id so the GUI can reparent the window into its
-        waypoint view (``win_id`` stays None when the window couldn't be
-        found — the viewer then simply stays a standalone window).
+        to its top-level window id (X11 window id on Linux, HWND on
+        Windows) so the GUI can reparent the window into its waypoint view
+        (``win_id`` stays None when the window couldn't be found — the
+        viewer then simply stays a standalone window).
         """
         if not self.enabled:
             return False
@@ -159,19 +165,58 @@ class RerunLogger:
 
     @staticmethod
     def _kill_viewer_pid(pid: int) -> None:
-        """SIGTERM the real viewer process (see ``_viewer_pid``).
+        """Terminate the real viewer process (see ``_viewer_pid``).
 
-        Safety-checked against /proc so a recycled pid that no longer
-        belongs to a rerun binary is left alone.
+        Safety-checked so a recycled pid that no longer belongs to a rerun
+        binary is left alone: /proc cmdline inspection on Linux, and on
+        Windows a process-name query that must contain 'rerun'.
         """
         import signal
         try:
-            with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                if b"rerun" not in fh.read():
+            if _ON_WINDOWS:
+                if not RerunLogger._win32_process_name(pid):
                     return
-            os.kill(pid, signal.SIGTERM)
+                # TerminateProcess(handle, 1); PROCESS_TERMINATE access.
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                PROCESS_TERMINATE = 0x0001
+                h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+                if not h:
+                    return
+                try:
+                    kernel32.TerminateProcess(h, 1)
+                finally:
+                    kernel32.CloseHandle(h)
+            else:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    if b"rerun" not in fh.read():
+                        return
+                os.kill(pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
+
+    @staticmethod
+    def _win32_process_name(pid: int) -> bool:
+        """True when the process `pid` looks like a rerun binary (its
+        executable path contains 'rerun')."""
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        h = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return False
+        try:
+            size = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(
+                    h, 0, buf, ctypes.byref(size)):
+                return False
+            return "rerun" in (buf.value or "").lower()
+        finally:
+            kernel32.CloseHandle(h)
 
     def log_annotated_markers(self, markers: List[Tuple]) -> bool:
         """Replace the annotated-frame markers on the recording's map.
@@ -211,14 +256,17 @@ class RerunLogger:
         """Launch ``rerun <path> --port <free>`` (windowed, with a gRPC
         server) and connect once the server accepts connections.
 
-        With ``embed=True`` the viewer's top-level X11 window is looked up
+        With ``embed=True`` the viewer's top-level window is looked up
         (``self.win_id``) so the GUI can reparent it into its waypoint
-        view. The window may flash standalone for a moment before the GUI
-        grabs it; when the lookup fails the recording still opens as a
-        normal external window (``win_id`` stays None).
+        view: an X11 window id on Linux (X11/xwininfo) or a Win32 HWND on
+        Windows (EnumWindows). The window may flash standalone for a
+        moment before the GUI grabs it; when the lookup fails the
+        recording still opens as a normal external window (``win_id``
+        stays None).
 
-        In both modes the real viewer pid is resolved from the window's
-        _NET_WM_PID (the Popen handle only tracks the short-lived wrapper
+        In both modes the real viewer pid is resolved — from the window's
+        _NET_WM_PID on X11, or the EnumWindows hit's owning pid on
+        Windows (the Popen handle only tracks the short-lived wrapper
         script — see ``_viewer_pid``), so shutdown can actually kill it.
         """
         try:
@@ -235,7 +283,10 @@ class RerunLogger:
             with socket.socket() as s:
                 s.bind(("127.0.0.1", 0))
                 port = s.getsockname()[1]
-            before = self._x11_rerun_windows()
+            if _ON_WINDOWS:
+                before = self._win32_rerun_windows()
+            else:
+                before = self._x11_rerun_windows()
             proc = subprocess.Popen(["rerun", self.rrd_path,
                                      "--port", str(port)])
             if embed:
@@ -262,7 +313,7 @@ class RerunLogger:
             if embed:
                 self.win_id = self._wait_for_window(before)
                 if self.win_id is None:
-                    print("WARNING: could not find the rerun viewer's X11 "
+                    print("WARNING: could not find the rerun viewer's "
                           "window; it stays a standalone window")
                 else:
                     self._viewer_pid = self._window_pid(self.win_id)
@@ -281,7 +332,14 @@ class RerunLogger:
 
     @staticmethod
     def _window_pid(wid: int) -> Optional[int]:
-        """The owning process id of an X11 window (_NET_WM_PID)."""
+        """The owning process id of a viewer window.
+
+        X11: _NET_WM_PID via xprop. Windows: the hwnd's owning process via
+        GetWindowThreadProcessId (the lookup itself returns the pair).
+        """
+        if _ON_WINDOWS:
+            hwnd_pid = RerunLogger._win32_window_pids().get(wid)
+            return hwnd_pid
         try:
             out = subprocess.run(["xprop", "-id", str(wid), "_NET_WM_PID"],
                                  capture_output=True, text=True,
@@ -292,8 +350,65 @@ class RerunLogger:
         return int(m.group(1)) if m else None
 
     @staticmethod
+    def _win32_window_pids() -> dict:
+        """{hwnd: pid} of every visible top-level window (EnumWindows +
+        GetWindowThreadProcessId). Empty on any failure."""
+        import ctypes
+        from ctypes import wintypes
+
+        result: dict = {}
+        user32 = ctypes.windll.user32
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                   wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            result[int(hwnd) & 0xFFFFFFFF] = pid.value
+            return True
+
+        try:
+            user32.EnumWindows(proto(_cb), 0)
+        except Exception:
+            pass
+        return result
+
+    @staticmethod
+    def _win32_rerun_windows() -> set:
+        """Window handles (as ints) of visible top-level windows titled
+        'Rerun' — the Win32 counterpart of _x11_rerun_windows."""
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        hits: set = set()
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                   wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            if user32.IsWindowVisible(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    if buf.value.strip() == "Rerun":
+                        hits.add(int(hwnd) & 0xFFFFFFFF)
+            return True
+
+        try:
+            user32.EnumWindows(proto(_cb), 0)
+        except Exception:
+            pass
+        return hits
+
+    @staticmethod
     def _x11_rerun_windows() -> set:
-        """Window ids of top-level X11 windows titled 'Rerun'."""
+        """Window ids of top-level X11 windows titled 'Rerun' (Linux)."""
         try:
             out = subprocess.run(["xwininfo", "-root", "-children"],
                                  capture_output=True, text=True,
@@ -310,7 +425,10 @@ class RerunLogger:
         window that didn't exist before the spawn)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            new = self._x11_rerun_windows() - before
+            if _ON_WINDOWS:
+                new = self._win32_rerun_windows() - before
+            else:
+                new = self._x11_rerun_windows() - before
             if new:
                 return new.pop()
             time.sleep(0.25)

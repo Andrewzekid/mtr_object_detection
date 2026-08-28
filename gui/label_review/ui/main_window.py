@@ -117,10 +117,9 @@ class ReviewWindow(QMainWindow):
                    owlv2_model: Optional[str] = None,
                    owlv2_conf: float = 0.3,
                    owlv2_exemplar_conf: float = 0.6,
-                   gdino_model: Optional[str] = None,
-                   gdino_conf: float = 0.35,
-                   falcon_model: Optional[str] = None,
-                   parent=None):
+                    gdino_model: Optional[str] = None,
+                    gdino_conf: float = 0.35,
+                    parent=None):
         super().__init__(parent)
         self.frame_index = frame_index
         self.coco = coco
@@ -162,13 +161,14 @@ class ReviewWindow(QMainWindow):
         # Fraction of min(frame w, h) used as the max pairing distance when
         # matching anchor boxes for interpolation.
         self.interp_match_frac = interp_match_frac
-        # Whether the advanced controls (interpolation + tracking settings,
-        # keyframe/interpolate buttons) are exposed. Off by default; toggled
-        # from the Config dialog's "Advanced settings" checkbox.
+        # Whether the advanced controls (interpolation parameters + the
+        # interpolate/keyframe hide checkboxes in the Config dialog) are
+        # exposed. Off by default; toggled from the dialog's
+        # "Advanced settings" checkbox.
         self.advanced_ui: bool = advanced_ui
         # Whether track ids are shown (canvas "T<id>" labels, box-list
         # suffix, "Track of selected" row). On by default; config key
-        # tracking.show_ids, editable under the dialog's advanced section.
+        # tracking.show_ids, editable in the dialog's Tracking section.
         self.show_track_ids: bool = show_track_ids
         # Whether to show the track-id mismatch confirmation dialog before
         # interpolating.
@@ -197,12 +197,10 @@ class ReviewWindow(QMainWindow):
         # Autolabel detector: "sam3" (text-prompt SAM3, boxes+masks),
         # "owlv2" (zero-shot OWLv2 boxes), "owlv2_exemplar" (1-shot
         # image-guided OWLv2 using the selected box as the visual query),
-        # or a generic open-set backend: "grounding_dino" (boxes) /
-        # "falcon" (boxes + real masks).
+        # or a generic open-set backend: "grounding_dino" (boxes).
         # Config: autolabel.detector / autolabel.owlv2_model /
         # autolabel.owlv2_conf / autolabel.owlv2_exemplar_conf /
-        # autolabel.gdino_model /
-        # autolabel.gdino_conf / autolabel.falcon_model.
+        # autolabel.gdino_model / autolabel.gdino_conf.
         self.autolabel_detector: str = (
             autolabel_detector if autolabel_detector in AUTOLABEL_DETECTORS
             else "sam3")
@@ -214,7 +212,6 @@ class ReviewWindow(QMainWindow):
         self.owlv2_exemplar_conf = float(owlv2_exemplar_conf)
         self.gdino_model = gdino_model
         self.gdino_conf = float(gdino_conf)
-        self.falcon_model = falcon_model
 
         self.setWindowTitle("Computer Vision Label Review Tool")
         self.resize(1600, 900)
@@ -259,6 +256,10 @@ class ReviewWindow(QMainWindow):
         self._sam3_all_ok: int = 0
         self._sam3_all_fail: int = 0
         self._interp_worker: Optional[InterpBatchWorker] = None
+        # '⇉ Interpolate all keyframes' queue: (a, b) anchor spans still to
+        # interpolate, filled by _on_interpolate_all_keyframes and drained
+        # one span per finished run by _start_next_interp_span.
+        self._interp_all_pending: List[Tuple[int, int]] = []
         # Tmp file path for the current frame's image (run_sam3 needs a path).
         self._tmp_image_path: Optional[str] = None
 
@@ -336,8 +337,8 @@ class ReviewWindow(QMainWindow):
         # The central area is a stack: page 0 is the image labeling view
         # (canvas splitter), page 1 the embedded rerun waypoint map.
         # View → "Switch to Rerun waypoint view" swaps the pages. The
-        # QWebEngineView is created lazily on first embed so headless/test
-        # runs never instantiate QtWebEngine.
+        # rerun page hosts the native viewer window's container, created
+        # lazily on first embed (see _load_rerun_embedded).
         self._stack = QtWidgets.QStackedWidget(self)
         self._stack.addWidget(self._splitter)
         self._rerun_page = QtWidgets.QWidget(self._stack)
@@ -345,8 +346,8 @@ class ReviewWindow(QMainWindow):
         _rerun_layout.setContentsMargins(0, 0, 0, 0)
         _placeholder = QLabel(
             "Open an .rrd recording (File → Open rerun file…) to see the "
-            "rerun map here. Embedded view needs an X11 session (xcb) and "
-            "the `xwininfo` tool; otherwise the recording opens in the "
+            "rerun map here. Embedded view needs an X11 session (Linux) or "
+            "a native Windows display; otherwise the recording opens in the "
             "external viewer.", self._rerun_page)
         _placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         _placeholder.setWordWrap(True)
@@ -365,8 +366,9 @@ class ReviewWindow(QMainWindow):
         self._rerun_embedded_key: Optional[tuple] = None
         # Focus-follows-pointer for the embedded viewer (a reparented
         # foreign window gets mouse events from the window under the cursor
-        # but keyboard events follow the X input focus), plus the shared
-        # libX11 connection it runs on. See _sync_rerun_focus.
+        # but keyboard events follow the platform input focus), plus the
+        # shared libX11 connection the X11 focus calls run on. See
+        # _sync_rerun_focus.
         self._x11_lib = None
         self._x11_dpy = None
         self._rerun_focus_timer = QTimer(self)
@@ -379,11 +381,10 @@ class ReviewWindow(QMainWindow):
         self._build_menu()
 
         # Config-driven UI tweaks: hide button groups, preset mask opacity.
-        # Without advanced mode the keyframe/interpolate groups are always
-        # hidden, regardless of the ui_hide list.
+        # The keyframe/interpolate groups are visible by default; only an
+        # explicit ui_hide list (or the dialog's hide checkboxes, which are
+        # part of it) removes them.
         hide_groups = list(ui_hide or [])
-        if not self.advanced_ui:
-            hide_groups = sorted(set(hide_groups) | {"interpolate", "keyframe"})
         if hide_groups:
             self.side.set_hidden_groups(hide_groups)
         if mask_opacity is not None:
@@ -429,8 +430,14 @@ class ReviewWindow(QMainWindow):
         self.side.autolabel_all_clicked.connect(self._on_autolabel_all)
         self.side.propagate_clicked.connect(self._on_propagate_track)
         self.side.toggle_keyframe_clicked.connect(self._on_toggle_keyframe)
+        self.side.mark_every_nth.connect(self._on_mark_every_nth)
+        self.side.interpolate_all_keyframes.connect(
+            self._on_interpolate_all_keyframes)
+        self.side.propagate_all_keyframes.connect(
+            self._on_propagate_all_keyframes)
         self.side.toggle_annotated_clicked.connect(self._on_toggle_annotated)
         self.side.nav_annotated.connect(self._on_nav_annotated)
+        self.side.nav_keyframe.connect(self._on_nav_keyframe)
         self.side.toggle_discard_clicked.connect(self._on_toggle_discard)
         self.side.show_annotated_rerun_clicked.connect(
             self._on_show_annotated_rerun)
@@ -507,7 +514,7 @@ class ReviewWindow(QMainWindow):
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.MouseButtonPress:
             if obj is self._rerun_container:
-                # Clicking the embedded rerun window forwards X11 keyboard
+                # Clicking the embedded rerun window forwards keyboard
                 # focus to it, so its camera controls (WASD…) work.
                 self._focus_rerun_window()
             # Clicking a stereo canvas makes it the active side (the target
@@ -551,8 +558,9 @@ class ReviewWindow(QMainWindow):
         if not dpy:
             return 0
         focus = ctypes.c_ulong(0)
+        revert = ctypes.c_int(0)
         x11.XGetInputFocus(ctypes.c_void_p(dpy), ctypes.byref(focus),
-                           ctypes.byref(ctypes.c_int(0)))
+                           ctypes.byref(revert))
         return focus.value
 
     def _x11_set_focus(self, wid: int) -> None:
@@ -564,37 +572,77 @@ class ReviewWindow(QMainWindow):
                            1, 0)  # RevertToParent, CurrentTime
         x11.XSync(ctypes.c_void_p(dpy), 0)
 
+    # -- Win32 focus (embedded viewer on Windows) ------------------------- #
+
+    @staticmethod
+    def _on_windows() -> bool:
+        import sys
+        return sys.platform.startswith("win")
+
+    def _win32_set_focus(self, hwnd: int) -> None:
+        """Give Win32 keyboard focus to the embedded viewer's HWND.
+
+        SetFocus moves focus within the calling thread's input queue; for a
+        reparented (WS_CHILD) foreign window this works when its thread is
+        attached to ours — Windows does that automatically for
+        cross-process SetParent (AttachThreadInput semantics), which Qt's
+        createWindowContainer relies on. SetForegroundWindow is skipped
+        deliberately: our own top-level already owns foreground when the
+        map view is up.
+        """
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.SetFocus(ctypes.wintypes.HWND(hwnd))
+
+    def _win32_focus(self) -> int:
+        """HWND currently holding Win32 keyboard focus (0 on failure)."""
+        import ctypes
+        user32 = ctypes.windll.user32
+        return int(user32.GetFocus()) & 0xFFFFFFFF
+
     def _focus_rerun_window(self) -> None:
-        """Move X11 input focus to the embedded rerun window.
+        """Move input focus to the embedded rerun window.
 
         A reparented foreign window receives mouse events (they go to the
         window under the cursor) but NOT keyboard events, which follow the
         input focus our Qt window holds — so WASD camera controls are dead
-        until we hand the focus over via XSetInputFocus. Retries cover the
-        transient not-viewable state right after a respawn.
+        until we hand the focus over (XSetInputFocus on X11, SetFocus on
+        Windows). Retries cover the transient not-viewable state right
+        after a respawn.
         """
         wid = self._rerun_embedded_wid
         if not wid:
             return
         try:
-            for _ in range(5):
-                self._x11_set_focus(wid)
-                if self._x11_focus() == wid:
-                    break
-                time.sleep(0.1)
+            if self._on_windows():
+                for _ in range(5):
+                    self._win32_set_focus(wid)
+                    if self._win32_focus() == wid:
+                        break
+                    time.sleep(0.1)
+            else:
+                for _ in range(5):
+                    self._x11_set_focus(wid)
+                    if self._x11_focus() == wid:
+                        break
+                    time.sleep(0.1)
         except Exception as exc:
             print(f"WARNING: could not focus the embedded rerun window: "
                   f"{exc}")
 
     def _restore_qt_focus(self) -> None:
-        """Hand X11 input focus back from the embedded rerun window to our
-        own top-level window, so the GUI's hotkeys and text fields work."""
+        """Hand input focus back from the embedded rerun window to our own
+        top-level window, so the GUI's hotkeys and text fields work."""
         wid = self._rerun_embedded_wid
         if not wid:
             return
         try:
-            if self._x11_focus() == wid:
-                self._x11_set_focus(int(self.winId()))
+            if self._on_windows():
+                if self._win32_focus() == wid:
+                    self._win32_set_focus(int(self.winId()))
+            else:
+                if self._x11_focus() == wid:
+                    self._x11_set_focus(int(self.winId()))
         except Exception as exc:
             print(f"WARNING: could not restore Qt keyboard focus: {exc}")
 
@@ -625,14 +673,23 @@ class ReviewWindow(QMainWindow):
             return  # don't yank focus out of a text field mid-edit
         over_map = self._rerun_container.rect().contains(
             self._rerun_container.mapFromGlobal(QtGui.QCursor.pos()))
-        focus = self._x11_focus()
+        if self._on_windows():
+            focus = self._win32_focus()
+        else:
+            focus = self._x11_focus()
         mine = int(self.winId())
         if focus not in (self._rerun_embedded_wid, mine):
             return  # another app holds focus — don't fight the WM
         if over_map and focus != self._rerun_embedded_wid:
-            self._x11_set_focus(self._rerun_embedded_wid)
+            if self._on_windows():
+                self._win32_set_focus(self._rerun_embedded_wid)
+            else:
+                self._x11_set_focus(self._rerun_embedded_wid)
         elif not over_map and focus == self._rerun_embedded_wid:
-            self._x11_set_focus(mine)
+            if self._on_windows():
+                self._win32_set_focus(mine)
+            else:
+                self._x11_set_focus(mine)
 
     # ----------------------- canvases (mono / stereo) ------------------- #
 
@@ -950,6 +1007,7 @@ class ReviewWindow(QMainWindow):
             c.setEnabled(True)
         self.side.set_interp_running(False)
         self.side.set_interp_status("Interpolation: idle")
+        self._interp_all_pending.clear()
         # Save the current session before switching away from it.
         try:
             self.coco.save(is_final=False)
@@ -998,9 +1056,10 @@ class ReviewWindow(QMainWindow):
         """File -> Open rerun file…: open an .rrd recording (with the map,
         images and timestamps) in the embedded rerun waypoint view, which
         replaces the image view automatically. Only when native embedding
-        is unavailable (no X11/xwininfo) or the spawn fails does the
-        recording stay in a standalone windowed viewer. The recording
-        becomes the target for '🗺 Show annotated in Rerun' markers."""
+        is unavailable (no X11/xwininfo on Linux, or neither platform's
+        native windowing is in use) or the spawn fails does the recording
+        stay in a standalone windowed viewer. The recording becomes the
+        target for '🗺 Show annotated in Rerun' markers."""
         path, _ = QFileDialog.getOpenFileName(
             self, "Open rerun file", "", "Rerun recording (*.rrd)")
         if not path:
@@ -1020,11 +1079,21 @@ class ReviewWindow(QMainWindow):
 
     @staticmethod
     def _native_embed_available() -> bool:
-        """True when native window reparenting can work: X11 (xcb) session
-        with the `xwininfo` tool to locate the viewer window."""
+        """True when native window reparenting can work.
+
+        Linux: an X11 (xcb) session with the `xwininfo` tool to locate the
+        viewer window. Windows: the Qt 'windows' platform plugin — the
+        viewer's HWND is found via EnumWindows and reparented through
+        Qt's createWindowContainer (which drives SetParent + the
+        WS_CHILD style change internally).
+        """
         import shutil
         app = QApplication.instance()
-        return (app is not None and app.platformName() == "xcb"
+        if app is None:
+            return False
+        if app.platformName() == "windows":
+            return True
+        return (app.platformName() == "xcb"
                 and shutil.which("xwininfo") is not None)
 
     def _load_rerun_embedded(self) -> None:
@@ -1217,8 +1286,6 @@ class ReviewWindow(QMainWindow):
         if "gdino_conf" in autolabel_cfg:
             self.gdino_conf = max(
                 0.0, min(1.0, float(autolabel_cfg["gdino_conf"])))
-        if autolabel_cfg.get("falcon_model"):
-            self.falcon_model = str(autolabel_cfg["falcon_model"])
         sam3_cfg = cfg.get("sam3", {})
         dev = sam3_cfg.get("device")
         if dev in ("auto", "cuda", "cpu"):
@@ -1276,8 +1343,6 @@ class ReviewWindow(QMainWindow):
             self.advanced_ui = bool(ui_cfg["advanced"])
         if "hide" in ui_cfg or "advanced" in ui_cfg:
             groups = list(ui_cfg.get("hide") or [])
-            if not self.advanced_ui:
-                groups = sorted(set(groups) | {"interpolate", "keyframe"})
             self.side.set_hidden_groups(groups)
         if "mask_opacity" in ui_cfg:
             pct = max(0, min(100, int(ui_cfg["mask_opacity"])))
@@ -1674,6 +1739,21 @@ class ReviewWindow(QMainWindow):
         self.coco.save(is_final=False)
         self.statusBar().showMessage(msg, 2500)
 
+    def _on_mark_every_nth(self, n: int) -> None:
+        """'★ mark keyframes': mark frames 0, N, 2N, … (existing marks
+        are kept)."""
+        total = len(self.frame_index)
+        if total < 2:
+            return
+        before = len(self.coco.keyframes)
+        self.coco.keyframes.update(range(0, total, max(2, int(n))))
+        self._sync_keyframe_button()
+        self.coco.save(is_final=False)
+        added = len(self.coco.keyframes) - before
+        self.statusBar().showMessage(
+            f"Keyframes: +{added} new, {len(self.coco.keyframes)} total "
+            f"(every {n} frames)", 4000)
+
     def _sync_annotated_button(self) -> None:
         """Reflect whether the current frame is marked as annotated."""
         self.side.btn_mark_annotated.blockSignals(True)
@@ -1930,19 +2010,30 @@ class ReviewWindow(QMainWindow):
                     "current frame", 4500)
                 return
             a, b = max(before), min(after)
+        self._start_interp_span(side, a, b)
         if b - a < 2:
             self.statusBar().showMessage(
                 f"Nothing to interpolate between frames {a + 1} and {b + 1}",
                 3000)
             return
+        self._start_interp_span(side, a, b)
+
+    def _start_interp_span(self, side: str, a: int, b: int) -> bool:
+        """Build + launch the flow-interpolation worker for one [a, b]
+        anchor span (on `side`). Returns True when a worker was started.
+
+        The pairing warnings are auto-accepted here (mismatch details land
+        in the log) so batch runs over many keyframe gaps don't need a
+        click per gap.
+        """
+        if b - a < 2:
+            return False
         img_a = self.coco._img_id_by_idx.get((a, side))
         img_b = self.coco._img_id_by_idx.get((b, side))
         anns_a = self.coco.anns_for_image(img_a) if img_a else []
         anns_b = self.coco.anns_for_image(img_b) if img_b else []
         if not anns_a or not anns_b:
-            self.statusBar().showMessage(
-                "Interpolate: anchor frames must have boxes", 3000)
-            return
+            return False
         boxes_a = [self._ann_to_interp_dict(ann) for ann in anns_a]
         boxes_b = [self._ann_to_interp_dict(ann) for ann in anns_b]
         # Match threshold: fraction of the smaller frame dimension (config:
@@ -1958,27 +2049,11 @@ class ReviewWindow(QMainWindow):
                     break
         pairs, warnings = self._pair_boxes(boxes_a, boxes_b, max_dist)
         if not pairs:
-            self.statusBar().showMessage(
-                "Interpolate: no box pairs to interpolate", 3000)
-            return
-        if warnings and self.interp_confirm_mismatch:
-            msg = QMessageBox(self)
-            msg.setIcon(QMessageBox.Icon.Warning)
-            msg.setWindowTitle("Track id mismatch")
-            msg.setText(
-                f"Interpolating frames {a + 1} → {b + 1}:\n\n"
-                + "\n".join(f"• {w_}" for w_ in warnings)
-                + "\n\nProceed with this pairing?")
-            msg.setStandardButtons(
-                QMessageBox.StandardButton.Ok
-                | QMessageBox.StandardButton.Cancel)
-            msg.setDefaultButton(QMessageBox.StandardButton.Ok)
-            if msg.exec() != QMessageBox.StandardButton.Ok:
-                return
-        elif warnings:
-            # Confirmation disabled via config — log the mismatches instead.
+            return False
+        if warnings:
+            # Confirmation disabled for batch runs — log the mismatches.
             for w_ in warnings:
-                print(f"⚠️ Interpolate pairing: {w_}")
+                print(f"⚠️ Interpolate pairing ({a + 1}→{b + 1}): {w_}")
         jobs = [{"a": a, "b": b, "box_a": ba, "box_b": bb}
                 for ba, bb in pairs]
         tmp_base = str(Path(self.coco.output_json).parent
@@ -2001,14 +2076,110 @@ class ReviewWindow(QMainWindow):
         self._interp_worker.cancelled_signal.connect(
             self._on_interp_cancelled)
         self._interp_worker.start()
+        return True
+
+    def _on_interpolate_all_keyframes(self) -> None:
+        """'⇉ Interpolate all keyframes': flow-fill every gap between
+        adjacent anchor frames (keyframes with boxes are the preferred
+        anchors — anchor_candidates() already orders them first), starting
+        from the current position and wrapping to cover the whole session.
+
+        Spans are queued and run back-to-back on the active side; frames
+        that already have boxes are skipped by the shared finish handler.
+        """
+        if (self._interp_worker is not None
+                and self._interp_worker.isRunning()):
+            self.statusBar().showMessage("Interpolation already running", 2500)
+            return
+        side = self._active_canvas.side
+        anchors = self.coco.anchor_candidates(side)
+        if len(anchors) < 2:
+            self.statusBar().showMessage(
+                "Interpolate all: need at least two labeled frames", 3000)
+            return
+        # Start at the first anchor AFTER the current frame and walk the
+        # anchor list (wrapping once) so re-running after a partial pass
+        # picks up where the last run stopped.
+        cur = self._current_idx
+        starts = [f for f in anchors if f > cur] + [f for f in anchors
+                                                    if f <= cur]
+        spans: List[Tuple[int, int]] = []
+        for a in starts:
+            nxt = next((f for f in anchors if f > a), None)
+            if nxt is not None and nxt - a >= 2:
+                spans.append((a, nxt))
+        spans = [sp for sp in spans]
+        # Deduplicate while keeping order.
+        seen = set()
+        unique_spans = []
+        for sp in spans:
+            if sp not in seen:
+                seen.add(sp)
+                unique_spans.append(sp)
+        if not unique_spans:
+            self.statusBar().showMessage(
+                "Interpolate all: no gaps between labeled frames", 3000)
+            return
+        n_frames = sum(b - a - 1 for a, b in unique_spans)
+        ret = QMessageBox.question(
+            self, "Interpolate all keyframe gaps?",
+            f"Flow-interpolate {len(unique_spans)} gap(s) "
+            f"({n_frames} frame(s)) between adjacent labeled/keyframe "
+            f"anchors on the {side} side?\n\n"
+            f"Frames that already have boxes are skipped. Runs in the "
+            f"background, one gap at a time; Ctrl+Z undoes per gap.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self._interp_all_pending = list(unique_spans)
+        self._start_next_interp_span()
+
+    def _start_next_interp_span(self) -> None:
+        """Pop the next queued keyframe gap and interpolate it."""
+        if not self._interp_all_pending:
+            return
+        if self._stale_sender():
+            return
+        if (self._interp_worker is not None
+                and self._interp_worker.isRunning()):
+            # Previous worker still tearing down — retry shortly (only
+            # reached with a live event loop; the chained call from
+            # _on_interp_finished never hits this for fakes).
+            QTimer.singleShot(200, self._start_next_interp_span)
+            return
+        a, b = self._interp_all_pending.pop(0)
+        side = self._interp_side if self._interp_worker else \
+            self._active_canvas.side
+        if not self._start_interp_span(side, a, b):
+            # Gap already filled (or anchors lost) — move on immediately.
+            self._start_next_interp_span()
 
     def _on_cancel_interp(self) -> None:
+        self._interp_all_pending.clear()
         if self._interp_worker is not None:
             self._interp_worker.cancel()
 
     def _on_interp_progress(self, done: int, total: int) -> None:
         self.side.set_interp_status(
             f"Interpolating {done}/{total} pair(s)…")
+
+    def _is_current_interp_sender(self) -> bool:
+        """True when the interp chain should continue after this signal.
+
+        Only a source switch (session bump) invalidates a run — identity
+        and _stale_sender() both break for manually-emitted fakes, where
+        sender() is a stale leftover QObject.
+        """
+        s = self.sender()
+        if isinstance(s, InterpBatchWorker):
+            return getattr(s, "_lr_session", self._session_seq) \
+                == self._session_seq
+        # Direct / manual emit: current unless a stale-session worker
+        # object is still registered.
+        return (self._interp_worker is None
+                or getattr(self._interp_worker, "_lr_session",
+                           self._session_seq) == self._session_seq)
 
     def _on_interp_finished(self, results: list) -> None:
         if self._stale_sender():
@@ -2047,6 +2218,12 @@ class ReviewWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Interpolation done: {added} box(es) added (Ctrl+Z undoes all)",
             4000)
+        # Batch mode ('⇉ Interpolate all keyframes'): fill the next queued
+        # gap. Chained directly (not via a queued QTimer — that fires after
+        # teardown in headless use and aborts). Identity (not _stale_sender)
+        # decides: manual emits in tests leave sender() stale.
+        if self._interp_all_pending and self._is_current_interp_sender():
+            self._start_next_interp_span()
 
     def _on_interp_failed(self, err: str) -> None:
         if self._stale_sender():
@@ -2056,6 +2233,7 @@ class ReviewWindow(QMainWindow):
         for c in self.canvases.values():
             c.setEnabled(True)
         self.side.set_interp_running(False)
+        self._interp_all_pending.clear()  # don't chain after a failure
         self.side.set_interp_status("Interpolation failed")
         QMessageBox.critical(self, "Interpolation failed", err)
 
@@ -2250,6 +2428,32 @@ class ReviewWindow(QMainWindow):
         self.coco.save(is_final=False)
         self.statusBar().showMessage(
             f"Annotated frame {target + 1}/{len(self.frame_index)}", 2500)
+
+    def _on_nav_keyframe(self, direction: int) -> None:
+        """Jump to the next (+1) / previous (-1) ★ keyframe, wrapping
+        around at the ends."""
+        marks = sorted(self.coco.keyframes)
+        if not marks:
+            self.statusBar().showMessage(
+                "No keyframes marked yet", 3000)
+            return
+        cur = self._current_idx
+        if direction > 0:
+            target = next((m for m in marks if m > cur), marks[0])
+        else:
+            target = next((m for m in reversed(marks) if m < cur),
+                          marks[-1])
+        if target == cur:
+            self.statusBar().showMessage(
+                "This is the only keyframe", 3000)
+            return
+        self._current_idx = target
+        self._load_current()
+        # Same as explicit N/B nav: record progress so the tmp file tracks
+        # where the review session is.
+        self.coco.save(is_final=False)
+        self.statusBar().showMessage(
+            f"Keyframe {target + 1}/{len(self.frame_index)}", 2500)
 
     def _on_save(self) -> None:
         """File → Save (Ctrl+S): write the final COCO JSON to the current
@@ -2898,12 +3102,11 @@ class ReviewWindow(QMainWindow):
 
     def _autolabel_model_id(self, detector: str) -> Optional[str]:
         """The configured checkpoint for one autolabel backend."""
-        return {"grounding_dino": self.gdino_model,
-                "falcon": self.falcon_model}.get(detector, self.owlv2_model)
+        return {"grounding_dino": self.gdino_model}.get(
+            detector, self.owlv2_model)
 
     def _autolabel_conf(self, detector: str) -> float:
-        """The configured threshold for one autolabel backend (Falcon
-        emits no scores — the value is ignored there)."""
+        """The configured threshold for one autolabel backend."""
         if detector == "grounding_dino":
             return self.gdino_conf
         if detector == "owlv2_exemplar":
@@ -3056,8 +3259,8 @@ class ReviewWindow(QMainWindow):
                 parent=self,
             )
         elif detector in GENERIC_DETECTORS:
-            # Grounding DINO / Falcon — same signal shape;
-            # Falcon detections carry real masks.
+            # Grounding DINO — same signal shape; detections carry
+            # mask=None.
             self._sam3_autolabel_worker = GenericAutolabelWorker(
                 detector=detector,
                 image_path=img_path,
@@ -3220,7 +3423,7 @@ class ReviewWindow(QMainWindow):
             f"{selected_note}?{exemplar_note}\n"
             f"Runs in the background (device: {self.sam3_device}, CPU "
             f"fallback on CUDA OOM). Detections become editable boxes"
-            + (" with masks" if detector in ("sam3", "falcon") else "")
+            + (" with masks" if detector == "sam3" else "")
             + "; duplicates of existing boxes are skipped. "
             f"You can cancel anytime.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -3278,8 +3481,8 @@ class ReviewWindow(QMainWindow):
                 parent=self,
             )
         elif detector in GENERIC_DETECTORS:
-            # Grounding DINO / Falcon — same signal shape;
-            # Falcon detections carry real masks.
+            # Grounding DINO — same signal shape; detections carry
+            # mask=None.
             self._sam3_autolabel_batch_worker = GenericAutolabelBatchWorker(
                 detector, self._side_worker_index(side), list(range(n)),
                 concepts, cat_ids, tmp_dir,
@@ -3530,6 +3733,80 @@ class ReviewWindow(QMainWindow):
                 self._current_idx, side_seeds, side,
                 seed_tid_changes=seed_tid_changes_by_side.get(side, []),
                 end_frame_idx=end_frame_idx)
+
+    def _on_propagate_all_keyframes(self) -> None:
+        """'⇉ Propagate all keyframes': for every pair of adjacent
+        keyframes (a, b) and every side, seed SAM3 from frame a's boxes
+        (one seed per track id) and fill the frames up to b. Jobs go
+        through the SAM3 queue, so the whole batch runs back-to-back in
+        the background; a track that already has boxes on b keeps them
+        (the seed frame's own boxes are never duplicated).
+        """
+        if not _SAM3_AVAILABLE:
+            QMessageBox.warning(self, "SAM3 unavailable",
+                                "SAM3 (ultralytics) is not importable.")
+            return
+        total = len(self.frame_index)
+        kfs = sorted(k for k in self.coco.keyframes if k < total - 1)
+        if len(kfs) < 2:
+            self.statusBar().showMessage(
+                "Propagate all: mark at least two keyframes first "
+                "('★ mark keyframes' or K)", 4000)
+            return
+        sides = ["left", "right"] if self._stereo else ["left"]
+        jobs: List[Dict[str, Any]] = []
+        n_seed_boxes = 0
+        for a, b in zip(kfs, kfs[1:]):
+            for side in sides:
+                img_id = self.coco._img_id_by_idx.get((a, side))
+                if img_id is None:
+                    continue
+                side_seeds: List[Dict[str, Any]] = []
+                seen_tids = set()
+                for ann in self.coco.anns_for_image(img_id):
+                    tid = ann.get("track_id")
+                    if tid is None or (side, tid) in seen_tids:
+                        continue
+                    seen_tids.add((side, tid))
+                    x, y, w, h = ann["bbox"]
+                    side_seeds.append({
+                        "track_id": tid,
+                        "cat_id": ann["category_id"],
+                        "concept": self.coco.cat_map.get(
+                            ann["category_id"], "object"),
+                        "bbox_xyxy": [x, y, x + w, y + h],
+                    })
+                if side_seeds:
+                    n_seed_boxes += len(side_seeds)
+                    jobs.append({"kind": "propagate",
+                                 "start_frame_idx": a,
+                                 "seeds": side_seeds,
+                                 "side": side,
+                                 "end_frame_idx": b + 1})
+        if not jobs:
+            self.statusBar().showMessage(
+                "Propagate all: no tracked boxes on any keyframe", 4000)
+            return
+        gaps = len(kfs) - 1
+        ret = QMessageBox.question(
+            self, "Propagate between all keyframes?",
+            f"Queue {len(jobs)} SAM3 propagate run(s) — one per keyframe "
+            f"gap and side ({n_seed_boxes} track seed(s) total), each "
+            f"bounded at its next ★ keyframe (method: "
+            f"{self.propagate_method})?\n\n"
+            f"Seeds come from the boxes already on each keyframe; frames "
+            f"that already have a box with that track id are skipped. "
+            f"Each run is one Ctrl+Z step (device: {self.sam3_device}).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self._sam3_queue.extend(jobs)
+        self._refresh_sam3_status()
+        self.statusBar().showMessage(
+            f"Propagate all: {len(jobs)} run(s) queued "
+            f"({n_seed_boxes} track seed(s))", 4000)
+        QTimer.singleShot(0, self._start_next_queued_sam3)
 
     def _propagate_label(self, seeds: List[Dict[str, Any]],
                          side: str) -> str:

@@ -114,13 +114,14 @@ class CocoState:
         # file, so the toggle stays reversible until the final export.
         # Persisted in the .progress sidecar like `reviewed`.
         self.discarded_frames: set = set()
-        # Track id assignment for newly drawn boxes. Default (False): every
-        # new box gets a fresh id from the global auto-increment counter.
-        # When True (config "tracking": {"sticky_ids": true}), the k-th box
-        # drawn on a frame inherits the k-th track id from the nearest
-        # earlier annotated frame (see _next_track_id) — what interpolation
-        # pairing expects. Deleted ids are never recycled either way.
-        self.sticky_track_ids: bool = False
+        # Track id assignment for newly drawn boxes. Default (True): the
+        # k-th box drawn on a frame inherits the k-th track id from the
+        # nearest earlier annotated frame (see _next_track_id) — what
+        # interpolation pairing expects. When False (config
+        # "tracking": {"sticky_ids": false}), every new box gets a fresh id
+        # from the global auto-increment counter. Deleted ids are never
+        # recycled either way.
+        self.sticky_track_ids: bool = True
         self._track_next: int = 1
         # Minimum contour area (px²) for a SAM3 mask contour to be saved as
         # a COCO polygon — drops the scattered speck polygons SAM3
@@ -847,6 +848,7 @@ class CocoState:
         self._ann_by_id = None
         self._ann_id_next += 1
         self.dirty = True
+        self._invalidate_ann_caches()
         new_id = ann["id"]
         self.undo_stack.push(
             f"interp box #{new_id}",

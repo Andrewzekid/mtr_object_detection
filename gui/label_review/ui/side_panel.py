@@ -59,6 +59,10 @@ class SidePanel(QWidget):
     toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
     toggle_annotated_clicked = pyqtSignal()  # "✔ Mark as annotated" button
     nav_annotated = pyqtSignal(int)          # -1 prev / +1 next annotated frame
+    nav_keyframe = pyqtSignal(int)           # -1 prev / +1 next keyframe
+    mark_every_nth = pyqtSignal(int)         # mark every Nth frame as keyframe
+    interpolate_all_keyframes = pyqtSignal()  # fill every keyframe gap
+    propagate_all_keyframes = pyqtSignal()    # propagate across all keyframes
     toggle_discard_clicked = pyqtSignal()    # "🚫 Discard image" button
     # "🗺 Show annotated in Rerun" button
     show_annotated_rerun_clicked = pyqtSignal()
@@ -362,6 +366,64 @@ class SidePanel(QWidget):
         interp_row.addWidget(self.btn_cancel_interp)
         layout.addLayout(interp_row)
 
+        # Batch keyframe tools: mark every Nth frame, then fill or track
+        # every keyframe gap in one click.
+        kf_auto_row = QHBoxLayout()
+        self.spin_keyframe_every = QtWidgets.QSpinBox()
+        self.spin_keyframe_every.setRange(2, 10000)
+        self.spin_keyframe_every.setValue(10)
+        self.spin_keyframe_every.setToolTip(
+            "Stride N for 'Mark every Nth frame as keyframe' (frames "
+            "0, N, 2N, …).")
+        kf_auto_row.addWidget(QLabel("every"))
+        kf_auto_row.addWidget(self.spin_keyframe_every)
+        self.btn_mark_every_nth = QPushButton("★ mark keyframes")
+        self.btn_mark_every_nth.setToolTip(
+            "Mark every Nth frame (0, N, 2N, …) as a keyframe. Existing "
+            "marks are kept. K on the current frame marks one by hand.")
+        self.btn_mark_every_nth.clicked.connect(
+            lambda: self.mark_every_nth.emit(
+                self.spin_keyframe_every.value()))
+        kf_auto_row.addWidget(self.btn_mark_every_nth)
+        layout.addLayout(kf_auto_row)
+
+        kf_batch_row = QHBoxLayout()
+        self.btn_interp_all_keyframes = QPushButton("⇉ Interpolate all keyframes")
+        self.btn_interp_all_keyframes.setToolTip(
+            "Run flow interpolation over EVERY gap between adjacent "
+            "keyframes (or adjacent labeled anchor frames when a keyframe "
+            "has none), on the active side. Frames that already have "
+            "boxes are skipped. One Ctrl+Z step.")
+        self.btn_interp_all_keyframes.clicked.connect(
+            self.interpolate_all_keyframes.emit)
+        kf_batch_row.addWidget(self.btn_interp_all_keyframes)
+        self.btn_propagate_all_keyframes = QPushButton("⇉ Propagate all keyframes")
+        self.btn_propagate_all_keyframes.setToolTip(
+            "Propagate the SELECTED tracks from every keyframe to the "
+            "next: for each keyframe with selected boxes, SAM3 fills the "
+            "frames up to the next keyframe. Run after selecting the "
+            "tracks on the first keyframe.")
+        self.btn_propagate_all_keyframes.clicked.connect(
+            self.propagate_all_keyframes.emit)
+        kf_batch_row.addWidget(self.btn_propagate_all_keyframes)
+        layout.addLayout(kf_batch_row)
+
+        # Jump between keyframes (both directions, wraps around).
+        nav_kf_row = QHBoxLayout()
+        self.btn_prev_keyframe = QPushButton("◀ Prev keyframe")
+        self.btn_prev_keyframe.setToolTip(
+            "Jump to the previous ★ keyframe (wraps around).")
+        self.btn_prev_keyframe.clicked.connect(
+            lambda _c=False: self.nav_keyframe.emit(-1))
+        nav_kf_row.addWidget(self.btn_prev_keyframe)
+        self.btn_next_keyframe = QPushButton("Next keyframe ▶")
+        self.btn_next_keyframe.setToolTip(
+            "Jump to the next ★ keyframe (wraps around).")
+        self.btn_next_keyframe.clicked.connect(
+            lambda _c=False: self.nav_keyframe.emit(+1))
+        nav_kf_row.addWidget(self.btn_next_keyframe)
+        layout.addLayout(nav_kf_row)
+
         self.interp_status = QLabel("Interpolation: idle")
         self.interp_status.setWordWrap(True)
         layout.addWidget(self.interp_status)
@@ -631,6 +693,7 @@ class SidePanel(QWidget):
         """Enable Stop and disable the trigger buttons while busy."""
         self.btn_interpolate.setEnabled(not running)
         self.btn_keyframe.setEnabled(not running)
+        self.btn_interp_all_keyframes.setEnabled(not running)
         self.btn_cancel_interp.setEnabled(running)
 
     def set_annotated_progress(self, annotated: int, total: int) -> None:

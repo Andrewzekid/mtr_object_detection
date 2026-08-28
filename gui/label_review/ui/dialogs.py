@@ -101,13 +101,6 @@ class ConfigDialog(QtWidgets.QDialog):
         interp_form.addRow("Match max dist frac", self.spin_match_frac)
         self.check_confirm_mismatch = QCheckBox("Confirm on mismatch")
         interp_form.addRow(self.check_confirm_mismatch)
-        self.check_show_track_ids = QCheckBox(
-            "Show track ids (T<id> labels + track edit field)")
-        self.check_show_track_ids.setToolTip(
-            "Unchecked (default): track ids are not displayed — box labels\n"
-            "and the box list show only the category and annotation id, and\n"
-            "the \"Track of selected\" row is hidden. Checked: show them.")
-        interp_form.addRow(self.check_show_track_ids)
         body.addWidget(self.interp_box)
 
         # --- SAM3 ----------------------------------------------------------
@@ -133,6 +126,25 @@ class ConfigDialog(QtWidgets.QDialog):
         self.spin_sam3_conf.setSingleStep(0.05)
         self.spin_sam3_conf.setDecimals(2)
         sam3_form.addRow("Confidence", self.spin_sam3_conf)
+        self.spin_sam3_imgsz = QtWidgets.QSpinBox()
+        self.spin_sam3_imgsz.setRange(0, 4096)
+        self.spin_sam3_imgsz.setSingleStep(64)
+        self.spin_sam3_imgsz.setToolTip(
+            "SAM3 inference size in pixels (square). 0 = library default.\n"
+            "Lower values (e.g. 768/512) segment faster; boxes/masks are\n"
+            "always rescaled back to the original image size. Takes effect\n"
+            "on the next SAM3 run (re-segment, point segment, autolabel,\n"
+            "SAM3 ALL, propagate).")
+        sam3_form.addRow("Inference imgsz", self.spin_sam3_imgsz)
+        self.combo_sam3_quantize = QtWidgets.QComboBox()
+        self.combo_sam3_quantize.addItem("FP32 (full precision)", 32)
+        self.combo_sam3_quantize.addItem("FP16 (recommended on GPU)", 16)
+        self.combo_sam3_quantize.addItem("FP8 (fastest, may lose quality)", 8)
+        self.combo_sam3_quantize.setToolTip(
+            "SAM3 precision. FP16 roughly halves memory and speeds up\n"
+            "inference on GPU with no visible quality loss; FP8 is\n"
+            "experimental. FP32 matches the checkpoint exactly.")
+        sam3_form.addRow("Precision", self.combo_sam3_quantize)
         self.check_auto_segment = QCheckBox("Auto-segment on box add")
         sam3_form.addRow(self.check_auto_segment)
         self.spin_min_poly_area = QtWidgets.QSpinBox()
@@ -222,8 +234,6 @@ class ConfigDialog(QtWidgets.QDialog):
             "OWLv2 exemplar (1-shot, uses selected box)", "owlv2_exemplar")
         self.combo_autolabel_detector.addItem(
             "Grounding DINO (zero-shot boxes)", "grounding_dino")
-        self.combo_autolabel_detector.addItem(
-            "Falcon Perception (boxes + masks)", "falcon")
         self.combo_autolabel_detector.setToolTip(
             "Which model the 'Autolabel frame' / 'Autolabel ALL frames'\n"
             "buttons use.\n"
@@ -235,10 +245,7 @@ class ConfigDialog(QtWidgets.QDialog):
             "  currently selected box is cropped out and used as the\n"
             "  visual query; matching objects get its category.\n"
             "- Grounding DINO: zero-shot text-prompt boxes (no masks).\n"
-            "  Default checkpoint: IDEA-Research/grounding-dino-base.\n"
-            "- Falcon Perception: open-vocabulary grounding with real\n"
-            "  instance masks (no confidence scores).\n"
-            "  Default checkpoint: tiiuae/Falcon-Perception.")
+            "  Default checkpoint: IDEA-Research/grounding-dino-base.")
         al_form.addRow("Detector", self.combo_autolabel_detector)
         self.edit_owlv2_model = QtWidgets.QLineEdit()
         self.edit_owlv2_model.setPlaceholderText(
@@ -278,13 +285,6 @@ class ConfigDialog(QtWidgets.QDialog):
         self.spin_gdino_conf.setToolTip(
             "Grounding DINO box threshold (detection confidence).")
         al_form.addRow("Grounding DINO confidence", self.spin_gdino_conf)
-        self.edit_falcon_model = QtWidgets.QLineEdit()
-        self.edit_falcon_model.setPlaceholderText(
-            "default: tiiuae/Falcon-Perception")
-        self.edit_falcon_model.setToolTip(
-            "Falcon Perception checkpoint (HuggingFace model id or local\n"
-            "path). Takes effect on the next autolabel run.")
-        al_form.addRow("Falcon model", self.edit_falcon_model)
         body.addWidget(al_box)
 
         # --- Mask opacity --------------------------------------------------
@@ -334,27 +334,33 @@ class ConfigDialog(QtWidgets.QDialog):
         map_form.addRow("Pose DB match", self.combo_pose_db_match)
         body.addWidget(map_box)
 
-        # --- Tracking ------------------------------------------------------
+        # --- Tracking (always visible — not advanced-gated) ------------------
         self.track_box = QtWidgets.QGroupBox("Tracking")
         track_form = QtWidgets.QFormLayout(self.track_box)
         self.check_sticky_ids = QCheckBox(
             "Sticky track ids (inherit from previous frame)")
         self.check_sticky_ids.setToolTip(
-            "Unchecked (default): every new box gets a fresh auto-increment "
-            "track id.\nChecked: the k-th box drawn on a frame inherits the "
-            "k-th track id\nfrom the nearest earlier annotated frame (what "
-            "interpolation expects).")
+            "Checked (default): the k-th box drawn on a frame inherits the\n"
+            "k-th track id from the nearest earlier annotated frame (what\n"
+            "interpolation expects). Unchecked: every new box gets a fresh\n"
+            "auto-increment track id.")
         track_form.addRow(self.check_sticky_ids)
+        self.check_show_track_ids = QCheckBox(
+            "Show track ids (T<id> labels + track edit field)")
+        self.check_show_track_ids.setToolTip(
+            "Checked (default): boxes are labelled T<id> on the canvas and\n"
+            "in the box list, and the \"Track of selected\" edit row shows.")
+        track_form.addRow(self.check_show_track_ids)
         body.addWidget(self.track_box)
 
         # --- Advanced toggle (at the very bottom of the settings) ----------
         self.check_advanced = QCheckBox(
-            "Advanced settings (interpolation, tracking, keyframe/interpolate "
-            "controls)")
+            "Advanced settings (interpolation parameters, hide checkboxes)")
         self.check_advanced.setToolTip(
-            "Unchecked (default): the interpolation and tracking sections\n"
-            "above are hidden, and the keyframe/interpolate buttons stay\n"
-            "hidden in the side panel.")
+            "Unchecked (default): the interpolation parameter section and\n"
+            "the 'hide UI elements' checkboxes for interpolation/keyframe\n"
+            "are hidden. The keyframe/interpolate buttons themselves are\n"
+            "always visible in the side panel.")
         body.addWidget(self.check_advanced)
 
         # --- Buttons -------------------------------------------------------
@@ -386,11 +392,10 @@ class ConfigDialog(QtWidgets.QDialog):
         self._update_advanced_visibility()
 
     def _update_advanced_visibility(self) -> None:
-        """Show the interpolation/tracking sections and the keyframe +
-        interpolate hide checkboxes only in advanced mode."""
+        """Show the interpolation-parameter section and the interpolate /
+        keyframe hide checkboxes only in advanced mode."""
         adv = self.check_advanced.isChecked()
         self.interp_box.setVisible(adv)
-        self.track_box.setVisible(adv)
         self.hide_checks["interpolate"].setVisible(adv)
         self.hide_checks["keyframe"].setVisible(adv)
         self.adjustSize()
@@ -422,6 +427,10 @@ class ConfigDialog(QtWidgets.QDialog):
         self.combo_device.setCurrentText(win.sam3_device)
         self.edit_sam3_model.setText(win.sam3_model or "")
         self.spin_sam3_conf.setValue(win.sam3_conf)
+        self.spin_sam3_imgsz.setValue(win.sam3_imgsz or 0)
+        qidx = self.combo_sam3_quantize.findData(
+            win.sam3_quantize if win.sam3_quantize in (8, 16, 32) else 32)
+        self.combo_sam3_quantize.setCurrentIndex(max(0, qidx))
         self.check_auto_segment.setChecked(win.auto_segment)
         self.spin_min_poly_area.setValue(int(win.coco.min_polygon_area))
         self.spin_nms_iou.setValue(win.sam3_nms_iou)
@@ -438,8 +447,6 @@ class ConfigDialog(QtWidgets.QDialog):
             getattr(win, "gdino_model", "") or "")
         self.spin_gdino_conf.setValue(
             getattr(win, "gdino_conf", 0.35))
-        self.edit_falcon_model.setText(
-            getattr(win, "falcon_model", "") or "")
         idx = self.combo_propagate_method.findData(
             getattr(win, "propagate_method", "memory"))
         self.combo_propagate_method.setCurrentIndex(max(0, idx))
@@ -475,6 +482,15 @@ class ConfigDialog(QtWidgets.QDialog):
             self.edit_sam3_model.setText(str(sam3["model"]))
         if "conf" in sam3:
             self.spin_sam3_conf.setValue(float(sam3["conf"]))
+        if "imgsz" in sam3:
+            try:
+                self.spin_sam3_imgsz.setValue(
+                    max(0, int(sam3["imgsz"] or 0)))
+            except (TypeError, ValueError):
+                pass
+        if sam3.get("quantize") in (8, 16, 32):
+            qidx = self.combo_sam3_quantize.findData(int(sam3["quantize"]))
+            self.combo_sam3_quantize.setCurrentIndex(max(0, qidx))
         if "auto_segment" in sam3:
             self.check_auto_segment.setChecked(bool(sam3["auto_segment"]))
         if "min_polygon_area" in sam3:
@@ -497,8 +513,7 @@ class ConfigDialog(QtWidgets.QDialog):
                 max(0.0, min(1.0, float(sam3["propagate_min_seed_iou"]))))
         autolabel = cfg.get("autolabel", {})
         if autolabel.get("detector") in ("sam3", "owlv2", "owlv2_exemplar",
-                                         "grounding_dino",
-                                         "falcon"):
+                                         "grounding_dino"):
             self.combo_autolabel_detector.setCurrentIndex(
                 self.combo_autolabel_detector.findData(
                     autolabel["detector"]))
@@ -515,8 +530,6 @@ class ConfigDialog(QtWidgets.QDialog):
         if "gdino_conf" in autolabel:
             self.spin_gdino_conf.setValue(
                 max(0.0, min(1.0, float(autolabel["gdino_conf"]))))
-        if autolabel.get("falcon_model"):
-            self.edit_falcon_model.setText(str(autolabel["falcon_model"]))
         ui = cfg.get("ui", {})
         if "advanced" in ui:
             self.check_advanced.setChecked(bool(ui["advanced"]))
@@ -548,12 +561,7 @@ class ConfigDialog(QtWidgets.QDialog):
 
     def _collect(self) -> Dict[str, Any]:
         """Widget state as a config dict (same schema as the example JSON)."""
-        advanced = self.check_advanced.isChecked()
         hidden = [k for k, cb in self.hide_checks.items() if cb.isChecked()]
-        if not advanced:
-            # Keyframe/interpolate checkboxes are hidden in basic mode; the
-            # groups stay hidden in the side panel regardless.
-            hidden = sorted(set(hidden) | {"interpolate", "keyframe"})
         return {
             "interpolation": {
                 "flow_method": self.combo_flow.currentText(),
@@ -566,6 +574,8 @@ class ConfigDialog(QtWidgets.QDialog):
                 "device": self.combo_device.currentText(),
                 "model": self.edit_sam3_model.text().strip() or None,
                 "conf": self.spin_sam3_conf.value(),
+                "imgsz": self.spin_sam3_imgsz.value() or None,
+                "quantize": self.combo_sam3_quantize.currentData(),
                 "auto_segment": self.check_auto_segment.isChecked(),
                 "min_polygon_area": self.spin_min_poly_area.value(),
                 "autolabel_nms_iou": self.spin_nms_iou.value(),
@@ -584,10 +594,9 @@ class ConfigDialog(QtWidgets.QDialog):
                 "owlv2_exemplar_conf": self.spin_owlv2_exemplar_conf.value(),
                 "gdino_model": self.edit_gdino_model.text().strip() or None,
                 "gdino_conf": self.spin_gdino_conf.value(),
-                "falcon_model": self.edit_falcon_model.text().strip() or None,
             },
             "ui": {
-                "advanced": advanced,
+                "advanced": self.check_advanced.isChecked(),
                 "hide": hidden,
                 "mask_opacity": self.spin_opacity.value(),
                 "theme": self.combo_theme.currentData(),

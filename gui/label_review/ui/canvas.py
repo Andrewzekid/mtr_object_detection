@@ -86,6 +86,13 @@ class CanvasWidget(QWidget):
         self._draw_current: Optional[Tuple[float, float]] = None
         self._waiting_cat: bool = False
         self._pending_rect: Optional[Tuple[float, float, float, float]] = None
+        # Digits typed while picking a category (see keyPressEvent): they
+        # accumulate so sessions with 10+ categories work (type 12). The
+        # buffer commits as soon as no LONGER valid id can start with these
+        # digits (typing "1" in a 9-category session commits 1 immediately;
+        # with 13 categories it waits, then "12" commits once "120" would
+        # be invalid). Enter commits early; Backspace erases; Esc cancels.
+        self._cat_buffer: str = ""
         # Point-segment mode: left click adds a positive point, right click a
         # negative one; every click re-runs SAM3 with the full prompt set.
         # Enter accepts the session, Esc cancels it. Toggled from the side
@@ -171,6 +178,7 @@ class CanvasWidget(QWidget):
         self._boxes_rev += 1  # invalidates the cached mask overlay
         self._selected_idx = -1
         self._multi_selected = set()
+        self._cat_buffer = ""
         self._waiting_cat = False
         self._pending_rect = None
         if not self._suppress_update:
@@ -219,6 +227,7 @@ class CanvasWidget(QWidget):
         self._drawing = False
         self._draw_start = None
         self._draw_current = None
+        self._cat_buffer = ""
         self._waiting_cat = False
         self._pending_rect = None
         self._selected_idx = -1
@@ -445,11 +454,16 @@ class CanvasWidget(QWidget):
         p.drawText(8, 16, self._info_text)
 
         if self._waiting_cat:
-            p.fillRect(8, self.height() - 28, 380, 22, QColor(0, 0, 0, 180))
+            max_id = max(getattr(self.parent_window.coco, "cat_map", {}) or [0])
+            digits = f"0-{max_id}" if max_id > 0 else "0"
+            buf = (f"  [{self._cat_buffer}_]" if self._cat_buffer else "")
+            msg = (f"Pick category: {digits} (digits; Enter on prefix)"
+                   f"{buf}  |  ESC to cancel")
+            p.fillRect(8, self.height() - 28,
+                       8 * len(msg) + 12, 22, QColor(0, 0, 0, 180))
             p.setPen(QColor(255, 220, 30))
             p.setFont(QFont("Sans", 10))
-            p.drawText(12, self.height() - 12,
-                       "Pick category: 0-9 / click button   |  ESC to cancel")
+            p.drawText(12, self.height() - 12, msg)
 
     # ----------------------- mouse ------------------------------------- #
 
@@ -631,6 +645,7 @@ class CanvasWidget(QWidget):
                     else:
                         self._pending_rect = (x, y, w, h)
                         self._waiting_cat = True
+                        self._cat_buffer = ""
                         self.update()
                         self.cat_pick_requested.emit(x, y, w, h)
                 else:
@@ -655,6 +670,55 @@ class CanvasWidget(QWidget):
         elif ev.button() == Qt.MiddleButton:
             self._panning = False
             self._pan_start = None
+
+    def _maybe_commit_cat(self) -> None:
+        """Commit the buffered digits when the choice is unambiguous: no
+        longer valid id can start with them (with categories 0..12, "1"
+        waits — 10..12 possible — while "12" commits immediately; with 9
+        categories "1" commits right away). A digit run that can never
+        become a valid id (e.g. "13" with 0..12) keeps waiting so the user
+        can Backspace out of it; only a prefix that IS a valid id commits
+        on its own."""
+        cat_map = getattr(self.parent_window.coco, "cat_map", {})
+        buf = self._cat_buffer
+        if not buf or not cat_map:
+            return
+        max_id = max(cat_map)
+        val = int(buf)
+        if val in cat_map and (val * 10 > max_id            # no extension
+                               or len(buf) >= len(str(max_id))):
+            self._commit_cat_buffer()
+
+    def _commit_cat_buffer(self) -> None:
+        """Enter/auto commit of the typed category digits (canvas waits for
+        a category after a draw). Invalid ids warn and keep the pick
+        pending so the user can correct with Backspace."""
+        if not self._waiting_cat or not self._cat_buffer:
+            return
+        cat_id = int(self._cat_buffer)
+        if cat_id not in getattr(self.parent_window.coco, "cat_map", {}):
+            # Leave the buffer so Backspace can fix it; the HUD shows the
+            # invalid entry. _assign_pending_cat would warn too, but exiting
+            # pick mode on an invalid id would strand the pending rect.
+            self.parent_window.statusBar().showMessage(
+                f"⚠️ Category {cat_id} not found — Backspace to fix, ESC to "
+                "cancel", 4000)
+            return
+        # Leave pick mode first but keep the pending rect —
+        # _assign_pending_cat reads it and clears the rest of the state
+        # itself via reset_state().
+        self._cat_buffer = ""
+        self._waiting_cat = False
+        self.update()
+        self.parent_window._assign_pending_cat(cat_id)
+
+    def _stop_cat_wait(self) -> None:
+        """Leave category-pick mode: drop the buffer, clear the pending
+        rect."""
+        self._cat_buffer = ""
+        self._waiting_cat = False
+        self._pending_rect = None
+        self.update()
 
     def _update_cursor(self, px: float, py: float) -> None:
         """Set the cursor shape based on what's under it (handle / box / empty)."""
@@ -731,14 +795,20 @@ class CanvasWidget(QWidget):
         k = ev.key()
         if self._waiting_cat:
             if k == Qt.Key_Escape:
-                self._waiting_cat = False
-                self._pending_rect = None
-                self.update()
+                self._stop_cat_wait()
                 return
-            # number keys
+            if k in (Qt.Key_Return, Qt.Key_Enter):
+                self._commit_cat_buffer()
+                return
+            if k in (Qt.Key_Backspace, Qt.Key_Delete):
+                if self._cat_buffer:
+                    self._cat_buffer = self._cat_buffer[:-1]
+                    self.update()
+                return
             txt = ev.text()
             if txt.isdigit():
-                self.parent_window._assign_pending_cat(int(txt))
+                self._cat_buffer = (self._cat_buffer + txt)[-4:]
+                self._maybe_commit_cat()
             return
 
         if k in (Qt.Key_D, Qt.Key_Delete, Qt.Key_Backspace):

@@ -166,7 +166,7 @@ def _tid(coco, ann_id):
 def test_add_box_and_global_track_ids(lr, make_coco):
     cats = [{"id": 0, "name": "a"}, {"id": 1, "name": "b"}]
     coco = make_coco(cats)
-    assert coco.sticky_track_ids is False  # default = auto-increment
+    coco.sticky_track_ids = False  # global auto-increment mode
     img1 = coco.ensure_image(_mkframe(0), 10, 10)
     img2 = coco.ensure_image(_mkframe(1), 10, 10)
     coco.add_box(img1, 0, 0, 2, 2, 0)
@@ -176,6 +176,21 @@ def test_add_box_and_global_track_ids(lr, make_coco):
     assert coco.dirty
     a = coco.annotations[0]
     assert a["bbox"] == [0.0, 0.0, 2.0, 2.0] and a["area"] == 4.0
+
+
+def test_add_box_sticky_ids_default(lr, make_coco):
+    """Sticky ids default ON: the k-th box on a frame inherits the k-th
+    track id from the nearest earlier annotated frame."""
+    cats = [{"id": 0, "name": "a"}]
+    coco = make_coco(cats)
+    assert coco.sticky_track_ids is True
+    img1 = coco.ensure_image(_mkframe(0), 10, 10)
+    img2 = coco.ensure_image(_mkframe(1), 10, 10)
+    coco.add_box(img1, 0, 0, 2, 2, 0)   # no earlier frame → fresh id
+    coco.add_box(img1, 0, 0, 2, 2, 0)   # second box on the frame → fresh id
+    coco.add_box(img2, 0, 0, 2, 2, 0)   # inherits k-th id from img1
+    coco.add_box(img2, 0, 0, 2, 2, 0)
+    assert [a["track_id"] for a in coco.annotations] == [1, 2, 1, 2]
 
 
 def test_track_id_counter_rebuilt_after_load(lr, tmp_path):
@@ -660,6 +675,30 @@ def test_discarded_frames_excluded_from_final_only(lr, tmp_path):
     coco2 = lr.CocoState(out, [{"id": 0, "name": "k"}])
     coco2.load_progress(2)
     assert coco2.discarded_frames == {1}
+
+
+def test_add_interp_box_invalidates_ann_cache(lr, tmp_path):
+    """Regression: add_interp_box must invalidate the anns_for_image cache.
+
+    Without _invalidate_ann_caches() the interpolated boxes were appended to
+    self.annotations but anns_for_image() kept serving the stale cached
+    list — the UI reported the interpolation done while the canvas drew
+    nothing until some other action rebuilt the cache."""
+    out = str(tmp_path / "interp.json")
+    coco = lr.CocoState(out, [{"id": 0, "name": "k"}])
+    idx = FakeIdx(3)
+    id_0 = coco.ensure_image(idx.frame_at(0), 12, 10)
+    id_1 = coco.ensure_image(idx.frame_at(1), 12, 10)
+    coco.add_box(id_0, 0, 0, 2, 2, 0)
+    assert len(coco.anns_for_image(id_0)) == 1  # cache built
+
+    coco.add_interp_box(id_1, 1, 1, 2, 2, 0, track_id=None,
+                        source="linear", confidence=0.5)
+    # The freshly added interp box must be visible immediately.
+    anns = coco.anns_for_image(id_1)
+    assert len(anns) == 1 and anns[0].get("interp") is True
+    assert anns[0]["source"] == "linear" and anns[0]["confidence"] == 0.5
+    assert coco.frame_has_boxes(1)
 
 
 # ---------------------------------------------------------------------------

@@ -199,7 +199,8 @@ the assistants below depending on the footage.
   near-duplicates, so label every Nth (`--keyframe-stride N`, N≈10) and let
   interpolation/propagation cover the gaps. Small N for fast motion, large
   N for static scenes. The GUI's ★ Keyframe toggle (K) marks frames that
-  anchor interpolation.
+  anchor interpolation; **★ mark keyframes** (with the `every` spinbox)
+  marks 0, N, 2N, … in one click.
 - **Interpolate (I)** — linearly/optical-flow interpolates boxes of the
   same track between two labelled frames. Use when motion is **smooth and
   in a constant direction** (walking past a static camera, slow pans).
@@ -218,6 +219,9 @@ the assistants below depending on the footage.
   the run only covers the frames between the keyframes — it stops at the
   next keyframe instead of running to the end of the dataset, so you can
   annotate keyframe by keyframe and let SAM3 fill each segment.
+  **⇉ Propagate all keyframes** queues one run per keyframe gap and side,
+  seeded from the boxes already on each keyframe — the batch way to fill
+  every segment after labelling the keyframes.
 - **Re-segment selected** — re-runs SAM3 on a box you moved/resized to get
   a fresh mask. Use after every manual box edit if masks matter.
 - **Point segment (🎯 Add points + ▶ Segment points)** — SAM2-style point
@@ -318,7 +322,8 @@ python scripts/orchestrate_pipeline.py \
 python scripts/orchestrate_pipeline.py --images Datasets/HKU_GH --camera both
 
 # Or via the shell wrapper (env overrides: QWEN_BACKEND, OLLAMA_URL,
-# QWEN_MODEL, LLAMACPP_URL, QWEN_MMPROJ; all extra args pass through):
+# QWEN_MODEL, LLAMACPP_URL, QWEN_MMPROJ, QWEN_PROMPT (custom detection
+# prompt), QWEN_CLASSES ("A B C" class list); all extra args pass through):
 ./scripts/run_pipeline.sh 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 --camera both
 
 # Alternative llama.cpp backend (self-hosted model files on port 8089):
@@ -797,7 +802,7 @@ Every entry point in `scripts/`. "Key inputs" lists the important CLI flags
 | `12_extract_keyframes.py` | Select every Nth frame as a keyframe + write a manifest for the interpolator. | `--image-folder`/`--video`, `--output-dir`, `--every`, `--mode` | Keyframe images + `keyframe_manifest.json` |
 | `13_interpolate_tracks.py` | Propagate reviewed keyframe boxes to every frame via anchored optical flow. An optional per-frame RANSAC camera model (`--camera-model global`) can absorb non-linear camera shake (tracking/anchoring on the residual, KLT dropouts re-seeded); off by default — accuracy testing on the re-reviewed MTR 4k frames showed no net gain on this fisheye camera. New objects at a keyframe are back-tracked. Each output box carries a `source`/`confidence` provenance field. | `--keyframes-coco`, `--manifest`, `--image-folder`, `--output-coco`, `--match-max-dist`, `--flow-method`, `--interp-method`, `--camera-model` | COCO annotations for every frame (+ optional vis) |
 | `orchestrate_pipeline.py` | End-to-end keyframe pipeline: undistort → sample → keyframes → stats → Qwen → COCO combine → GUI review → 01b COCO→YOLO-seg → 03 split → 02 augment (train only) → assemble final dataset + stats CSV → 04 train → 05 evaluate → 11 tracking. Stage markers make it resumable. Also supports a dataset-only mode (`--coco-json` + `--images-dir`) that runs just 01b convert → 02 augment → 03 split on an already-reviewed COCO file. | `--rosbag`/`--images`/`--coco-json`, `--camera`, `--stage`, `--skip-stage`, `--force`, per-stage args (`--sample-size`, `--ratios`, `--augmentations`, `--epochs`, `--tracker`, ...) | `<input>_pipeline/` output tree (or `{yolo_flat,augmented,dataset}/` in dataset-only mode) |
-| `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`QWEN_BACKEND`, `OLLAMA_URL`, `QWEN_MODEL`, `LLAMACPP_URL`, `QWEN_MMPROJ`). Pass `--coco-json ...` for the dataset-only mode. | `<rosbag_path>` (or `--coco-json <coco> --images-dir <dir>`) + any orchestrator args | same as orchestrator |
+| `run_pipeline.sh` | Shell wrapper around the orchestrator with env-var overrides (`QWEN_BACKEND`, `OLLAMA_URL`, `QWEN_MODEL`, `LLAMACPP_URL`, `QWEN_MMPROJ`, `QWEN_PROMPT` custom detection prompt, `QWEN_CLASSES` class list). Pass `--coco-json ...` for the dataset-only mode. | `<rosbag_path>` (or `--coco-json <coco> --images-dir <dir>`) + any orchestrator args | same as orchestrator |
 
 ### Data prep & conversion
 
@@ -904,8 +909,9 @@ viewer:
    app: the map replaces the image labeling view (switch back with View →
    **Switch back to image view**). This is the full-speed native renderer,
    so even maps with 100M+ points stay smooth. Embedding works out of the
-   box on a normal Linux desktop; over SSH or Wayland the recording opens
-   in a separate viewer window instead. The viewer opens on the **3D map
+    box on a normal Linux desktop (X11) and on Windows; over SSH or
+    Wayland the recording opens in a separate viewer window instead. The
+    viewer opens on the **3D map
    view** by default — the camera image/depth views are left out; add
    them back from the viewer's blueprint menu if needed. The camera-body
    subtree (`body/camera_left`, `body/camera_right`, `body/axes`,
@@ -957,7 +963,7 @@ CLI equivalent: `--pose-db` preloads the pose DB at launch.
 | `A` | toggle draw-box mode |
 | `D` / `Del` | delete selected box(es) |
 | `X` | discard all boxes on current frame, mark reviewed, advance |
-| `0–9` | assign category to a pending new box |
+| `0`–`9`, `00`… | assign category to a pending new box — digits accumulate; Enter confirms (e.g. `12` + `Enter` for category 12), 800 ms idle auto-confirms, Backspace erases |
 | `R` | re-segment selected box(es) with SAM3 (fresh masks) |
 | `I` | interpolate between anchors |
 | `K` | toggle ★ keyframe on current frame |
@@ -993,7 +999,10 @@ CLI equivalent: `--pose-db` preloads the pose DB at launch.
 | **🎬 Rerun viewer / map…** | open a `.rrd` recording in the rerun viewer — see *Rerun viewer & point-cloud map* above |
 | **📍 Pose database…** | load a Clio pose DB to place annotated frames on the map |
 | **★ Keyframe** (`K`) | mark anchor frame for interpolation |
+| **★ mark keyframes** + `every` | mark frames 0, N, 2N, … as keyframes in one click |
 | **Interpolate (I)** + **Stop** | optical-flow-fill boxes between two labeled/keyframe anchors; use for smooth, constant-direction motion |
+| **⇉ Interpolate all keyframes** | flow-fill EVERY gap between adjacent labeled/keyframe anchors, one gap at a time (already-labeled frames skipped) |
+| **⇉ Propagate all keyframes** | queue SAM3 propagation for every keyframe gap, seeded from the boxes on each keyframe |
 | **Run SAM3 (all)** / **Re-seg sel (R)** / **Cancel** | segment all boxes on the frame / re-mask the selection |
 | **SAM3 ALL frames** | background segmentation of every frame (checkpoints every 10 frames) |
 | **🎯 Add points** + **▶ Segment points** | point-prompt mode: accumulate +/− points on clicks, then run SAM3 once with all of them (see mouse section) |
@@ -1035,13 +1044,18 @@ The GUI loop is **box first, then segment**:
 - **Appearance** — UI theme: `dark`, `light`, or `pastel` lime (same as the
   View menu; applied on Apply and persisted, config key `ui.theme`).
 - **Hide UI elements** — hide panel groups you don't use (`ui.hide`).
-- **Advanced settings** — enables Interpolation/Tracking sections.
-  - Interpolation: flow method (`dis`/`klt`/`farneback`), camera model,
-    match distance, mismatch confirmation (`interpolation.*`).
-  - Tracking: sticky track ids, show ids (`tracking.*`).
-- **SAM3**: device, model path, confidence, auto-segment-on-add, min polygon
-  area, autolabel NMS IoU, propagate method (`memory`/`chain`) + thresholds
-  (`sam3.*`).
+- **Tracking** (always visible): sticky track ids — ON by default, the k-th
+  box on a frame inherits the k-th track id from the nearest earlier
+  annotated frame (what interpolation pairing expects) — and show track ids
+  (`tracking.*`). The ★ Keyframe and Interpolate controls are also visible
+  by default now; hide them with a `ui.hide` entry.
+- **Advanced settings** — enables the Interpolation **parameters** section
+  and the interpolate/keyframe hide checkboxes. Interpolation can only be
+  re-configured (flow method, camera model, match distance, mismatch
+  confirmation) when Advanced settings is turned on.
+- **SAM3**: device, model path, confidence, precision (FP32/FP16/FP8),
+  inference imgsz, auto-segment-on-add, min polygon area, autolabel NMS IoU,
+  propagate method (`memory`/`chain`) + thresholds (`sam3.*`).
 - **Autolabel detector**: `sam3`, `owlv2`, `owlv2_exemplar` (1-shot — select
   an existing box first; its crop becomes the visual query),
   `grounding_dino`, plus per-backend model/conf keys

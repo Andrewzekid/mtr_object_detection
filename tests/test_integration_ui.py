@@ -13,7 +13,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QEvent, QPointF
 from PyQt6.QtCore import Qt
 
-from conftest import (FakeIdx, FakeWorker, FakeAutolabelSingle,
+from conftest import (FakeIdx, FakeSig, FakeWorker, FakeAutolabelSingle,
                       FakePropagateWorker, make_image_folder)
 
 NM = Qt.KeyboardModifier.NoModifier
@@ -93,6 +93,62 @@ def test_draw_assigns_category_and_sticks(lr, make_coco, make_window):
     assert coco.annotations[2]["category_id"] == 0
     assert win._last_cat_id == 0  # preselected draw updates sticky cat
     assert win._pending_cat_id is None  # pending preselect consumed
+
+
+def test_draw_multi_digit_category_buffer(lr, make_coco, make_window):
+    """10+ categories: typed digits accumulate and commit as soon as no
+    longer id can start with them (with 0..12, "1" waits, "12" commits
+    immediately); Enter commits an ambiguous prefix early; Backspace
+    erases; invalid ids keep the pick pending."""
+    cats = [{"id": i, "name": f"c{i}"} for i in range(13)]
+    coco = make_coco(cats)
+    win = make_window(FakeIdx(2), coco)
+    c = win.canvas
+
+    draw_box(win)
+    assert c._waiting_cat
+    key(c, Qt.Key.Key_1, "1")
+    assert c._cat_buffer == "1"  # waits: 10..12 could follow
+    assert len(coco.annotations) == 0
+    key(c, Qt.Key.Key_2, "2")
+    # "12" auto-commits: no valid id extends it (120 > 12)
+    assert not c._waiting_cat
+    assert len(coco.annotations) == 1
+    assert coco.annotations[0]["category_id"] == 12
+
+    # Ambiguous prefix: with 0..102, typing "10" waits → Enter commits 10
+    win2 = make_window(FakeIdx(2), make_coco(
+        [{"id": i, "name": f"d{i}"} for i in range(103)]))
+    c2 = win2.canvas
+    draw_box(win2)
+    key(c2, Qt.Key.Key_1, "1")
+    key(c2, Qt.Key.Key_0, "0")
+    assert c2._cat_buffer == "10"  # 100..102 still possible → wait
+    assert len(win2.coco.annotations) == 0
+    key(c2, Qt.Key.Key_Return)
+    assert not c2._waiting_cat
+    assert win2.coco.annotations[0]["category_id"] == 10
+
+    # Backspace: fresh window (no sticky cat), type 13 → 1 → Enter commits 1
+    win3 = make_window(FakeIdx(2), make_coco(cats))
+    c3 = win3.canvas
+    draw_box(win3)
+    assert c3._waiting_cat
+    key(c3, Qt.Key.Key_1, "1")
+    key(c3, Qt.Key.Key_3, "3")  # 13 > 12 → invalid: stays buffered
+    assert c3._cat_buffer == "13"
+    key(c3, Qt.Key.Key_Backspace)
+    assert c3._cat_buffer == "1"  # 1 is ambiguous again (10..12) → waits
+    key(c3, Qt.Key.Key_Return)
+    assert len(win3.coco.annotations) == 1
+    assert win3.coco.annotations[0]["category_id"] == 1
+
+    # Invalid id + Enter: warns and stays in pick mode; Esc cancels cleanly
+    draw_box(win)
+    key(c, Qt.Key.Key_9, "9")
+    key(c, Qt.Key.Key_Return)
+    c._stop_cat_wait()
+    assert len(coco.annotations) == 2
 
 
 def test_box_clamped_to_image_bounds(lr, make_coco, make_window):
@@ -411,7 +467,8 @@ def test_track_edit_flow(lr, make_coco, make_window, tmp_path):
 
 def test_sticky_ids_runtime_config(lr, make_coco, make_window):
     coco = make_coco(CATS)
-    assert coco.sticky_track_ids is False
+    # Sticky ids default ON (what interpolation pairing expects).
+    assert coco.sticky_track_ids is True
     win = make_window(lr.EmptyIndex(), coco)
     assert win.coco is coco
     win._apply_runtime_config({"tracking": {"sticky_ids": False}})
@@ -560,19 +617,17 @@ def test_config_dialog_roundtrip(lr, make_coco, make_window, monkeypatch,
     assert dlg.combo_device.currentText() == "cpu"
     assert dlg.check_auto_segment.isChecked() == win.auto_segment
     assert dlg.spin_opacity.value() == win.side.opacity_slider.value()
-    # basic mode: everything unchecked except the force-hidden groups
-    assert all(not cb.isChecked() for k, cb in dlg.hide_checks.items()
-               if k not in ("interpolate", "keyframe"))
-    assert dlg.hide_checks["interpolate"].isChecked()
-    assert dlg.hide_checks["keyframe"].isChecked()
+    # basic mode: hide checkboxes unchecked; interpolate/keyframe checkboxes
+    # exist but are advanced-gated (the groups themselves stay visible).
+    assert all(not cb.isChecked() for cb in dlg.hide_checks.values())
     # advanced sections hidden until the checkbox is ticked
     assert not dlg.check_advanced.isChecked()
     dlg.show()
-    assert dlg.interp_box.isHidden() and dlg.track_box.isHidden()
+    assert dlg.interp_box.isHidden() and not dlg.track_box.isHidden()
     assert dlg.hide_checks["interpolate"].isHidden()
     assert dlg.hide_checks["keyframe"].isHidden()
     dlg.check_advanced.setChecked(True)
-    assert not dlg.interp_box.isHidden() and not dlg.track_box.isHidden()
+    assert not dlg.interp_box.isHidden()
     assert not dlg.hide_checks["interpolate"].isHidden()
     dlg.check_advanced.setChecked(False)  # back to basic for the rest
     assert dlg.interp_box.isHidden()
@@ -591,8 +646,9 @@ def test_config_dialog_roundtrip(lr, make_coco, make_window, monkeypatch,
     assert s.btn_run_sam3.isHidden() and s.btn_reseg.isHidden()
     assert s.btn_cancel_sam3.isHidden()
     assert s.btn_play.isHidden() and s.combo_speed.isHidden()
-    assert s.btn_keyframe.isHidden()   # basic mode keeps advanced groups hidden
-    assert s.btn_interpolate.isHidden()
+    # keyframe/interpolate are no longer advanced-gated — they stay visible
+    assert not s.btn_keyframe.isHidden()
+    assert not s.btn_interpolate.isHidden()
     assert win.sam3_device == "cuda"
     assert abs(win.sam3_conf - 0.5) < 1e-9
     assert win.auto_segment is True
@@ -609,9 +665,8 @@ def test_config_dialog_roundtrip(lr, make_coco, make_window, monkeypatch,
     saved = json.load(open(save_path))
     assert saved["ui"]["mask_opacity"] == 60
     assert saved["ui"]["advanced"] is False
-    # basic mode forces the advanced groups into the hidden list
-    assert set(saved["ui"]["hide"]) == {"sam3_run", "play",
-                                        "interpolate", "keyframe"}
+    # hide list only contains the explicitly checked groups
+    assert set(saved["ui"]["hide"]) == {"sam3_run", "play"}
     assert saved["sam3"]["device"] == "cuda"
     assert saved["interpolation"]["flow_method"] == "klt"
     assert s.opacity_slider.value() == 60  # save also applies
@@ -647,12 +702,10 @@ def test_config_dialog_roundtrip(lr, make_coco, make_window, monkeypatch,
     assert not s.btn_play.isHidden()   # un-hidden by the new config
     assert s.opacity_slider.value() == 10
 
-    # --- Advanced mode un-hides the advanced groups ---
-    win._apply_runtime_config({"ui": {"advanced": True, "hide": []}})
-    assert win.advanced_ui is True
+    # --- Hide list explicitly controls keyframe/interpolate visibility ---
+    win._apply_runtime_config({"ui": {"hide": []}})
     assert not s.btn_interpolate.isHidden() and not s.btn_keyframe.isHidden()
-    win._apply_runtime_config({"ui": {"advanced": False, "hide": []}})
-    assert win.advanced_ui is False
+    win._apply_runtime_config({"ui": {"hide": ["interpolate", "keyframe"]}})
     assert s.btn_interpolate.isHidden() and s.btn_keyframe.isHidden()
     dlg.close()
 
@@ -681,7 +734,8 @@ def test_config_dialog_buttons_not_enter_default(lr, make_coco, make_window):
 
 def test_main_hides_advanced_groups_by_default(lr, qapp, monkeypatch,
                                                tmp_path):
-    """main() with no config: interpolate + keyframe + autolabel hidden."""
+    """main() with no config: autolabel hidden; interpolate + keyframe
+    visible by default now (they were advanced-gated before)."""
     # main()'s idle mode uses ./untitled_labels_coco.json relative to the
     # cwd and saves progress on exit — run it from tmp_path so the repo
     # root stays untouched.
@@ -707,10 +761,10 @@ def test_main_hides_advanced_groups_by_default(lr, qapp, monkeypatch,
     win._quit_confirmed = True
     s = win.side
     s.show()
-    assert s.btn_interpolate.isHidden()
-    assert s.btn_cancel_interp.isHidden()
-    assert s.interp_status.isHidden()
-    assert s.btn_keyframe.isHidden()
+    # keyframe/interpolate are visible by default (not advanced-gated)
+    assert not s.btn_interpolate.isHidden()
+    assert not s.interp_status.isHidden()
+    assert not s.btn_keyframe.isHidden()
     assert s.btn_autolabel_frame.isHidden(), "autolabel hidden by default"
     assert s.btn_autolabel_all.isHidden()
     assert s.autolabel_header.isHidden()
@@ -720,10 +774,11 @@ def test_main_hides_advanced_groups_by_default(lr, qapp, monkeypatch,
     assert not s.btn_play.isHidden()
     assert not hasattr(win, "btn_toggle_rerun")
 
-    # config dialog prefill shows them checked (hidden)
+    # config dialog prefill: only the explicitly hidden autolabel group is
+    # checked — keyframe/interpolate are visible by default now
     dlg = lr.ConfigDialog(win)
-    assert dlg.hide_checks["interpolate"].isChecked()
-    assert dlg.hide_checks["keyframe"].isChecked()
+    assert not dlg.hide_checks["interpolate"].isChecked()
+    assert not dlg.hide_checks["keyframe"].isChecked()
     assert dlg.hide_checks["autolabel"].isChecked()
     assert not dlg.hide_checks["sam3_run"].isChecked()
     dlg.close()
@@ -1145,9 +1200,6 @@ def test_autolabel_header_follows_detector(lr, make_coco, make_window,
                       autolabel_detector="grounding_dino")
     assert win.side.autolabel_header.text() == "Grounding DINO Autolabel:"
     assert "Grounding DINO" in win.side.btn_autolabel_frame.toolTip()
-    win._apply_runtime_config({"autolabel": {"detector": "falcon"}})
-    assert win.side.autolabel_header.text() == "Falcon Perception Autolabel:"
-    assert "with masks" in win.side.btn_autolabel_frame.toolTip()
     win._apply_runtime_config({"autolabel": {"detector": "owlv2_exemplar"}})
     assert win.side.autolabel_header.text() == "OWLv2 exemplar Autolabel:"
     assert "visual query" in win.side.btn_autolabel_frame.toolTip()
@@ -1420,6 +1472,96 @@ def test_propagate_ignores_past_keyframes(lr, propagate_win):
     win._on_propagate_track()
     w = FakePropagateWorker.instances[-1]
     assert w.kw["end_frame_idx"] is None
+
+
+def test_mark_every_nth(lr, make_coco, make_window, fake_sam3):
+    """'★ mark keyframes': frames 0, N, 2N… get marked; existing marks
+    are kept."""
+    coco = make_coco([{"id": 0, "name": "a"}])
+    win = make_window(FakeIdx(21), coco)
+    coco.keyframes.add(5)  # pre-existing mark must survive
+    win._on_mark_every_nth(10)
+    assert coco.keyframes == {0, 5, 10, 20}
+    # narrower stride adds more marks, keeps old ones
+    win._on_mark_every_nth(5)
+    assert coco.keyframes == {0, 5, 10, 15, 20}
+
+
+def test_propagate_all_keyframes_queues_per_gap(lr, propagate_win):
+    """'⇉ Propagate all keyframes': one queued SAM3 job per keyframe gap
+    per side, seeded from the boxes already on each keyframe and bounded
+    at the next keyframe; a gap with no tracked boxes is skipped."""
+    win, coco = propagate_win
+    # Keyframes 0, 3 (boxes with track ids on 0 only) and 5 (no boxes).
+    image_id = coco.ensure_image(FakeIdx().frame_at(0), 100, 80)
+    coco.add_box(image_id, 10, 10, 30, 20, 0)
+    coco.set_track_id(coco.annotations[-1]["id"], 1)
+    coco.keyframes.update({0, 3, 5})
+    win._on_propagate_all_keyframes()
+    # Two gaps (0→3, 3→5); only gap 1 has seeds.
+    assert len(win._sam3_queue) == 1
+    job = win._sam3_queue[0]
+    assert job["kind"] == "propagate" and job["side"] == "left"
+    assert job["start_frame_idx"] == 0
+    assert job["end_frame_idx"] == 4  # bounded at keyframe 3 (+1)
+    assert job["seeds"][0]["track_id"] == 1
+    win._sam3_queue.clear()
+
+
+def test_propagate_all_keyframes_needs_two_keyframes(lr, propagate_win):
+    win, coco = propagate_win
+    coco.keyframes.add(2)
+    win._on_propagate_all_keyframes()
+    assert not win._sam3_queue  # one keyframe → nothing to do
+
+
+def test_interpolate_all_keyframes_queues_gaps(lr, make_coco, make_window,
+                                               fake_sam3, auto_yes,
+                                               monkeypatch):
+    """'⇉ Interpolate all keyframes' queues one span per adjacent labeled
+    anchor pair (wrapping) and drains them through the interp worker;
+    gaps already filled are skipped."""
+    from gui.label_review.ui import main_window as mw
+    coco = make_coco([{"id": 0, "name": "a"}])
+    win = make_window(FakeIdx(9), coco)
+    # Labeled anchors at frames 0 and 3 (and 7) → gaps (0,3), (3,8), (8,0
+    # wraps to nothing since 0 is before 8 in the wrap scan? 8 is last
+    # anchor; wrap starts list over → no gap from 8).
+    for fidx in (0, 3, 8):
+        img_id = win._ensure_image_id(fidx, "left")
+        coco.add_box(img_id, 10.0 + fidx, 10.0, 20.0, 20.0, 0)
+    # Fake the worker so no real optical flow runs.
+    class FakeInterp:
+        instances = []
+        def __init__(self, *a, **kw):
+            self.jobs = a[1] if len(a) > 1 else []
+            for s in ("progress_signal", "finished_signal", "failed_signal",
+                      "cancelled_signal"):
+                setattr(self, s, FakeSig())
+            self._running = False
+            FakeInterp.instances.append(self)
+        def start(self): self._running = True
+        def isRunning(self): return self._running
+        def cancel(self): self._running = False
+        def stop(self): self._running = False
+    monkeypatch.setattr(mw, "InterpBatchWorker", FakeInterp)
+    FakeInterp.instances.clear()
+    win._on_interpolate_all_keyframes()
+    # Spans start from the first anchor AFTER the current frame (frame 0):
+    # (3,8) runs first, (0,3) queued next.
+    assert len(FakeInterp.instances) == 1
+    assert FakeInterp.instances[0].jobs[0]["a"] == 3
+    assert win._interp_all_pending == [(0, 3)]
+    # Finish the first → the next gap starts. (Emitting finished marks
+    # the fake torn down, mirroring a real QThread exiting run().)
+    FakeInterp.instances[0].stop()
+    FakeInterp.instances[0].finished_signal.emit([])
+    assert len(FakeInterp.instances) == 2
+    assert FakeInterp.instances[1].jobs[0]["a"] == 0
+    # Finishing the last span drains the queue.
+    FakeInterp.instances[1].stop()
+    FakeInterp.instances[1].finished_signal.emit([])
+    assert win._interp_all_pending == []
 
 
 def test_rerun_markers_labeled_with_waypoint_ids(lr, make_coco,
@@ -1940,7 +2082,7 @@ def test_discard_image_button(lr, make_coco, make_window, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# open-set autolabel backends (grounding_dino / falcon) and
+# open-set autolabel backends (grounding_dino) and
 # OWLv2 exemplar — routing, config roundtrip, exemplar crop extraction.
 # ---------------------------------------------------------------------------
 
@@ -1951,25 +2093,22 @@ def test_autolabel_detector_config_roundtrip(lr, make_coco, make_window,
     win = make_window(lr.EmptyIndex(), make_coco(AL_CATS))
     dlg = lr.ConfigDialog(win)
     assert dlg._collect()["autolabel"]["detector"] == "sam3"
-    for det in ("owlv2", "owlv2_exemplar", "grounding_dino",
-                "falcon"):
+    for det in ("owlv2", "owlv2_exemplar", "grounding_dino"):
         dlg._prefill_from_config({"autolabel": {
             "detector": det, "owlv2_model": "m/ow", "owlv2_conf": 0.55,
-            "gdino_model": "m/gd", "gdino_conf": 0.45,
-            "falcon_model": "m/fa"}})
+            "gdino_model": "m/gd", "gdino_conf": 0.45}})
         out = dlg._collect()["autolabel"]
         assert out["detector"] == det
         assert out["owlv2_model"] == "m/ow" and out["owlv2_conf"] == 0.55
         assert out["gdino_model"] == "m/gd" and out["gdino_conf"] == 0.45
-        assert out["falcon_model"] == "m/fa"
     # _apply_runtime_config on the live window
-    win._apply_runtime_config({"autolabel": {"detector": "falcon",
-                                             "falcon_model": "m/fa2",
+    win._apply_runtime_config({"autolabel": {"detector": "grounding_dino",
+                                             "gdino_model": "m/gd2",
                                              "gdino_conf": 0.5}})
-    assert win.autolabel_detector == "falcon"
-    assert win.falcon_model == "m/fa2" and win.gdino_conf == 0.5
+    assert win.autolabel_detector == "grounding_dino"
+    assert win.gdino_model == "m/gd2" and win.gdino_conf == 0.5
     win._apply_runtime_config({"autolabel": {"detector": "bogus"}})
-    assert win.autolabel_detector == "falcon"  # unchanged
+    assert win.autolabel_detector == "grounding_dino"  # unchanged
 
 
 def test_autolabel_detector_ctor_validation(lr, make_coco, make_window,
@@ -1985,30 +2124,22 @@ def test_autolabel_detector_ctor_validation(lr, make_coco, make_window,
 
 
 def test_generic_autolabel_routing(lr, autolabel_win, monkeypatch):
-    """detector=falcon routes to GenericAutolabelWorker with the falcon
-    model id; grounding_dino picks up the gdino model/conf."""
+    """detector=grounding_dino routes to GenericAutolabelWorker and picks up
+    the gdino model/conf."""
     from gui.label_review.ui import main_window as mw
     win, coco, image_id = autolabel_win
     monkeypatch.setattr(mw, "GenericAutolabelWorker", FakeAutolabelSingle)
     FakeAutolabelSingle.instances.clear()
-
-    win.autolabel_detector = "falcon"
-    win.falcon_model = "m/fa"
-    win._start_autolabel_worker("/img/f0.png", ["monitor"], [1], image_id)
-    aw = FakeAutolabelSingle.instances[-1]
-    assert aw.isRunning()
-    assert aw.kw["detector"] == "falcon"
-    assert aw.kw["model_id"] == "m/fa"
-    assert aw.kw["image_path"] == "/img/f0.png"
-    aw.stop()
 
     win.autolabel_detector = "grounding_dino"
     win.gdino_model = "m/gd"
     win.gdino_conf = 0.45
     win._start_autolabel_worker("/img/f0.png", ["monitor"], [1], image_id)
     aw = FakeAutolabelSingle.instances[-1]
+    assert aw.isRunning()
     assert aw.kw["detector"] == "grounding_dino"
     assert aw.kw["model_id"] == "m/gd" and aw.kw["conf"] == 0.45
+    assert aw.kw["image_path"] == "/img/f0.png"
     aw.stop()
 
 
@@ -2120,3 +2251,36 @@ def test_nav_annotated_buttons(lr, make_coco, make_window, fake_sam3,
     assert win._current_idx == 3  # frame 1 is discarded → skipped
     win.side.btn_next_annotated.click()
     assert win._current_idx == 5
+
+
+def test_nav_keyframe_buttons(lr, make_coco, make_window, fake_sam3,
+                              auto_yes):
+    """Prev/next keyframe buttons jump between ★ keyframes, wrapping
+    around at the ends; with no keyframes the view stays put."""
+    coco = make_coco(CATS)
+    win = make_window(FakeIdx(6), coco)
+
+    # No keyframes yet → nothing happens.
+    win._on_nav_keyframe(+1)
+    assert win._current_idx == 0
+
+    coco.keyframes.update({1, 4})
+    win.side.btn_next_keyframe.click()
+    assert win._current_idx == 1  # nearest keyframe forward
+    win.side.btn_next_keyframe.click()
+    assert win._current_idx == 4
+    win.side.btn_next_keyframe.click()
+    assert win._current_idx == 1  # wraps to the first keyframe
+    win.side.btn_prev_keyframe.click()
+    assert win._current_idx == 4  # wraps back to the last keyframe
+    win.side.btn_prev_keyframe.click()
+    assert win._current_idx == 1
+
+    # A single keyframe: both directions land on it from any other frame.
+    coco.keyframes.discard(4)
+    win._current_idx = 3
+    win.side.btn_prev_keyframe.click()
+    assert win._current_idx == 1
+    win._current_idx = 3
+    win.side.btn_next_keyframe.click()
+    assert win._current_idx == 1  # wraps

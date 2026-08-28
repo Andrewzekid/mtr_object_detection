@@ -583,7 +583,6 @@ def main():
                        gdino_model=autolabel_cfg.get("gdino_model"),
                        gdino_conf=float(autolabel_cfg.get(
                            "gdino_conf", 0.35)),
-                       falcon_model=autolabel_cfg.get("falcon_model"),
                        sam3_model=sam3_cfg.get("model") or args.sam3_model,
                        sam3_device=sam3_device,
                        sam3_conf=float(sam3_cfg.get("conf", args.sam3_conf)),
@@ -604,13 +603,11 @@ def main():
                             "match_max_dist_frac", 0.2)),
                         interp_confirm_mismatch=bool(interp_cfg.get(
                             "confirm_mismatch", True)),
-                        # Interpolation + keyframe controls are hidden unless
-                        # "ui": {"advanced": true} (the Config dialog exposes
-                        # the same toggle); "ui": {"hide": [...]} hides
-                        # additional groups on top.
-                        # Autolabel buttons are hidden by default; a config
-                        # "hide" list fully controls them.
-                        ui_hide=ui_cfg.get("hide", ["autolabel"]),
+                         # Keyframe/interpolate controls are visible by
+                         # default; "ui": {"hide": [...]} hides groups
+                         # explicitly. Autolabel buttons are hidden by
+                         # default; a config "hide" list fully controls them.
+                         ui_hide=ui_cfg.get("hide", ["autolabel"]),
                         mask_opacity=ui_cfg.get("mask_opacity"),
                         advanced_ui=bool(ui_cfg.get("advanced", False)),
                          show_track_ids=bool(tracking_cfg.get("show_ids",

@@ -24,6 +24,13 @@
 #                                         Qwen3.8-27B-Q4_K_M.gguf for llamacpp)
 #   LLAMACPP_URL   llama.cpp server URL (default http://127.0.0.1:8089)
 #   QWEN_MMPROJ    Qwen mmproj file     (default Qwen3.8-mmproj-F16.gguf)
+#   QWEN_PROMPT    Qwen detection prompt (default: the orchestrator's built-in
+#                  Sofa/Wooden Door/Overhead Signage/Sprinkler prompt).
+#                  Multi-line fine: QWEN_PROMPT=$'Sofa: ...\n\nDoor: ...'
+#   QWEN_CLASSES   Class list override (default: parsed from the prompt)
+#
+# Any extra CLI arguments (e.g. --camera both --sample-size 1000) pass
+# straight through to the orchestrator, overriding the defaults above.
 #
 # The qwen stage needs the Ollama server running first (Ollama 0.32.15+
 # for qwen3.8):
@@ -38,6 +45,8 @@ OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 QWEN_MODEL="${QWEN_MODEL:-}"
 LLAMACPP_URL="${LLAMACPP_URL:-http://127.0.0.1:8089}"
 QWEN_MMPROJ="${QWEN_MMPROJ:-Qwen3.8-mmproj-F16.gguf}"
+QWEN_PROMPT="${QWEN_PROMPT:-}"
+QWEN_CLASSES="${QWEN_CLASSES:-}"
 
 # Dataset-only mode (--coco-json ...): no rosbag, pass everything straight
 # through to the orchestrator.
@@ -77,6 +86,17 @@ EXTRA=()
 # Empty QWEN_MODEL lets the orchestrator pick the per-backend default
 # (qwen3.8 for ollama, the GGUF name for llamacpp).
 [[ -n "${QWEN_MODEL}" ]] && EXTRA+=(--qwen-model "${QWEN_MODEL}")
+# Custom Qwen detection prompt (replaces the orchestrator's built-in
+# Sofa/Door/Signage/Sprinkler prompt). --classes overrides the class list
+# parsed from the prompt when set.
+if [[ -n "${QWEN_PROMPT}" ]]; then
+    EXTRA+=(--prompt "${QWEN_PROMPT}")
+fi
+if [[ -n "${QWEN_CLASSES}" ]]; then
+    # QWEN_CLASSES="Sofa Door" → --classes Sofa Door
+    read -r -a _cls <<< "${QWEN_CLASSES}"
+    EXTRA+=(--classes "${_cls[@]}")
+fi
 
 exec python3 "${SCRIPT_DIR}/orchestrate_pipeline.py" \
     --rosbag "${ROSBAG}" \

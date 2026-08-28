@@ -323,7 +323,7 @@ cat <<EOF
   (Alternative Qwen server: re-run with --llamacpp to build llama.cpp's
   llama-server and serve a Qwen3.8 GGUF + mmproj on port 8089 instead.)
 
-  The HF autolabel backends (owlv2 / grounding-dino / falcon)
+  The HF autolabel backends (owlv2 / grounding-dino)
   download automatically on first use in the GUI's Settings → Autolabel.
 
   See README → Installation for the Docker option and manual steps.

@@ -11,10 +11,7 @@
     "auto_segment": false
   },
   "ui": {
-    "hide": [
-      "keyframe",
-      "interpolate"
-    ],
+    "hide": [],
     "mask_opacity": 10
   }
 }

@@ -69,6 +69,11 @@ import requests
 import base64
 import os
 
+try:  # letterbox-aware mask rescale (same op the high-level API postprocess uses)
+    from ultralytics.utils import ops as _ul_ops
+except Exception:  # ultralytics optional for non-SAM3 uses of this module
+    _ul_ops = None
+
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -674,8 +679,8 @@ def sam3_video_propagate(
                 # internally (same convention as the high-level driver).
                 frame = predictor.dataset.frame
                 predictor.inference_state["im"] = im
+                frame_h, frame_w = batch[1][0].shape[:2]
                 if frame_idx == 0:
-                    frame_h, frame_w = batch[1][0].shape[:2]
                     # Register each exemplar box as its own object — the same
                     # box-prompt path SAM2VideoPredictor.inference() uses
                     # when the high-level API is given bboxes.
@@ -710,11 +715,25 @@ def sam3_video_propagate(
                 # mask threshold like inference() does; a plain astype(bool)
                 # turns every nonzero (even negative) logit into foreground.
                 mask = masks_np[j] > mask_threshold
+                # The predictor letterboxes every frame into the square imgsz
+                # input (content anchored top-left, padding at the bottom /
+                # right — LetterBox(center=False)), so the raw logits sit in
+                # LETTERBOX space. A plain resize to the frame size distorts +
+                # offsets every propagated mask (boxes drift off after the
+                # first frame). Undo the letterbox exactly like the high-level
+                # postprocess: crop the padding (padding=False) then resize to
+                # the original frame.
                 if mask.shape != (frame_h, frame_w):
-                    mask = cv2.resize(mask.astype(np.uint8),
-                                      (frame_w, frame_h),
-                                      interpolation=cv2.INTER_NEAREST
-                                      ).astype(bool)
+                    if _ul_ops is not None:
+                        mask_t = torch.from_numpy(np.ascontiguousarray(mask))
+                        mask = (_ul_ops.scale_masks(
+                            mask_t[None, None].float(), (frame_h, frame_w),
+                            padding=False)[0, 0].numpy() > 0.5)
+                    else:  # no ultralytics → plain resize (square clips only)
+                        mask = cv2.resize(mask.astype(np.uint8),
+                                          (frame_w, frame_h),
+                                          interpolation=cv2.INTER_NEAREST
+                                          ).astype(bool)
                 if not mask.any():
                     continue  # object lost on this frame (may recover)
                 ys, xs = np.where(mask)

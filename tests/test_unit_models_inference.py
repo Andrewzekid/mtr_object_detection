@@ -136,3 +136,45 @@ def test_video_propagate_predictor_cached_across_runs(fake_video_predictor):
     list(sam3_video_propagate("/tmp/clip.mp4", [[1, 1, 9, 9]],
                               model_path="m.pt", device="cpu", imgsz=1024))
     assert len(fake_video_predictor.instances) == 2
+
+
+def test_video_propagate_rescales_letterboxed_masks(fake_video_predictor,
+                                                    monkeypatch):
+    """Regression: propagated masks come back in LETTERBOX space (the
+    predictor letterboxes frames into the square imgsz input, content
+    anchored top-left with pad at the bottom/right). They must be un-
+    letterboxed (crop pad, then resize) — a plain resize distorted and
+    offset every propagated box after the first frame."""
+    import torch
+    import ultralytics.models.sam as sam_mod
+    from core import models_inference as mi
+
+    # Frame 80x100; predictor letterboxes to a 40x40 square input (content
+    # band occupies rows 0..32 — scale 0.4) and predicts at 10x10 (imgsz/4).
+    class _LetterboxedPredictor(_FakeVideoPredictor):
+        def __init__(self, overrides=None):
+            super().__init__(overrides)
+            self.dataset = _FakeDataset(frames=2, shape=(80, 100, 3))
+
+        def preprocess(self, ims):
+            return np.zeros((1, 3, 40, 40), np.float32)
+
+        def propagate_in_video(self, state, frame_idx):
+            import torch
+            m = torch.zeros((1, 10, 10))
+            m[0, 2:6, 3:7] = 10.0  # logit blob at rows 2..6, cols 3..7
+            return [0], m, torch.zeros(1)
+
+    monkeypatch.setattr(sam_mod, "SAM3VideoPredictor",
+                        _LetterboxedPredictor)
+    mi._SAM3_VIDEO_PREDICTOR_CACHE.clear()
+    from core.models_inference import sam3_video_propagate
+    frames = list(sam3_video_propagate("/tmp/clip.mp4", [[1, 1, 9, 9]],
+                                       model_path="m.pt", device="cpu"))
+    mask, bbox, _ = frames[1][1][0]
+    # Blob in letterbox space (10x10) → unpad/crop rows [0:8] → resize to
+    # 80x100 (gain 0.1): rows 2..6 → 20..60, cols 3..7 → 30..70.
+    ys, xs = np.where(mask)
+    assert mask.shape == (80, 100)
+    assert (xs.min(), ys.min(), xs.max(), ys.max()) == (30, 20, 69, 59)
+    assert bbox == [30.0, 20.0, 69.0, 59.0]

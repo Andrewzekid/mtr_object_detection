@@ -341,12 +341,11 @@ def test_autolabel_frame_runs_both_sides_in_stereo(lr, make_coco, make_window,
     from gui.label_review.ui import main_window as mw
     win, coco, idx, _l, _r = _stereo_setup(lr, make_coco, make_window,
                                            tmp_path, name="alframe")
-    # Patch the generic autolabel single-frame worker (falcon/grounding_dino
-    # share it) so we can observe both dispatches.
+    # Patch the generic autolabel single-frame worker (grounding_dino)
+    # so we can observe both dispatches.
     monkeypatch.setattr(mw, "GenericAutolabelWorker", FakeAutolabelSingle)
     FakeAutolabelSingle.instances.clear()
-    win.autolabel_detector = "falcon"
-    win.falcon_model = "tiiuae/Falcon-Perception"
+    win.autolabel_detector = "grounding_dino"
     # RIGHT canvas focused — the reported bug scenario (only right got labelled)
     win._set_active_canvas(win.canvases["right"])
 
@@ -355,11 +354,11 @@ def test_autolabel_frame_runs_both_sides_in_stereo(lr, make_coco, make_window,
     assert len(FakeAutolabelSingle.instances) == 1
     running = FakeAutolabelSingle.instances[0]
     assert running.isRunning()
-    assert running.kw["detector"] == "falcon"
+    assert running.kw["detector"] == "grounding_dino"
     assert len(win._sam3_queue) == 1
     queued = win._sam3_queue[0]
     assert queued["kind"] == "autolabel"
-    assert queued["detector"] == "falcon"
+    assert queued["detector"] == "grounding_dino"
     # The two jobs target different image ids (one per side).
     left_id = win.canvas._image_id
     right_id = win.canvases["right"]._image_id
@@ -379,8 +378,7 @@ def test_autolabel_all_runs_both_sides_in_stereo(lr, make_coco, make_window,
                                            tmp_path, name="alall")
     monkeypatch.setattr(mw, "GenericAutolabelBatchWorker", FakeWorker)
     FakeWorker.instances.clear()
-    win.autolabel_detector = "falcon"
-    win.falcon_model = "tiiuae/Falcon-Perception"
+    win.autolabel_detector = "grounding_dino"
 
     win._on_autolabel_all()
     # Left batch started, right pending.
@@ -388,7 +386,7 @@ def test_autolabel_all_runs_both_sides_in_stereo(lr, make_coco, make_window,
     assert win._autolabel_batch_side == "left"
     assert win._autolabel_all_pending == ["right"]
     # GenericAutolabelBatchWorker receives `detector` as the first positional.
-    assert FakeWorker.instances[0].args[0] == "falcon"
+    assert FakeWorker.instances[0].args[0] == "grounding_dino"
 
     # Finishing the left batch chains the right batch.
     FakeWorker.instances[0].finished_signal.emit(0)
@@ -410,8 +408,7 @@ def test_autolabel_all_cancel_stops_the_chain(lr, make_coco, make_window,
                                            tmp_path, name="alcancel")
     monkeypatch.setattr(mw, "GenericAutolabelBatchWorker", FakeWorker)
     FakeWorker.instances.clear()
-    win.autolabel_detector = "falcon"
-    win.falcon_model = "tiiuae/Falcon-Perception"
+    win.autolabel_detector = "grounding_dino"
 
     win._on_autolabel_all()
     FakeWorker.instances[0].cancelled_signal.emit()
@@ -429,8 +426,7 @@ def test_autolabel_all_mono_single_batch(lr, make_coco, make_window, tmp_path,
     FakeWorker.instances.clear()
     win = make_window(lr.ImageFolderIndex([str(folder)]),
                      make_coco([{"id": 0, "name": "a"}]))
-    win.autolabel_detector = "falcon"
-    win.falcon_model = "tiiuae/Falcon-Perception"
+    win.autolabel_detector = "grounding_dino"
 
     win._on_autolabel_all()
     assert len(FakeWorker.instances) == 1

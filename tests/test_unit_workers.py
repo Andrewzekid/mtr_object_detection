@@ -634,7 +634,7 @@ def test_propagate_worker_chain_passes_iou_thresholds(sam3_on, workers,
 
 
 # ---------------------------------------------------------------------------
-# Generic open-set autolabel backends (Grounding DINO / Falcon)
+# Generic open-set autolabel backends (Grounding DINO)
 # and OWLv2 exemplar workers — detector fns monkeypatched, no HF downloads.
 # ---------------------------------------------------------------------------
 
@@ -667,15 +667,7 @@ def test_generic_detect_dispatch_grounding_dino(workers, monkeypatch):
     assert calls["state"] is state and calls["model_id"] == "m/gd"
 
 
-def test_generic_detect_dispatch_falcon(workers, monkeypatch):
-    import core.detectors as fa
-    monkeypatch.setattr(
-        fa, "falcon_detect",
-        lambda *a, **k: [{"label": "y", "bbox_xyxy": [0, 0, 2, 2],
-                          "mask": None, "confidence": 1.0}])
-    assert workers._generic_detect(
-        "falcon", "/i.png", ["y"], None, "cpu", 0.3, None
-    )[0]["label"] == "y"
+def test_generic_detect_dispatch_unknown(workers):
     with pytest.raises(ValueError, match="Unknown autolabel detector"):
         workers._generic_detect("nope", "/i.png", ["x"], None, "cpu", 0.3,
                                 None)
@@ -689,7 +681,7 @@ def test_generic_autolabel_worker_maps_cat_ids(workers, monkeypatch):
              "confidence": 0.9},
             {"label": "???", "bbox_xyxy": [5, 5, 9, 9], "mask": None,
              "confidence": 0.1}])
-    w = workers.GenericAutolabelWorker("falcon", "/img/x.png",
+    w = workers.GenericAutolabelWorker("grounding_dino", "/img/x.png",
                                        ["ceiling light", "monitor"], [0, 1],
                                        42, None, "cpu", 0.35)
     got = {}
@@ -738,7 +730,7 @@ def test_generic_autolabel_batch_worker_cancel(workers, monkeypatch,
         lambda *a, **k: [{"label": "a", "bbox_xyxy": [0, 0, 4, 4],
                           "mask": None, "confidence": 0.5}])
     w = workers.GenericAutolabelBatchWorker(
-        "falcon", FakeIdx(3), [0, 1, 2], ["a"], [0], str(tmp_path / "al"),
+        "grounding_dino", FakeIdx(3), [0, 1, 2], ["a"], [0], str(tmp_path / "al"),
         None, "cpu", 0.3)
     events = []
     w.frame_done_signal.connect(
@@ -793,45 +785,3 @@ def test_owlv2_exemplar_batch_worker(workers, monkeypatch, tmp_path):
     assert all(e[1][0]["cat_id"] == 5 for e in events[:2])
 
 
-# ---------------------------------------------------------------------------
-# core.detectors falcon helpers (no HF download — model/load monkeypatched)
-# ---------------------------------------------------------------------------
-
-def test_falcon_bbox_conversion(monkeypatch):
-    """Normalized centre+size -> absolute xyxy using the image size."""
-    import core.detectors as fd
-
-    class FakeModel:
-        def generate(self, img, query, compile=False):
-            return [[{"xy": {"x": 0.5, "y": 0.5},
-                      "hw": {"h": 0.2, "w": 0.4},
-                      "mask_rle": {"counts": "", "size": [100, 200]}}]]
-
-    monkeypatch.setattr(fd, "load_falcon", lambda *a, **k: FakeModel())
-    img = np.zeros((100, 200, 3), np.uint8)  # H=100, W=200
-    dets = fd.falcon_detect(img, ["door"], device="cpu")
-    assert len(dets) == 1
-    d = dets[0]
-    assert d["label"] == "door"
-    assert d["bbox_xyxy"] == pytest.approx([60, 40, 140, 60])
-    assert d["mask"] is None  # empty counts decode to None
-    assert d["confidence"] == 1.0
-
-
-def test_falcon_decode_mask_roundtrip():
-    pytest.importorskip("pycocotools")
-    from pycocotools import mask as mask_utils
-    from core.detectors import _decode_mask
-    m = np.zeros((10, 12), dtype=np.uint8, order="F")
-    m[2:5, 3:8] = 1
-    rle = mask_utils.encode(m)
-    out = _decode_mask({"size": list(rle["size"]),
-                        "counts": rle["counts"].decode("utf-8")})
-    assert out is not None and out.shape == (10, 12)
-    assert np.array_equal(out, m.astype(bool))
-
-
-def test_falcon_decode_mask_empty():
-    from core.detectors import _decode_mask
-    assert _decode_mask({"counts": "", "size": [10, 10]}) is None
-    assert _decode_mask({}) is None
