@@ -130,7 +130,8 @@ class ConfigDialog(QtWidgets.QDialog):
         self.spin_sam3_imgsz.setRange(0, 4096)
         self.spin_sam3_imgsz.setSingleStep(64)
         self.spin_sam3_imgsz.setToolTip(
-            "SAM3 inference size in pixels (square). 0 = library default.\n"
+            "SAM3 inference size in pixels (square; default 1024).\n"
+            "0 = library default.\n"
             "Lower values (e.g. 768/512) segment faster; boxes/masks are\n"
             "always rescaled back to the original image size. Takes effect\n"
             "on the next SAM3 run (re-segment, point segment, autolabel,\n"

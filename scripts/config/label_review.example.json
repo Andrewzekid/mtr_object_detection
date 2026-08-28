@@ -9,7 +9,7 @@
     "device": "auto",
     "model": null,
     "conf": 0.25,
-    "imgsz": null,
+    "imgsz": 1024,
     "quantize": 16,
     "auto_segment": false,
     "min_polygon_area": 100,

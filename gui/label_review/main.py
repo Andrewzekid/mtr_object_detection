@@ -239,7 +239,7 @@ config override the corresponding CLI flags. Example:
                                       // reports CUDA available, else cpu.
                                       // Or force "cuda" / "cpu".
         "conf": 0.25,
-        "imgsz": null,                // inference size (square). null =
+        "imgsz": 1024,                // inference size (square). null =
                                       // library default (1036 bbox / 644
                                       // text). Smaller (644/770) is much
                                       // faster; rounded to a multiple of 14.
@@ -383,13 +383,12 @@ def main():
                              "cpu).")
     parser.add_argument("--sam3-conf", type=float, default=0.25,
                         help="SAM3 confidence threshold (default: 0.25).")
-    parser.add_argument("--sam3-imgsz", type=int, default=None,
+    parser.add_argument("--sam3-imgsz", type=int, default=1024,
                         help="SAM3 inference image size (square). Default: "
-                             "library default (1036 for the bbox-exemplar "
-                             "model, 644 for the text/semantic model). "
-                             "Smaller values (644/770) run much faster with "
-                             "slightly coarser masks; rounded to a multiple "
-                             "of 14.")
+                             "1024 (down from the library's 1036/644 "
+                             "defaults). Smaller values (644/770) run much "
+                             "faster with slightly coarser masks; rounded "
+                             "to a multiple of 14.")
     parser.add_argument("--sam3-quantize", type=int, default=None,
                         choices=[8, 16, 32],
                         help="SAM3 precision: 16 = FP16 (much faster on "

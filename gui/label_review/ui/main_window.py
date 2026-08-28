@@ -3735,7 +3735,7 @@ class ReviewWindow(QMainWindow):
                 end_frame_idx=end_frame_idx)
 
     def _on_propagate_all_keyframes(self) -> None:
-        """'⇉ Propagate all keyframes': for every pair of adjacent
+        """'⇉ SAM3 propagate all keyframes': for every pair of adjacent
         keyframes (a, b) and every side, seed SAM3 from frame a's boxes
         (one seed per track id) and fill the frames up to b. Jobs go
         through the SAM3 queue, so the whole batch runs back-to-back in
@@ -3975,6 +3975,21 @@ class ReviewWindow(QMainWindow):
                 undo=_undo, redo=_redo)
         self.side.set_sam3_running(False)
         self._set_sam3_status(status)
+        # Propagated boxes carry SAM3 masks — if the overlay was toggled
+        # off, switch it on so the run's result is actually visible (the
+        # boxes alone look like plain labels).
+        meta_masks = sum(1 for a in anns
+                         if isinstance(a.get("_mask"), np.ndarray)
+                         or a.get("_poly") or a.get("_mask_png"))
+        if meta_masks and not self._active_canvas.masks_visible():
+            for c in self.canvases.values():
+                c.set_masks_visible(True)
+            self.side.btn_masks.blockSignals(True)
+            self.side.btn_masks.setChecked(True)
+            self.side.btn_masks.setText("Masks: ON")
+            self.side.btn_masks.blockSignals(False)
+            message = (message or "") + \
+                " — masks overlay was off, switched it on"
         self.coco.save(is_final=False)
         self._refresh_boxes()
         if message:

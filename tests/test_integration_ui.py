@@ -1488,7 +1488,7 @@ def test_mark_every_nth(lr, make_coco, make_window, fake_sam3):
 
 
 def test_propagate_all_keyframes_queues_per_gap(lr, propagate_win):
-    """'⇉ Propagate all keyframes': one queued SAM3 job per keyframe gap
+    """'⇉ SAM3 propagate all keyframes': one queued SAM3 job per keyframe gap
     per side, seeded from the boxes already on each keyframe and bounded
     at the next keyframe; a gap with no tracked boxes is skipped."""
     win, coco = propagate_win

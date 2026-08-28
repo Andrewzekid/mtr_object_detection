@@ -178,9 +178,9 @@ config keys):
 - **Precision** (`sam3.quantize`): FP16 (default in the example config)
   runs ~1.5-2x faster on GPU with no visible quality loss; FP8 is
   experimental; FP32 matches the checkpoint exactly.
-- **Inference imgsz** (`sam3.imgsz`): square inference size in pixels;
-  0 = library default. Lower (e.g. 768) is faster; boxes/masks are always
-  rescaled back to the original image size.
+- **Inference imgsz** (`sam3.imgsz`): square inference size in pixels,
+  1024 by default (null/0 = library default). Lower (e.g. 768) is faster;
+  boxes/masks are always rescaled back to the original image size.
 
 ### Labelling assist features (when and how to use them)
 
@@ -219,7 +219,7 @@ the assistants below depending on the footage.
   the run only covers the frames between the keyframes — it stops at the
   next keyframe instead of running to the end of the dataset, so you can
   annotate keyframe by keyframe and let SAM3 fill each segment.
-  **⇉ Propagate all keyframes** queues one run per keyframe gap and side,
+  **⇉ SAM3 propagate all keyframes** queues one run per keyframe gap and side,
   seeded from the boxes already on each keyframe — the batch way to fill
   every segment after labelling the keyframes.
 - **Re-segment selected** — re-runs SAM3 on a box you moved/resized to get
@@ -1002,7 +1002,7 @@ CLI equivalent: `--pose-db` preloads the pose DB at launch.
 | **★ mark keyframes** + `every` | mark frames 0, N, 2N, … as keyframes in one click |
 | **Interpolate (I)** + **Stop** | optical-flow-fill boxes between two labeled/keyframe anchors; use for smooth, constant-direction motion |
 | **⇉ Interpolate all keyframes** | flow-fill EVERY gap between adjacent labeled/keyframe anchors, one gap at a time (already-labeled frames skipped) |
-| **⇉ Propagate all keyframes** | queue SAM3 propagation for every keyframe gap, seeded from the boxes on each keyframe |
+| **⇉ SAM3 propagate all keyframes** | queue SAM3 propagation for every keyframe gap, seeded from the boxes on each keyframe |
 | **Run SAM3 (all)** / **Re-seg sel (R)** / **Cancel** | segment all boxes on the frame / re-mask the selection |
 | **SAM3 ALL frames** | background segmentation of every frame (checkpoints every 10 frames) |
 | **🎯 Add points** + **▶ Segment points** | point-prompt mode: accumulate +/− points on clicks, then run SAM3 once with all of them (see mouse section) |

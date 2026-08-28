@@ -397,12 +397,13 @@ class SidePanel(QWidget):
         self.btn_interp_all_keyframes.clicked.connect(
             self.interpolate_all_keyframes.emit)
         kf_batch_row.addWidget(self.btn_interp_all_keyframes)
-        self.btn_propagate_all_keyframes = QPushButton("⇉ Propagate all keyframes")
+        self.btn_propagate_all_keyframes = QPushButton(
+            "⇉ SAM3 propagate all keyframes")
         self.btn_propagate_all_keyframes.setToolTip(
-            "Propagate the SELECTED tracks from every keyframe to the "
-            "next: for each keyframe with selected boxes, SAM3 fills the "
-            "frames up to the next keyframe. Run after selecting the "
-            "tracks on the first keyframe.")
+            "Propagate every keyframe gap with SAM3: for each pair of "
+            "adjacent keyframes, the boxes already on the earlier one "
+            "seed the run and SAM3 fills the frames up to the next "
+            "keyframe.")
         self.btn_propagate_all_keyframes.clicked.connect(
             self.propagate_all_keyframes.emit)
         kf_batch_row.addWidget(self.btn_propagate_all_keyframes)
