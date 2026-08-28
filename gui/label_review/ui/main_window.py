@@ -612,6 +612,12 @@ class ReviewWindow(QMainWindow):
         if not self._in_rerun_view() or not self._rerun_embedded_wid \
                 or self._rerun_container is None:
             return
+        if QApplication.activePopupWidget() is not None \
+                or QApplication.activeModalWidget() is not None:
+            # A menu/dialog is open — often OVERLAPPING the map, so the
+            # pointer-in-container test below would misfire, and any X
+            # focus change dismisses the popup. Leave focus alone.
+            return
         fw = QApplication.focusWidget()
         if isinstance(fw, (QLineEdit, QtWidgets.QTextEdit,
                            QtWidgets.QPlainTextEdit)):
