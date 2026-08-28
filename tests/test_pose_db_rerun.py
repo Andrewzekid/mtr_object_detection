@@ -359,3 +359,59 @@ class TestEmbeddedReopen:
             for p in spawned:
                 if p.poll() is None:
                     p.terminate()
+
+    def test_open_seq_increments_on_each_open(self, monkeypatch):
+        """X11 recycles window ids, so the GUI keys its embedded container
+        on (win_id, open_seq) — open_seq must change on every open."""
+        pytest.importorskip("rerun")
+        logger = RerunLogger()
+        monkeypatch.setattr(logger, "_spawn_viewer", lambda embed=False: True)
+        monkeypatch.setattr(logger, "_read_store_id", lambda p: ("app", None))
+        monkeypatch.setattr(logger, "_find_marker_entity",
+                            lambda p, r: MARKER_ENTITY)
+        assert logger.open_seq == 0
+        assert logger.open_recording("map.rrd", embed=True)
+        assert logger.open_recording("map.rrd", embed=True)
+        assert logger.open_seq == 2
+
+    def test_shutdown_kills_detached_viewer_pid(self):
+        """The `rerun` console script detaches the real viewer process, so
+        terminating the Popen wrapper kills nothing — shutdown() must kill
+        the _NET_WM_PID-tracked viewer pid."""
+        import subprocess
+        import time
+        logger = RerunLogger()
+        proc = subprocess.Popen(
+            ["bash", "-c", "exec -a rerun_viewer sleep 30"])
+        # Right after Popen the child has not exec'ed yet and its /proc
+        # cmdline reads empty — wait for the exec so the rerun-cmdline
+        # safety check in _kill_viewer_pid can see it.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                if open(f"/proc/{proc.pid}/cmdline", "rb").read():
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        logger._viewer_pid = proc.pid
+        logger.win_id = 0x123
+        try:
+            logger.shutdown()
+            assert proc.wait(timeout=5) is not None
+            assert logger._viewer_pid is None
+            assert logger.win_id is None
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+
+    def test_kill_viewer_pid_ignores_recycled_non_rerun_pid(self):
+        """Safety net: a pid recycled by an unrelated process between the
+        window lookup and shutdown is left alone."""
+        import subprocess
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            RerunLogger._kill_viewer_pid(proc.pid)
+            assert proc.poll() is None  # not a rerun process — untouched
+        finally:
+            proc.terminate()

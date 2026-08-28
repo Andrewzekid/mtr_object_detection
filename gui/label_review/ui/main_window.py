@@ -358,6 +358,20 @@ class ReviewWindow(QMainWindow):
         self._rerun_container = None
         self._rerun_native_win = None
         self._rerun_embedded_wid: Optional[int] = None
+        # (win_id, open_seq) of the wrapped viewer. X11 recycles window
+        # ids, so a re-open can yield the SAME win_id for a NEW viewer
+        # process — compare the pair, not the id alone, when deciding
+        # whether the container must be rebuilt.
+        self._rerun_embedded_key: Optional[tuple] = None
+        # Focus-follows-pointer for the embedded viewer (a reparented
+        # foreign window gets mouse events from the window under the cursor
+        # but keyboard events follow the X input focus), plus the shared
+        # libX11 connection it runs on. See _sync_rerun_focus.
+        self._x11_lib = None
+        self._x11_dpy = None
+        self._rerun_focus_timer = QTimer(self)
+        self._rerun_focus_timer.setInterval(300)
+        self._rerun_focus_timer.timeout.connect(self._sync_rerun_focus)
         # WindowActivate forwarding for the embedded rerun window (see
         # eventFilter).
         self.installEventFilter(self)
@@ -511,46 +525,107 @@ class ReviewWindow(QMainWindow):
             self._focus_rerun_window()
         return super().eventFilter(obj, event)
 
+    def _x11_conn(self):
+        """Shared (libX11, Display) pair, opened lazily.
+
+        A custom no-op error handler is installed: without it a BadMatch
+        (focus request racing the window's mapping, e.g. right after a
+        respawn) would abort the process.
+        """
+        if self._x11_dpy is None:
+            import ctypes
+            x11 = ctypes.CDLL("libX11.so.6")
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            dpy = x11.XOpenDisplay(None)
+            if not dpy:
+                return None, None
+            x11.XSetErrorHandler(_X11_ERR_CB)  # module-level, stays alive
+            self._x11_lib, self._x11_dpy = x11, dpy
+        return self._x11_lib, self._x11_dpy
+
+    def _x11_focus(self) -> int:
+        """Window id holding the X11 input focus (0 on failure)."""
+        import ctypes
+        x11, dpy = self._x11_conn()
+        if not dpy:
+            return 0
+        focus = ctypes.c_ulong(0)
+        x11.XGetInputFocus(ctypes.c_void_p(dpy), ctypes.byref(focus),
+                           ctypes.byref(ctypes.c_int(0)))
+        return focus.value
+
+    def _x11_set_focus(self, wid: int) -> None:
+        x11, dpy = self._x11_conn()
+        if not dpy:
+            return
+        import ctypes
+        x11.XSetInputFocus(ctypes.c_void_p(dpy), ctypes.c_ulong(wid),
+                           1, 0)  # RevertToParent, CurrentTime
+        x11.XSync(ctypes.c_void_p(dpy), 0)
+
     def _focus_rerun_window(self) -> None:
         """Move X11 input focus to the embedded rerun window.
 
         A reparented foreign window receives mouse events (they go to the
         window under the cursor) but NOT keyboard events, which follow the
         input focus our Qt window holds — so WASD camera controls are dead
-        until we hand the focus over via XSetInputFocus. Clicking any Qt
-        widget (menu bar, image view) lets the WM focus our window again.
-
-        A custom no-op error handler is installed on our own Display
-        connection: without it a BadMatch (window momentarily not
-        viewable, e.g. right after a respawn) would abort the process.
-        Retries cover that transient state.
+        until we hand the focus over via XSetInputFocus. Retries cover the
+        transient not-viewable state right after a respawn.
         """
         wid = self._rerun_embedded_wid
         if not wid:
             return
         try:
-            import ctypes
-            x11 = ctypes.CDLL("libX11.so.6")
-            x11.XOpenDisplay.restype = ctypes.c_void_p
-            dpy = x11.XOpenDisplay(None)
-            if not dpy:
-                return
-            x11.XSetErrorHandler(_X11_ERR_CB)  # module-level, stays alive
             for _ in range(5):
-                x11.XSetInputFocus(ctypes.c_void_p(dpy), ctypes.c_ulong(wid),
-                                   1, 0)  # RevertToParent, CurrentTime
-                x11.XSync(ctypes.c_void_p(dpy), 0)
-                focus = ctypes.c_ulong(0)
-                x11.XGetInputFocus(ctypes.c_void_p(dpy),
-                                   ctypes.byref(focus),
-                                   ctypes.byref(ctypes.c_int(0)))
-                if focus.value == wid:
+                self._x11_set_focus(wid)
+                if self._x11_focus() == wid:
                     break
                 time.sleep(0.1)
-            x11.XCloseDisplay(ctypes.c_void_p(dpy))
         except Exception as exc:
             print(f"WARNING: could not focus the embedded rerun window: "
                   f"{exc}")
+
+    def _restore_qt_focus(self) -> None:
+        """Hand X11 input focus back from the embedded rerun window to our
+        own top-level window, so the GUI's hotkeys and text fields work."""
+        wid = self._rerun_embedded_wid
+        if not wid:
+            return
+        try:
+            if self._x11_focus() == wid:
+                self._x11_set_focus(int(self.winId()))
+        except Exception as exc:
+            print(f"WARNING: could not restore Qt keyboard focus: {exc}")
+
+    def _sync_rerun_focus(self) -> None:
+        """Focus follows the pointer while the map view is up.
+
+        Clicks on the embedded foreign window never reach Qt (they go
+        straight to that window at X level), so neither the container's
+        MouseButtonPress hook nor leaving-focus events fire reliably. This
+        timer — running only in the rerun view — forwards focus to the
+        viewer while the pointer is over the map and hands it back to Qt
+        when it leaves, so both the WASD camera controls and the GUI's own
+        hotkeys keep working. Focus held by another application is left
+        alone.
+        """
+        if not self._in_rerun_view() or not self._rerun_embedded_wid \
+                or self._rerun_container is None:
+            return
+        fw = QApplication.focusWidget()
+        if isinstance(fw, (QLineEdit, QtWidgets.QTextEdit,
+                           QtWidgets.QPlainTextEdit)):
+            return  # don't yank focus out of a text field mid-edit
+        over_map = self._rerun_container.rect().contains(
+            self._rerun_container.mapFromGlobal(QtGui.QCursor.pos()))
+        focus = self._x11_focus()
+        mine = int(self.winId())
+        if focus not in (self._rerun_embedded_wid, mine):
+            return  # another app holds focus — don't fight the WM
+        if over_map and focus != self._rerun_embedded_wid:
+            self._x11_set_focus(self._rerun_embedded_wid)
+        elif not over_map and focus == self._rerun_embedded_wid:
+            self._x11_set_focus(mine)
 
     # ----------------------- canvases (mono / stereo) ------------------- #
 
@@ -949,7 +1024,10 @@ class ReviewWindow(QMainWindow):
         """Reparent the viewer's native window into the rerun page,
         replacing the placeholder (or a stale container from a respawn)."""
         wid = self.rerun.win_id
-        if not wid or wid == self._rerun_embedded_wid:
+        # Keyed on open_seq as well: X11 recycles window ids, so a re-open
+        # can hand back the same wid for a brand-new viewer process.
+        key = (wid, self.rerun.open_seq)
+        if not wid or key == self._rerun_embedded_key:
             return
         if self._rerun_container is not None:
             self._rerun_container.hide()
@@ -969,6 +1047,13 @@ class ReviewWindow(QMainWindow):
                 w.deleteLater()
         lay.addWidget(self._rerun_container)
         self._rerun_embedded_wid = wid
+        self._rerun_embedded_key = key
+        if self._in_rerun_view():
+            # Embedded while the map page was already up (the toggle path
+            # opens the recording AFTER _show_rerun_page ran): the focus
+            # timer and the initial focus hand-off still need to happen.
+            QTimer.singleShot(150, self._focus_rerun_window)
+            self._rerun_focus_timer.start()
 
     def _in_rerun_view(self) -> bool:
         return self._stack.currentWidget() is self._rerun_page
@@ -981,9 +1066,12 @@ class ReviewWindow(QMainWindow):
             # Let the page switch settle, then hand keyboard focus to the
             # embedded window so WASD camera controls work immediately.
             QTimer.singleShot(150, self._focus_rerun_window)
+            self._rerun_focus_timer.start()  # focus follows the pointer
 
     def _show_image_page(self) -> None:
         """Back to the image labeling view."""
+        self._rerun_focus_timer.stop()
+        self._restore_qt_focus()  # hotkeys/text fields need the focus back
         self._stack.setCurrentWidget(self._splitter)
         self._act_rerun_view.setText("Switch to Rerun waypoint view")
 
@@ -1676,7 +1764,8 @@ class ReviewWindow(QMainWindow):
             return
         # A dropped embedded connection respawns the viewer with a new
         # window — re-embed it so the page follows the new process.
-        if self.rerun.win_id and self.rerun.win_id != self._rerun_embedded_wid:
+        if self.rerun.win_id and (self.rerun.win_id, self.rerun.open_seq) \
+                != self._rerun_embedded_key:
             self._load_rerun_embedded()
         self.statusBar().showMessage(
             f"Rerun: showing {len(markers)} annotated viewpoint(s)"

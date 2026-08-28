@@ -34,6 +34,7 @@ never modified.
 from __future__ import annotations
 
 import math
+import os
 import re
 import socket
 import subprocess
@@ -89,6 +90,19 @@ class RerunLogger:
         # shutdown()/GUI close on purpose, but terminated when the same
         # recording is re-opened embedded so both views don't coexist.
         self._ext_proc: Optional[subprocess.Popen] = None
+        # The `rerun` on PATH is a console script whose real viewer process
+        # DETACHES (re-parented to the session leader), so terminating the
+        # Popen handle kills an already-dead wrapper and leaks the viewer
+        # (it re-emerges as a standalone window when its Qt container is
+        # destroyed). We therefore track the real viewer pid, read from the
+        # window's _NET_WM_PID property, and kill that.
+        self._viewer_pid: Optional[int] = None      # embedded viewer
+        self._ext_viewer_pid: Optional[int] = None  # windowed viewer
+        # Incremented on every open_recording: X11 recycles window ids, so
+        # a re-open can legitimately yield the SAME win_id for a NEW viewer
+        # process — the GUI must compare (win_id, open_seq), not win_id
+        # alone, to decide whether to rebuild its container.
+        self.open_seq = 0
 
     # ------------------------------------------------------------------ #
 
@@ -115,6 +129,7 @@ class RerunLogger:
         self._port = None
         self.win_id = None
         self._embed = embed
+        self.open_seq += 1
         self.shutdown()  # an earlier embedded viewer process is useless now
         if embed:
             # Moving the recording into the embedded view — close the
@@ -127,14 +142,36 @@ class RerunLogger:
         (a windowed external viewer is left alone on purpose)."""
         proc, self._proc = self._proc, None
         self.win_id = None
+        pid, self._viewer_pid = self._viewer_pid, None
+        if pid is not None:
+            self._kill_viewer_pid(pid)
         if proc is not None and proc.poll() is None:
             proc.terminate()
 
     def _shutdown_external(self) -> None:
         """Terminate the windowed viewer process we spawned earlier."""
         proc, self._ext_proc = self._ext_proc, None
+        pid, self._ext_viewer_pid = self._ext_viewer_pid, None
+        if pid is not None:
+            self._kill_viewer_pid(pid)
         if proc is not None and proc.poll() is None:
             proc.terminate()
+
+    @staticmethod
+    def _kill_viewer_pid(pid: int) -> None:
+        """SIGTERM the real viewer process (see ``_viewer_pid``).
+
+        Safety-checked against /proc so a recycled pid that no longer
+        belongs to a rerun binary is left alone.
+        """
+        import signal
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                if b"rerun" not in fh.read():
+                    return
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
 
     def log_annotated_markers(self, markers: List[Tuple]) -> bool:
         """Replace the annotated-frame markers on the recording's map.
@@ -179,15 +216,26 @@ class RerunLogger:
         view. The window may flash standalone for a moment before the GUI
         grabs it; when the lookup fails the recording still opens as a
         normal external window (``win_id`` stays None).
+
+        In both modes the real viewer pid is resolved from the window's
+        _NET_WM_PID (the Popen handle only tracks the short-lived wrapper
+        script — see ``_viewer_pid``), so shutdown can actually kill it.
         """
         try:
+            # A respawn (marker logging after the connection dropped)
+            # replaces any previous viewer of the same mode instead of
+            # stacking a second window for the same recording.
+            if embed:
+                self.shutdown()
+            else:
+                self._shutdown_external()
             # Grab a free port instead of using the default (9876): with the
             # default port occupied, the CLI "helpfully" streams into the
             # already-running process instead of opening a new window.
             with socket.socket() as s:
                 s.bind(("127.0.0.1", 0))
                 port = s.getsockname()[1]
-            before = self._x11_rerun_windows() if embed else set()
+            before = self._x11_rerun_windows()
             proc = subprocess.Popen(["rerun", self.rrd_path,
                                      "--port", str(port)])
             if embed:
@@ -216,12 +264,32 @@ class RerunLogger:
                 if self.win_id is None:
                     print("WARNING: could not find the rerun viewer's X11 "
                           "window; it stays a standalone window")
+                else:
+                    self._viewer_pid = self._window_pid(self.win_id)
+            else:
+                # Best-effort pid for _shutdown_external; a short timeout
+                # keeps a windowless environment from stalling the open.
+                ext_wid = self._wait_for_window(before, timeout=5.0)
+                if ext_wid is not None:
+                    self._ext_viewer_pid = self._window_pid(ext_wid)
             self._send_map_blueprint()
             self._apply_level_transform()
             return True
         except Exception as exc:
             print(f"WARNING: could not spawn the rerun viewer: {exc}")
             return False
+
+    @staticmethod
+    def _window_pid(wid: int) -> Optional[int]:
+        """The owning process id of an X11 window (_NET_WM_PID)."""
+        try:
+            out = subprocess.run(["xprop", "-id", str(wid), "_NET_WM_PID"],
+                                 capture_output=True, text=True,
+                                 timeout=10).stdout
+        except Exception:
+            return None
+        m = re.search(r"_NET_WM_PID\(CARDINAL\)\s*=\s*(\d+)", out)
+        return int(m.group(1)) if m else None
 
     @staticmethod
     def _x11_rerun_windows() -> set:
@@ -345,7 +413,9 @@ class RerunLogger:
                             .to_numpy(zero_copy_only=False),
                             dtype=np.float32).reshape(-1, 3)
                         stride = max(1, len(pts) // _MAP_SAMPLE_PER_CHUNK)
-                        samples.append(pts[::stride])
+                        # .copy(): the strided view would otherwise keep
+                        # the whole chunk buffer alive until concatenate.
+                        samples.append(pts[::stride].copy())
                 quat_i = cols.get("Transform3D:quaternion")
                 trans_i = cols.get("Transform3D:translation")
                 if quat_i is not None or trans_i is not None:
