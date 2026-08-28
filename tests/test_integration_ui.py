@@ -1624,6 +1624,52 @@ def test_interpolate_starts_single_worker(lr, make_coco, make_window,
     assert len(FakeInterp.instances) == 1
     assert FakeInterp.instances[0].jobs[0]["a"] == 0
     assert FakeInterp.instances[0].jobs[0]["b"] == 3
+    FakeInterp.instances[0].stop()  # leave nothing running at teardown
+
+
+def test_interpolate_all_drains_past_unpairable_first_gap(
+        lr, make_coco, make_window, fake_sam3, auto_yes, monkeypatch):
+    """'⇉ Interpolate all keyframes' must keep draining the queue when the
+    FIRST span fails to start (unpairable anchors) — with no prior worker
+    the drain loop used to exit immediately, silently stalling the batch."""
+    from gui.label_review.ui import main_window as mw
+    coco = make_coco([{"id": 0, "name": "a"}])
+    win = make_window(FakeIdx(9), coco)
+    # Anchors 0, 3, 8. Gap (3,8) is unpairable (boxes far apart, distinct
+    # track ids); gap (0,3) pairs. From frame 0 the failing gap pops first.
+    img0 = win._ensure_image_id(0, "left")
+    img3 = win._ensure_image_id(3, "left")
+    img8 = win._ensure_image_id(8, "left")
+    a0 = coco.add_box(img0, 10.0, 10.0, 20.0, 20.0, 0)
+    a3 = coco.add_box(img3, 12.0, 12.0, 20.0, 20.0, 0)
+    a8 = coco.add_box(img8, 60.0, 50.0, 20.0, 20.0, 0)
+    coco.set_track_id(a0, 1)
+    coco.set_track_id(a3, 1)   # exact (track, cat) pair across gap (0,3)
+    coco.set_track_id(a8, 2)   # no exact pair with frame 3, too far apart
+
+    class FakeInterp:
+        instances = []
+        def __init__(self, *a, **kw):
+            self.jobs = a[1] if len(a) > 1 else []
+            for s in ("progress_signal", "finished_signal", "failed_signal",
+                      "cancelled_signal"):
+                setattr(self, s, FakeSig())
+            self._running = False
+            FakeInterp.instances.append(self)
+        def start(self): self._running = True
+        def isRunning(self): return self._running
+        def cancel(self): self._running = False
+        def stop(self): self._running = False
+    monkeypatch.setattr(mw, "InterpBatchWorker", FakeInterp)
+    FakeInterp.instances.clear()
+    win._current_idx = 0
+    win._on_interpolate_all_keyframes()
+    # The unpairable gap (3,8) is skipped and (0,3) starts.
+    assert len(FakeInterp.instances) == 1
+    assert FakeInterp.instances[0].jobs[0]["a"] == 0
+    assert FakeInterp.instances[0].jobs[0]["b"] == 3
+    assert win._interp_all_pending == []
+    FakeInterp.instances[0].stop()  # leave nothing running at teardown
 
 
 def test_rerun_markers_labeled_with_waypoint_ids(lr, make_coco,

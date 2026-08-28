@@ -398,6 +398,67 @@ def test_set_mask_muted_skips_undo_snapshot(lr, tmp_path):
     assert coco.dirty
 
 
+def test_set_mask_supersedes_spilled_png(lr, tmp_path):
+    """Re-segmenting a box whose old mask was LRU-spilled to _mask_png
+    must drop the stale bytes — otherwise the next eviction re-spills the
+    OLD mask and ensure_mask resurrects it (silent re-seg data loss)."""
+    path = str(tmp_path / "reseg.json")
+    coco = lr.CocoState(path, [{"id": 0, "name": "a"}])
+    coco.max_cached_masks = 8  # smallest LRU cap
+    img = coco.ensure_image(_mkframe(0), 16, 16)
+    target = coco.add_box(img, 1, 1, 4, 4, 0)
+    m1 = np.zeros((16, 16), bool)
+    m1[2:4, 2:4] = True
+    m2 = np.zeros((16, 16), bool)
+    m2[10:14, 10:14] = True
+    coco.set_mask(target, m1)
+    # Push the target's mask out of the LRU → spilled to _mask_png.
+    with coco.undo_stack.mute():
+        fillers1 = [coco.add_box(img, 8, 8, 2, 2, 0) for _ in range(8)]
+        for oid in fillers1:
+            coco.set_mask(oid, np.ones((16, 16), bool))
+    ann = coco.get_box(target)
+    assert ann.get("_mask") is None and ann.get("_mask_png")
+    # Re-segment (as R / re-seg does): the new mask supersedes the spill.
+    coco.set_mask(target, m2)
+    assert "_mask_png" not in coco.get_box(target)
+    # Evict the new mask too, then re-materialize: must be m2, not m1.
+    with coco.undo_stack.mute():
+        fillers2 = [coco.add_box(img, 0, 12, 2, 2, 0) for _ in range(8)]
+        for oid in fillers2:
+            coco.set_mask(oid, np.ones((16, 16), bool))
+    ann = coco.get_box(target)
+    assert ann.get("_mask") is None  # evicted again
+    back = coco.ensure_mask(ann)
+    assert back is not None and (back == m2).all()
+
+
+def test_undo_set_mask_drops_spilled_png(lr, tmp_path):
+    """Undoing a mask change onto a box whose CURRENT mask was spilled to
+    _mask_png must drop those bytes — else a later eviction resurrects the
+    undone mask."""
+    path = str(tmp_path / "undo_mask.json")
+    coco = lr.CocoState(path, [{"id": 0, "name": "a"}])
+    coco.max_cached_masks = 8
+    img = coco.ensure_image(_mkframe(0), 16, 16)
+    target = coco.add_box(img, 1, 1, 4, 4, 0)
+    m1 = np.zeros((16, 16), bool)
+    m1[2:4, 2:4] = True
+    m2 = np.zeros((16, 16), bool)
+    m2[10:14, 10:14] = True
+    coco.set_mask(target, m1)
+    coco.set_mask(target, m2)  # undoable: prev = m1
+    # Spill the current mask (m2) to _mask_png.
+    coco._evict_mask(target)
+    ann = coco.get_box(target)
+    assert ann.get("_mask") is None and ann.get("_mask_png")
+    # Undo restores m1 — and must clear the spilled m2 bytes.
+    coco.undo_stack.pop_undo()[1]()
+    ann = coco.get_box(target)
+    assert "_mask_png" not in ann
+    assert ann["_mask"] is not None and (ann["_mask"] == m1).all()
+
+
 def test_save_honors_min_polygon_area(lr, tmp_path):
     mask = np.zeros((64, 64), dtype=bool)
     mask[10:30, 10:30] = True

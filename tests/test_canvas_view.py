@@ -66,6 +66,22 @@ def test_apply_config_display_max_image_dim(lr, make_coco, make_window):
     assert all(c.display_max_dim == 64 for c in win.canvases.values())
 
 
+def test_apply_config_sam3_imgsz_zero_means_default(lr, make_coco,
+                                                    make_window):
+    """sam3.imgsz=0 is documented as 'library default' (the dialog
+    spinbox's 0) — it must normalize to None, not reach the predictor as
+    imgsz=0. Valid values and quantize round-trip unchanged."""
+    win = make_window(coco=make_coco([]))
+    win.sam3_imgsz = 1024
+    win._apply_runtime_config({"sam3": {"imgsz": 0}})
+    assert win.sam3_imgsz is None
+    win._apply_runtime_config({"sam3": {"imgsz": 768, "quantize": 16}})
+    assert win.sam3_imgsz == 768
+    assert win.sam3_quantize == 16
+    win._apply_runtime_config({"sam3": {"quantize": 0}})
+    assert win.sam3_quantize is None  # 0/None = no quantization override
+
+
 def test_config_dialog_display_roundtrip(lr, make_coco, make_window):
     win = make_window(coco=make_coco([]), display_max_dim=128)
     dlg = lr.ConfigDialog(win)

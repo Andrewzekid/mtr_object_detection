@@ -2155,9 +2155,12 @@ class ReviewWindow(QMainWindow):
         if not self._start_interp_span(side, a, b):
             # Gap already filled (or anchors lost) — move on immediately.
             # Recursion depth == remaining spans; a deep tail of empty gaps
-            # could blow the stack, so drain iteratively.
-            while self._interp_all_pending and self._interp_worker is not \
-                    None and not self._interp_worker.isRunning():
+            # could blow the stack, so drain iteratively. Keep draining even
+            # when no worker has ever started (first span unpairable): the
+            # worker-None case must not stall the rest of the batch.
+            while self._interp_all_pending and (
+                    self._interp_worker is None
+                    or not self._interp_worker.isRunning()):
                 if self._stale_sender():
                     return
                 a, b = self._interp_all_pending.pop(0)
