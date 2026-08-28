@@ -26,11 +26,10 @@ DETECTOR_LABELS = {
     "owlv2": "OWLv2",
     "owlv2_exemplar": "OWLv2 exemplar",
     "grounding_dino": "Grounding DINO",
-    "falcon": "Falcon Perception",
 }
 
 # Detectors whose detections carry segmentation masks.
-DETECTORS_WITH_MASKS = ("sam3", "falcon")
+DETECTORS_WITH_MASKS = ("sam3",)
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +58,8 @@ class SidePanel(QWidget):
     propagate_clicked = pyqtSignal()           # "Propagate →" button
     toggle_keyframe_clicked = pyqtSignal()   # "★ Keyframe" button (K)
     toggle_annotated_clicked = pyqtSignal()  # "✔ Mark as annotated" button
+    nav_annotated = pyqtSignal(int)          # -1 prev / +1 next annotated frame
+    nav_annotated = pyqtSignal(int)          # -1 prev / +1 next annotated frame
     toggle_discard_clicked = pyqtSignal()    # "🚫 Discard image" button
     # "🗺 Show annotated in Rerun" button
     show_annotated_rerun_clicked = pyqtSignal()
@@ -118,7 +119,8 @@ class SidePanel(QWidget):
         layout.addWidget(self.source_label)
 
         _header("Categories")
-        self.cat_label = QLabel("Click = preselect for next draw / 0-9 · "
+        self.cat_label = QLabel("Click = preselect for next draw / number keys "
+                                "(Enter confirms, e.g. 12) · "
                                 "multi-select = autolabel only these:")
         self.cat_label.setObjectName("mutedLabel")
         self.cat_label.setWordWrap(True)
@@ -280,6 +282,38 @@ class SidePanel(QWidget):
             self.toggle_annotated_clicked.emit)
         layout.addWidget(self.btn_mark_annotated)
 
+        # Jump between annotated frames (both directions, wraps around).
+        nav_ann_row = QHBoxLayout()
+        self.btn_prev_annotated = QPushButton("◀ Prev annotated")
+        self.btn_prev_annotated.setToolTip(
+            "Jump to the previous frame marked ✔ annotated (wraps around).")
+        self.btn_prev_annotated.clicked.connect(
+            lambda _c=False: self.nav_annotated.emit(-1))
+        nav_ann_row.addWidget(self.btn_prev_annotated)
+        self.btn_next_annotated = QPushButton("Next annotated ▶")
+        self.btn_next_annotated.setToolTip(
+            "Jump to the next frame marked ✔ annotated (wraps around).")
+        self.btn_next_annotated.clicked.connect(
+            lambda _c=False: self.nav_annotated.emit(+1))
+        nav_ann_row.addWidget(self.btn_next_annotated)
+        layout.addLayout(nav_ann_row)
+
+        # Jump between annotated frames (both directions, wraps around).
+        nav_ann_row = QHBoxLayout()
+        self.btn_prev_annotated = QPushButton("◀ Prev annotated")
+        self.btn_prev_annotated.setToolTip(
+            "Jump to the previous frame marked ✔ annotated (wraps around).")
+        self.btn_prev_annotated.clicked.connect(
+            lambda _c=False: self.nav_annotated.emit(-1))
+        nav_ann_row.addWidget(self.btn_prev_annotated)
+        self.btn_next_annotated = QPushButton("Next annotated ▶")
+        self.btn_next_annotated.setToolTip(
+            "Jump to the next frame marked ✔ annotated (wraps around).")
+        self.btn_next_annotated.clicked.connect(
+            lambda _c=False: self.nav_annotated.emit(+1))
+        nav_ann_row.addWidget(self.btn_next_annotated)
+        layout.addLayout(nav_ann_row)
+
         # Discard the current frame (both sides in stereo): its image
         # record(s) and annotations are excluded from the FINAL output
         # JSON. Toggle again to restore — reversible until the final save.
@@ -429,7 +463,7 @@ class SidePanel(QWidget):
 
         # Text-prompt autolabel: the detector finds objects by category name,
         # no drawn boxes needed; detections become editable boxes (with masks
-        # for SAM3/Falcon). When categories are highlighted in the list above
+        # for SAM3). When categories are highlighted in the list above
         # (Ctrl/Shift, or any multi-select), only those are detected —
         # otherwise every category. set_autolabel_detector() rewrites the
         # header/tooltips with the active backend's name.
@@ -508,7 +542,8 @@ class SidePanel(QWidget):
             "<b>Keys (work anywhere):</b><br>"
             "D = delete sel &nbsp; A = draw &nbsp; N = next &nbsp; B = back<br>"
             "X = discard all &nbsp; S = save+quit &nbsp; Q = quit<br>"
-            "0-9 = pick cat (when drawing) &nbsp; + / - = zoom &nbsp; F = fit<br>"
+            "digits = pick cat (when drawing; Enter confirms 2+ digits) "
+            "&nbsp; + / - = zoom &nbsp; F = fit<br>"
             "M = toggle masks &nbsp; R = re-seg sel &nbsp; Space = play/pause<br>"
             "Z = zoom to sel &nbsp; Ctrl+Z = undo &nbsp; Ctrl+Shift+Z = redo<br>"
             "Ctrl+A = select all &nbsp; Esc = clear sel / quit<br>"

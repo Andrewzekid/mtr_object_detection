@@ -430,6 +430,7 @@ class ReviewWindow(QMainWindow):
         self.side.propagate_clicked.connect(self._on_propagate_track)
         self.side.toggle_keyframe_clicked.connect(self._on_toggle_keyframe)
         self.side.toggle_annotated_clicked.connect(self._on_toggle_annotated)
+        self.side.nav_annotated.connect(self._on_nav_annotated)
         self.side.toggle_discard_clicked.connect(self._on_toggle_discard)
         self.side.show_annotated_rerun_clicked.connect(
             self._on_show_annotated_rerun)
@@ -2218,6 +2219,32 @@ class ReviewWindow(QMainWindow):
                 f"Next unlabeled: frame {idx + 1}/{total}", 2500)
             return
         self.statusBar().showMessage("No unlabeled frames left 🎉", 3000)
+
+    def _on_nav_annotated(self, direction: int) -> None:
+        """Jump to the next (+1) / previous (-1) frame marked ✔ annotated,
+        wrapping around at the ends."""
+        marks = sorted(self.coco.annotated_marks)
+        if not marks:
+            self.statusBar().showMessage(
+                "No annotated frames marked yet", 3000)
+            return
+        cur = self._current_idx
+        if direction > 0:
+            target = next((m for m in marks if m > cur), marks[0])
+        else:
+            target = next((m for m in reversed(marks) if m < cur),
+                          marks[-1])
+        if target == cur:
+            self.statusBar().showMessage(
+                "This is the only annotated frame", 3000)
+            return
+        self._current_idx = target
+        self._load_current()
+        # Same as explicit N/B nav: record progress so the tmp file tracks
+        # where the review session is.
+        self.coco.save(is_final=False)
+        self.statusBar().showMessage(
+            f"Annotated frame {target + 1}/{len(self.frame_index)}", 2500)
 
     def _on_save(self) -> None:
         """File → Save (Ctrl+S): write the final COCO JSON to the current
