@@ -8,6 +8,7 @@ GUI — the one human step — where you fix boxes, segment them with SAM3
 (bbox prompts). The reviewed labels are assembled into a YOLO-seg dataset
 (augment + split), trained with Ultralytics YOLO, evaluated per class,
 and run through DeepOCSort tracking.
+<img width="1847" height="1055" alt="image" src="https://github.com/user-attachments/assets/459a0cab-9194-4d96-8b81-64a4d7bbc5fd" />
 
 ---
 
