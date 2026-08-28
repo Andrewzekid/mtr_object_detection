@@ -834,9 +834,11 @@ class SidePanel(QWidget):
     # Values are attribute names on this panel; an attribute may be a single
     # widget or a list of widgets.
     _HIDEABLE = {
-        "keyframe": ["btn_keyframe"],
+        "keyframe": ["btn_keyframe", "btn_mark_every_nth",
+                     "spin_keyframe_every"],
         "interpolate": ["btn_interpolate", "btn_cancel_interp",
-                        "interp_status"],
+                        "btn_interp_all_keyframes",
+                        "btn_propagate_all_keyframes", "interp_status"],
         "jump": ["jump_buttons"],
         "viewpoint": ["viewpoint_header", "btn_mark_annotated",
                       "btn_discard_image", "btn_show_annotated_rerun",

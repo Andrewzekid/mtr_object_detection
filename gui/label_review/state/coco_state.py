@@ -664,6 +664,10 @@ class CocoState:
                     ann.pop("_mask_png", None)
                     self._mask_lru.pop(ann_id, None)
                 else:
+                    # The new mask supersedes any spilled PNG of the OLD
+                    # mask — leaving it would resurrect the old mask on the
+                    # next LRU eviction (_evict_mask reuses existing bytes).
+                    ann.pop("_mask_png", None)
                     ann["_mask"] = mask
                     self._remember_mask(ann)
                 self.dirty = True
@@ -1015,6 +1019,10 @@ class CocoState:
                     ann.pop("_mask_png", None)
                     self._mask_lru.pop(ann_id, None)
                 else:
+                    # Drop any spilled PNG of the mask being replaced —
+                    # otherwise a later LRU eviction would resurrect it
+                    # (_evict_mask reuses existing _mask_png bytes).
+                    ann.pop("_mask_png", None)
                     ann["_mask"] = prev_mask.copy() if isinstance(prev_mask, np.ndarray) else prev_mask
                     self._remember_mask(ann)
                 self.dirty = True

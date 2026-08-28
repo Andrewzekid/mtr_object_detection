@@ -1019,7 +1019,6 @@ def run_detect_then_sam3(args):
     """Run YOLO detect-track + SAM3 segmentation pipeline."""
     from ultralytics import SAM
 
-    project_dir = Path(__file__).parent.parent
     yolo_model_path = Path(args.yolo_model)
     sam3_model_path = Path(args.sam3_model)
     data_path = Path(args.data)

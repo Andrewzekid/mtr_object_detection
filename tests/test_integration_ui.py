@@ -1515,6 +1515,34 @@ def test_propagate_all_keyframes_needs_two_keyframes(lr, propagate_win):
     assert not win._sam3_queue  # one keyframe → nothing to do
 
 
+def test_queued_propagate_keeps_seed_tid_changes(lr, propagate_win):
+    """A propagate job queued while SAM3 is busy must carry its
+    seed_tid_changes through the queue — otherwise a back-to-back run
+    (e.g. the second stereo side) loses them and its composite undo can't
+    restore the original track ids of previously track-less seed boxes."""
+    win, coco = propagate_win
+    image_id = coco.ensure_image(FakeIdx().frame_at(0), 100, 80)
+    seed_ann = coco.add_box(image_id, 10, 10, 30, 20, 0)
+    win._refresh_boxes()
+    win.canvas._selected_idx = 0
+    win.canvas._multi_selected = {0}
+    win._on_propagate_track()  # first run starts → SAM3 busy
+    assert FakePropagateWorker.instances[-1].isRunning()
+    changes = [(seed_ann, None, 42)]
+    win._start_propagate_worker(
+        0, [{"track_id": 7, "cat_id": 0, "concept": "ceiling light",
+             "bbox_xyxy": [0.0, 0.0, 5.0, 5.0]}],
+        side="left", seed_tid_changes=changes)
+    assert len(win._sam3_queue) == 1  # queued, not started
+    # Drain the queue: the dequeued run's meta must carry the changes.
+    FakePropagateWorker.instances[-1].stop()
+    win._start_next_queued_sam3()
+    w = FakePropagateWorker.instances[-1]
+    assert w.isRunning()
+    assert w._meta["seed_tid_changes"] == changes
+    w.stop()
+
+
 def test_interpolate_all_keyframes_queues_gaps(lr, make_coco, make_window,
                                                fake_sam3, auto_yes,
                                                monkeypatch):
@@ -1562,6 +1590,40 @@ def test_interpolate_all_keyframes_queues_gaps(lr, make_coco, make_window,
     FakeInterp.instances[1].stop()
     FakeInterp.instances[1].finished_signal.emit([])
     assert win._interp_all_pending == []
+
+
+def test_interpolate_starts_single_worker(lr, make_coco, make_window,
+                                          fake_sam3, monkeypatch):
+    """I key / Interpolate with a valid gap starts exactly ONE interp
+    worker — a leftover duplicate _start_interp_span call used to launch
+    the same span twice (two workers racing over the same tmp dir)."""
+    from gui.label_review.ui import main_window as mw
+    coco = make_coco([{"id": 0, "name": "a"}])
+    win = make_window(FakeIdx(6), coco)
+    for fidx in (0, 3):  # labeled anchors around the current frame
+        img_id = win._ensure_image_id(fidx, "left")
+        coco.add_box(img_id, 10.0, 10.0, 20.0, 20.0, 0)
+
+    class FakeInterp:
+        instances = []
+        def __init__(self, *a, **kw):
+            self.jobs = a[1] if len(a) > 1 else []
+            for s in ("progress_signal", "finished_signal", "failed_signal",
+                      "cancelled_signal"):
+                setattr(self, s, FakeSig())
+            self._running = False
+            FakeInterp.instances.append(self)
+        def start(self): self._running = True
+        def isRunning(self): return self._running
+        def cancel(self): self._running = False
+        def stop(self): self._running = False
+    monkeypatch.setattr(mw, "InterpBatchWorker", FakeInterp)
+    FakeInterp.instances.clear()
+    win._current_idx = 1
+    win._on_interpolate()
+    assert len(FakeInterp.instances) == 1
+    assert FakeInterp.instances[0].jobs[0]["a"] == 0
+    assert FakeInterp.instances[0].jobs[0]["b"] == 3
 
 
 def test_rerun_markers_labeled_with_waypoint_ids(lr, make_coco,

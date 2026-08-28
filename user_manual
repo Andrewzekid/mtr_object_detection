@@ -56,7 +56,7 @@ You need to label data in a way that the detection model outputs results which a
 3) do not label objects behind glass / do not label reflections
 
 Waypoint Selection:
-For selecting waypoints, you can either: "Draw bboxes on an image" or click "✔ Mark as annotated". Then, switch to the embedded rerun viewer with View -> "Switch to Rerun waypoint view" (switch back with View -> "Switch back to image view"). This needs the .rrd file and IMAGE POSE DATABASE loaded. You can click on "🗺 Show annotated in Rerun" button to view the waypoints inside rerun. "◀ Prev annotated / Next annotated ▶" jump between annotated frames (boxed or marked).
+For selecting waypoints, you can either: "Draw bboxes on an image" or click "✔ Mark as annotated". Then, switch to the embedded rerun viewer with View -> "Switch to Rerun waypoint view" (switch back with View -> "Switch back to image view"). This needs the .rrd file and IMAGE POSE DATABASE loaded. You can click on "🗺 Show annotated in Rerun" button to view the waypoints inside rerun. "◀ Prev annotated / Next annotated ▶" jump between annotated frames (boxed or marked). To run interval selection, see image_selection/sample_images_along_trajectory.py. You need to combine the json result with the ms coco json produced by the gui. use 09b_split_and_combine.py to do that (pretty easy, just merge the annotated_timestamp list in the json). 
 
 Configuration:
 You can edit important configurations via File -> "Config settings..." (Ctrl+G) or the "⚙ Config" corner button, and save your settings ("Save...") for quick future loading ("Load from file..."). 

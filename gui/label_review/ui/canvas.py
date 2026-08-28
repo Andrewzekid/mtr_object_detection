@@ -710,7 +710,9 @@ class CanvasWidget(QWidget):
         self._cat_buffer = ""
         self._waiting_cat = False
         self.update()
-        self.parent_window._assign_pending_cat(cat_id)
+        # Pass THIS canvas: the keys were typed here, and in stereo the
+        # active side may have changed since the draw started.
+        self.parent_window._assign_pending_cat(cat_id, canvas=self)
 
     def _stop_cat_wait(self) -> None:
         """Leave category-pick mode: drop the buffer, clear the pending

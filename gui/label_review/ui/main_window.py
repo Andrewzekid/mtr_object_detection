@@ -1298,7 +1298,9 @@ class ReviewWindow(QMainWindow):
             self.sam3_conf = float(sam3_cfg["conf"])
         if "imgsz" in sam3_cfg:
             try:
-                self.sam3_imgsz = int(sam3_cfg["imgsz"])
+                # 0 means "library default" (the dialog spinbox's 0), same
+                # as None — passing 0 to the predictor would break inference.
+                self.sam3_imgsz = int(sam3_cfg["imgsz"]) or None
             except (TypeError, ValueError):
                 print(f"⚠️ config sam3.imgsz {sam3_cfg['imgsz']!r} invalid; "
                       "keeping the previous value")
@@ -2010,7 +2012,6 @@ class ReviewWindow(QMainWindow):
                     "current frame", 4500)
                 return
             a, b = max(before), min(after)
-        self._start_interp_span(side, a, b)
         if b - a < 2:
             self.statusBar().showMessage(
                 f"Nothing to interpolate between frames {a + 1} and {b + 1}",
@@ -2153,7 +2154,16 @@ class ReviewWindow(QMainWindow):
             self._active_canvas.side
         if not self._start_interp_span(side, a, b):
             # Gap already filled (or anchors lost) — move on immediately.
-            self._start_next_interp_span()
+            # Recursion depth == remaining spans; a deep tail of empty gaps
+            # could blow the stack, so drain iteratively.
+            while self._interp_all_pending and self._interp_worker is not \
+                    None and not self._interp_worker.isRunning():
+                if self._stale_sender():
+                    return
+                a, b = self._interp_all_pending.pop(0)
+                if self._start_interp_span(side, a, b):
+                    return
+            return
 
     def _on_cancel_interp(self) -> None:
         self._interp_all_pending.clear()
@@ -2310,20 +2320,29 @@ class ReviewWindow(QMainWindow):
                     ann_ids=[new_ann_id],
                 )
 
-    def _assign_pending_cat(self, cat_id: int) -> None:
-        """Number-key category pick for the pending rectangle (on the
-        active side)."""
+    def _assign_pending_cat(self, cat_id: int, canvas=None) -> None:
+        """Number-key / click category pick for a pending rectangle.
+
+        ``canvas`` selects the side to search for the pending rect
+        (default: the active canvas — the number keys always arrive at the
+        canvas the user drew on, so the keyboard path passes it
+        explicitly; a stale active-side in stereo would otherwise drop
+        the pick silently).
+        """
         if cat_id not in self.coco.cat_map:
             self.statusBar().showMessage(f"⚠️ Category {cat_id} not found", 3000)
             return
-        canvas = self._active_canvas
+        canvas = canvas or self._active_canvas
         rect = canvas.get_pending_rect()
-        if rect is None or self._current_image_id is None:
+        if rect is None:
+            return
+        image_id = canvas._image_id
+        if image_id is None:
             return
         x, y, w, h = rect
         canvas.reset_state()
         # Reuse the shared add-box path.
-        self._on_box_added(self._current_image_id, x, y, w, h, cat_id)
+        self._on_box_added(image_id, x, y, w, h, cat_id)
 
     def _on_discard_all(self) -> None:
         # X discards all boxes on the ACTIVE side of the current frame.
@@ -2531,12 +2550,14 @@ class ReviewWindow(QMainWindow):
             print(f"    {cid} -> {name}")
 
     def _on_side_cat_clicked(self, cat_id: int) -> None:
-        # If we have a pending rect (on the active side), assign; else
-        # preselect for the next draw.
-        if self._active_canvas.get_pending_rect() is not None:
-            self._assign_pending_cat(cat_id)
-        else:
-            self._on_preselect_cat(cat_id)
+        # If a pending rect exists (either canvas — the user may have drawn
+        # on the other stereo side), assign; else preselect for the next
+        # draw.
+        for canvas in self.canvases.values():
+            if canvas.get_pending_rect() is not None:
+                self._assign_pending_cat(cat_id, canvas=canvas)
+                return
+        self._on_preselect_cat(cat_id)
 
     def _refresh_boxes(self) -> None:
         """Rebuild every canvas's box list from the COCO state; the side
@@ -2804,6 +2825,7 @@ class ReviewWindow(QMainWindow):
         elif job.get("kind") == "propagate":
             self._start_propagate_worker(
                 job["start_frame_idx"], job["seeds"], side=job.get("side"),
+                seed_tid_changes=job.get("seed_tid_changes"),
                 end_frame_idx=job.get("end_frame_idx"))
         elif job.get("kind") == "point":
             self._start_point_seg_worker(job)
@@ -3787,12 +3809,11 @@ class ReviewWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Propagate all: no tracked boxes on any keyframe", 4000)
             return
-        gaps = len(kfs) - 1
         ret = QMessageBox.question(
             self, "Propagate between all keyframes?",
-            f"Queue {len(jobs)} SAM3 propagate run(s) — one per keyframe "
-            f"gap and side ({n_seed_boxes} track seed(s) total), each "
-            f"bounded at its next ★ keyframe (method: "
+            f"Queue {len(jobs)} SAM3 propagate run(s) across "
+            f"{len(kfs) - 1} keyframe gap(s) ({n_seed_boxes} track seed(s) "
+            f"total), each bounded at its next ★ keyframe (method: "
             f"{self.propagate_method})?\n\n"
             f"Seeds come from the boxes already on each keyframe; frames "
             f"that already have a box with that track id are skipped. "
@@ -3833,6 +3854,10 @@ class ReviewWindow(QMainWindow):
                 "seeds": seeds,
                 "side": side,
                 "end_frame_idx": end_frame_idx,
+                # Must ride along: without it a queued (e.g. stereo second
+                # side) run's composite undo can't restore the original
+                # track ids of previously track-less seed boxes.
+                "seed_tid_changes": seed_tid_changes,
             })
             self._refresh_sam3_status()
             self.statusBar().showMessage(

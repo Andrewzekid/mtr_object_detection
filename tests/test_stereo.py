@@ -631,3 +631,37 @@ def test_discard_drops_both_sides_despite_skips(lr, make_coco, tmp_path):
         open(coco.output_json.replace(".json", "_tmp.json")).read())
     assert sorted(i["timestamp_ns"] for i in tmp["images"]) == \
         [200, 200, 300, 300]
+
+
+def test_assign_pending_cat_on_non_active_side(lr, make_coco, make_window,
+                                               tmp_path):
+    """Stereo: a pending rect drawn on the LEFT canvas gets its category
+    assigned even when the ACTIVE side is RIGHT — the number-key path
+    passes the canvas that holds the rect (regression: the pick was
+    silently dropped when the active side changed between draw and
+    keypress)."""
+    win, coco, idx, _l, _r = _stereo_setup(lr, make_coco, make_window,
+                                           tmp_path, name="catpick")
+    img_l = win._ensure_image_id(0, "left")
+    # Draw on the LEFT canvas → pending rect lives there.
+    lc = win.canvases["left"]
+    lc._edit_mode = "draw"
+    lc._drawing = True
+    lc._draw_start = (1.0, 1.0)
+    lc._draw_current = (5.0, 5.0)
+    lc.mouseReleaseEvent(lr.QtGui.QMouseEvent(
+        lr.QtCore.QEvent.Type.MouseButtonRelease,
+        lc._img_to_widget(5.0, 5.0), lr.Qt.MouseButton.LeftButton,
+        lr.Qt.MouseButton.LeftButton, lr.Qt.NoModifier))
+    assert lc._waiting_cat
+    # Focus/active side switches to RIGHT (a click there does that).
+    win._set_active_canvas(win.canvases["right"])
+    # Number-key commit arrives at the LEFT canvas.
+    lc.keyPressEvent(lr.QtGui.QKeyEvent(
+        lr.QtCore.QEvent.Type.KeyPress, lr.Qt.Key.Key_0, lr.Qt.NoModifier,
+        "0"))
+    # The box landed on the LEFT image (not the right).
+    anns = [a for a in coco.annotations]
+    assert len(anns) == 1
+    assert anns[0]["image_id"] == img_l
+    assert anns[0]["category_id"] == 0

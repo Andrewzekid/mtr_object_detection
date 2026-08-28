@@ -27,7 +27,10 @@
 #   QWEN_PROMPT    Qwen detection prompt (default: the orchestrator's built-in
 #                  Sofa/Wooden Door/Overhead Signage/Sprinkler prompt).
 #                  Multi-line fine: QWEN_PROMPT=$'Sofa: ...\n\nDoor: ...'
-#   QWEN_CLASSES   Class list override (default: parsed from the prompt)
+#   QWEN_CLASSES   Class list override (default: parsed from the prompt).
+#                  Space-separated; class NAMES containing spaces are not
+#                  supported here — pass --classes '...' as an extra arg
+#                  instead.
 #
 # Any extra CLI arguments (e.g. --camera both --sample-size 1000) pass
 # straight through to the orchestrator, overriding the defaults above.

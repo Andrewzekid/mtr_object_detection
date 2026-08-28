@@ -185,7 +185,9 @@ def main():
         json.dump(manifest, f, indent=2)
 
     print(f"\nWrote {written} new images to: {args.out_dir}")
-    print(f"Total images now in out_dir: {sum(1 for _ in args.out_dir.glob('*.jpg'))}")
+    total_out = sum(1 for f in args.out_dir.iterdir()
+                    if f.is_file() and f.suffix.lower() in IMAGE_EXTS)
+    print(f"Total images now in out_dir: {total_out}")
     print(f"Manifest: {manifest_path}")
 
 

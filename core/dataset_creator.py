@@ -310,8 +310,11 @@ class DatasetCreator:
             split_img_dir = split_path / split_name / "images"
             if split_img_dir.exists():
                 image_files = [f for f in split_img_dir.iterdir() if f.suffix.lower() in self.IMAGE_EXTENSIONS]
+                split_lbl_dir = split_path / split_name / "labels"
+                label_files = list(split_lbl_dir.glob("*.txt")) if split_lbl_dir.exists() else []
                 stats[split_name] = {
                     "image_count": len(image_files),
+                    "label_count": len(label_files),
                 }
 
         return stats

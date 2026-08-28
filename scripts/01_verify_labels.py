@@ -434,9 +434,6 @@ def main():
         fix=args.fix,
     )
     
-    # Generate report
-    report_lines = []
-    
     # Capture output
     import io
     old_stdout = sys.stdout

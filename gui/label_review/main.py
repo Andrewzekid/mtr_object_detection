@@ -460,7 +460,9 @@ def main():
     sam3_imgsz = sam3_cfg.get("imgsz", args.sam3_imgsz)
     if sam3_imgsz is not None:
         try:
-            sam3_imgsz = int(sam3_imgsz)
+            # 0 means "library default" (the settings dialog's spinbox
+            # documents 0 that way) — the predictor needs None instead.
+            sam3_imgsz = int(sam3_imgsz) or None
         except (TypeError, ValueError):
             print(f"⚠️ config sam3.imgsz {sam3_imgsz!r} invalid; "
                   "using the library default")
