@@ -557,7 +557,6 @@ python -m gui.label_review.main --help
 | SAM3 (`sam3.pt`) | `facebook/sam3` (gated) | `core/sam3/models/sam3-model/sam3.pt` | `install.sh` / manual / Docker build |
 | SAM3.1 (`sam3.1_multiplex.pt`) | `facebook/sam3.1` (gated) | `core/sam3/models/sam3.1-model/sam3.1_multiplex.pt` | same |
 | YOLO base weights (`yolo26n.pt` …) | Ultralytics | `models/` | Ultralytics on first training run |
-| OWLv2 / Grounding-DINO | HuggingFace | `~/.cache/huggingface/` | `transformers.from_pretrained` on first GUI use |
 | Qwen VLM (`qwen3.8`) | Ollama model registry | Ollama's store (`~/.ollama`) | `install.sh` / `ollama pull qwen3.8` (needs Ollama 0.32.15+) |
 | Qwen VLM (llama.cpp alternative: self-hosted model files) | user-supplied | `~/code/llama/llama.cpp/` | you (install.sh `--llamacpp` builds the server only) |
 
