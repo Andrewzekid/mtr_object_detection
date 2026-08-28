@@ -1,0 +1,66 @@
+TRAINING WORKFLOW:
+You can launch the pipeline using scripts/run_pipeline.sh. This file runs scripts/orchestrate_pipeline.py, which runs the full stage chain: undistort -> sample -> keyframes -> dataset stats -> qwen -> qwen-to-coco -> GUI review (interactive, waits for you to save & close) -> coco-to-yolo -> split -> augment (train split only) -> assemble -> train -> evaluate -> tracking. Each stage can be re-run with --stage / skipped with --skip-stage.
+
+Autolabelling:
+To reduce human effort, it is recommended to autolabel the images with qwen3.8 beforehand. You may need to spend time tuning the prompt, examining Qwens outputs, and adjusting. Ideally, ask qwen3.8 to describe the objects of interest (pass in conditioning images via --conditioning-images) and use that for building the prompt. 07_run_qwen.py supports running qwen using ollama (default), Aliyun Dashscope API key (--use-api), and llama.cpp (--backend llamacpp). With llama.cpp you need to tune the llama-server launch parameters such as --image-min-tokens (controlling the image size passed into the model, recommended 8192). 
+
+For the MTR admiralty inspection, it is recommended to have atleast 4-5k images labelled.  
+Let's say u have a dataset of 10k images. If time is a constraint, you can sample a set of keyframes (eg 1 frame every 10 frames), label those 1k images with qwen, review the bounding boxes, and then run interpolation or sam3 propagation between the labelled frames to get annotations for all 10k images. After interpolation, you still need to run sam3 segmentation and review the masks in ui. This way, you can get annotations for 10k images using around 1.5-2x the time needed to label 1k images. 
+
+If interpolation/propagation is not working well, increase the sampling interval (1 frame every 5 frames) so that you have more data points and interpolation/propagation has to do less work. 
+
+What order should i run the scripts?
+
+ The ideal workflow is undistort_rosbag.py (rosbag folder + calibration.json -> undistorted images) -> 00_sample_from_dataset.py (sample N frames from large datasets) -> 12_extract_keyframes.py (get 1 frame every N frames) -> 07_run_qwen.py (Qwen3.8 automatic labelling, run on a folder of images; writes one <name>_result.json per image) -> 08c_qwen_results_to_coco.py (converts qwens per-image result jsons into one MS COCO file, bboxes only, plus annotated_image_ids, loadable by the gui via "File -> Load annotations file...") -> Load in GUI -> review bboxes -> 01b_coco_to_yolo_seg.py to get a yolov26 style dataset -> 03_split_dataset.py -> 02_augment_data.py (train split only) -> 04_train_model.py -> 05_evaluate_model.py.
+ 
+You can sample images using 00_sample_from_dataset.py to get N frames randomly (default; seed-controlled, reproducible, skipping already-labelled ids) or the first N frames in chronological order (--mode first), and 12_extract_keyframes.py to get 1 frame every N frames (deterministic; default stride 20, the pipeline uses 10). Then, run 07_run_qwen.py for autolabelling. Afterwards, you can divide the work to multiple people by using 09b_split_and_combine.py. This can split 1 image folder into multiple smaller image folders (split mode: --ranges or --divide-evenly; images are MOVED by default, use --copy to keep originals), and give each person a different subset of images. [After everyone is done annotating their portion, combine the mscoco annotation files into one file using 09b_split_and_combine.py combine (ids are re-assigned and references fixed up, categories merged by name) to execute the rest of the pipeline (split, augment, train, eval)].
+
+After loading the results inside GUI, you have 2 paths:
+
+Manual label every frame and no interpolation/propagation:
+0) open the folder with the images qwen annotated
+1) Go through all images to verify that the bboxes are correct. 
+2) Then, run SAM3 segmentation on all frames ("SAM3 ALL frames" button; if you chose "Propagate ->" between keyframes instead of interpolation, sam3 will auto segment for the frames in between). 
+3) You need to examine SAM3s masks again and if they are inappropriate, need to adjust the bounding boxes manually and then segment again ("Re-seg sel (R)") or run Point Segment.
+
+IF USING KEYFRAME METHOD (label keyframes and propagate/interpolate to all images)
+0) open the folder with all images, and open your annotations file containing qwen annotations for a subset of the images.
+1) mark keyframes using the "every" spinbox + "★ mark keyframes" button (marks frames 0, N, 2N, ...). 
+2) Review the bounding boxes inside each keyframe by using "Next keyframe ▶ / ◀ Prev keyframe" (also ensure that the track ids are correct on each keyframe). 
+3) "⇉ Interpolate all keyframes" or "⇉ Propagate all keyframes". 
+4) Go through all images to verify that the bboxes are correct . 
+5) Then, run SAM3 segmentation on all frames (if you chose propagate between all keyframes instead of interpolation, sam3 will auto segment for the frames in between). 
+6) You need to examine SAM3s masks again and if they are inappropriate, need to adjust the bounding boxes manually and then segment again or run Point Segment. 
+
+After the data has been segmented, you need to SAVE THE JSON FILE (File -> Save, Ctrl+S). Run 01b_coco_to_yolo_seg.py on the json file to get a yolov26 style dataset (boxes without masks are SKIPPED unless you pass --bbox-as-rect) -> 03_split_dataset.py (train/test/val split, default ratios 0.7 0.15 0.15, --generate-yaml writes dataset.yaml) -> 02_augment_data.py (augment the TRAIN split only: --input-dir <split>/train) -> 04_train_model.py (takes the dataset.yaml; --model-type yolo26n --task segment for a yolov26 seg model). After that, per class evaluation metrics (precision, recall, F1, AP50, AP50-95, plus mask variants for seg models) come from 05_evaluate_model.py (--model best.pt --data dataset.yaml), and dataset statistics (per-class instance counts, image coverage) from 01a_dataset_statistics.py. 
+
+Tracking:
+To run tracking and detection, use 11_run_tracking.py (recommend undistorted data).
+YOLO sometimes outputs low confidence false positive detections. 11_run_tracking.py supports changing the confidence value (--conf, default 0.5) so low confidence detections are filtered out, it also supports NMS (--iou for the detector's class-aware NMS, default 0.45; --nms-iou for an extra class-agnostic NMS pass, default 0.5) to remove overlapping detections. run with --no-vis to speed up tracking: it skips drawing the per-frame images and the summary video, and only outputs the results.json (COCO-style with track_id, confidence, and segmentation polygons). 
+=====================================================================================
+CV LABELLING TOOL USAGE GUIDE:
+First, ensure you have the sam3 weights installed (they are on NAS under MTR Inspection/MTR_CV/detection_ws/core/sam3). 
+
+Loading Files
+
+Launc the gui and press File -> "Open stereo folders..." (left/right) / "Open folder..." (Ctrl+Shift+O, one side only). If you want to use rerun you must also open a .rrd file (File -> "Open rerun file..." or the "🎬 Rerun viewer / map..." button) and an image pose database with image <-> odom data (File -> "Open pose database..."). After opening an image folder(s), you can "File -> Load annotations file..." (Ctrl+I) to load in a mscoco format annotations file. 
+
+Adding / Deleting Bboxes and Segmentation
+
+Enter add bbox mode by pressing "A" key. You can delete a bbox with Backspace or "D" key. You can click and drag to draw a bounding box, then enter 0-9 and press Enter key to spawn the bbox (if a category is already preselected / last-used, the box spawns immediately with no typing). You can select a bbox by clicking on it (Shift+click for multi-select, Ctrl+A for all boxes) and then press "Run SAM3 (all)" to segment every bbox on the frame, or "Re-seg sel (R)" to re-segment only the selected bbox(es). If you just highlight categories without drawing bboxes, use "Autolabel frame" / "Autolabel ALL frames" (with the sam3 detector): SAM3 then runs detection+segmentation with those category names as the prompt. SAM3 can also take in positive/negative points for fine grained Promptable Visual Segmentation, working especially well for small objects: toggle "🎯 Add points", left-click for positive points, right-click for negative points, then press "▶ Segment points" (Enter accepts, Esc cancels).
+
+How to label data:
+You need to label data in a way that the detection model outputs results which are beneficial for grounding. This means:
+1) Do not label objects too far away (within ~3m by naked eye)
+2) do not label occluded objects which only can be seen partially.
+3) do not label objects behind glass / do not label reflections
+
+Waypoint Selection:
+For selecting waypoints, you can either: "Draw bboxes on an image" or click "✔ Mark as annotated". Then, switch to the embedded rerun viewer with View -> "Switch to Rerun waypoint view" (switch back with View -> "Switch back to image view"). This needs the .rrd file and IMAGE POSE DATABASE loaded. You can click on "🗺 Show annotated in Rerun" button to view the waypoints inside rerun. "◀ Prev annotated / Next annotated ▶" jump between annotated frames (boxed or marked).
+
+Configuration:
+You can edit important configurations via File -> "Config settings..." (Ctrl+G) or the "⚙ Config" corner button, and save your settings ("Save...") for quick future loading ("Load from file..."). 
+
+SAM3 propagation / Interpolation:
+There are many frames where an object is stationary / moving slowly. SAM3 can take in bbox exemplars as prompts to track an object between keyframes, reducing human effort. Interpolation is useful when camera motion is linear / moving in a constant direction or stationary. Mark the start and end keyframe for SAM3 propagation ("Propagate →" / "⇉ Propagate all keyframes") / Interpolation ("Interpolate (I)" / "⇉ Interpolate all keyframes"); It will run between those keyframes. For Interpolation, you need to add the track ids of objects of interest in the start and end keyframe so they match up (boxes are paired by (category, track_id) first, with a nearest-center fallback). This is useful for instance if you have a large dataset and only want to label a small set of data and propagate your labels to the rest of the dataset. 
+=====================================================================================

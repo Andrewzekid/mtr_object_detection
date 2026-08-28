@@ -26,7 +26,9 @@ original numeric id).
 Without ``--labeled-dir``, every source image is eligible.
 
 The selection is a reproducible random sample (``--seed``, default 42) of the
-complement. Use ``--dry-run`` to preview without writing anything.
+complement, or the first N frames in sorted (chronological for
+timestamp-named files) order with ``--mode first``.
+Use ``--dry-run`` to preview without writing anything.
 """
 
 import argparse
@@ -94,6 +96,10 @@ def main():
                     help=f"Destination folder for the selected images (default: {DEFAULT_OUT_DIR})")
     ap.add_argument("-n", "--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE,
                     help=f"Number of images to select (default: {DEFAULT_SAMPLE_SIZE})")
+    ap.add_argument("--mode", choices=["random", "first"], default="random",
+                    help="random: reproducible random sample (default). "
+                         "first: the first N frames in sorted order "
+                         "(chronological for timestamp-named files).")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
                     help=f"Random seed for reproducible sampling (default: {DEFAULT_SEED})")
     ap.add_argument("--copy", action="store_true", default=True,
@@ -120,17 +126,23 @@ def main():
         sys.exit(f"Error: complement ({len(complement)}) smaller than requested sample "
                  f"size ({args.sample_size}). Reduce --sample-size.")
 
-    # Reproducible random sample.
-    import random
-    rng = random.Random(args.seed)
-    selected = rng.sample(complement, args.sample_size)
+    if args.mode == "first":
+        # First N frames in sorted order (chronological for
+        # timestamp-named files).
+        selected = complement[:args.sample_size]
+    else:
+        # Reproducible random sample.
+        import random
+        rng = random.Random(args.seed)
+        selected = rng.sample(complement, args.sample_size)
     selected_set = set(selected)
 
     # Sanity: no overlap with already-labeled ids.
     overlap = selected_set & labeled
     assert not overlap, f"BUG: selection overlaps labeled set: {sorted(overlap)[:5]}"
 
-    print(f"Selected           : {len(selected)} (seed={args.seed})")
+    print(f"Selected           : {len(selected)} (mode={args.mode}"
+          + (f", seed={args.seed})" if args.mode == "random" else ")"))
     print(f"First 5 ids        : {selected[:5]}")
     print(f"Last 5 ids         : {selected[-5:]}")
 
@@ -142,7 +154,8 @@ def main():
         "labeled_count": len(labeled),
         "complement_count": len(complement),
         "sample_size": len(selected),
-        "seed": args.seed,
+        "mode": args.mode,
+        "seed": args.seed if args.mode == "random" else None,
         "selected_ids": selected,
     }
 
