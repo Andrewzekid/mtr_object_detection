@@ -5,8 +5,7 @@ plain image folders) into a trained instance-segmentation model and
 tracked output videos. Frames are undistorted, sampled and keyframed; a
 Qwen VLM server seeds the initial bounding boxes; then a PyQt6 review
 GUI — the one human step — where you fix boxes, segment them with SAM3
-(bbox prompts, with point prompts as fallback) and propagate labels
-across frames. The reviewed labels are assembled into a YOLO-seg dataset
+(bbox prompts). The reviewed labels are assembled into a YOLO-seg dataset
 (augment + split), trained with Ultralytics YOLO, evaluated per class,
 and run through DeepOCSort tracking.
 
@@ -28,10 +27,11 @@ See **[Installation](#installation)** below for the one-command setup
 ./install.sh --llamacpp --hf-token hf_xxx
 ```
 
-Then start the Qwen VLM server (seed labels):
+Then start the Qwen VLM server (seed labels): 
+
 
 ### Step 1 — start the Qwen VLM server (seed labels)
-
+Note: you must download the qwen3.8 gguf from huggingface and check that the path is correct before running.
 ```bash
 llama-server -m Qwen3.8-27B-Q4_K_M.gguf \
     --mmproj Qwen3.8-mmproj-F16.gguf \
