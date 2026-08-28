@@ -47,10 +47,11 @@ model, pull it (`ollama pull <tag>`) and point the pipeline at it with
 or `--model <tag>` (`scripts/07_run_qwen.py` directly).
 
 <details>
-<summary>Alternative: llama.cpp server (GGUF + mmproj)</summary>
+<summary>Alternative: llama.cpp server (self-hosted model files)</summary>
 
-Note: you must download the qwen3.8 GGUF (and its mmproj) from HuggingFace
-first and check that the paths below are correct before running.
+Note: you must download the qwen3.8 model file (and its vision projector
+file) from HuggingFace first and check that the paths below are correct
+before running.
 
 ```bash
 llama-server -m Qwen3.8-27B-Q4_K_M.gguf \
@@ -162,19 +163,11 @@ Settings → Autolabel (persisted as `autolabel.detector` in the GUI config):
 | `owlv2` | boxes | zero-shot, `google/owlv2-large-patch14-ensemble` (HF) |
 | `owlv2_exemplar` | boxes | 1-shot: select an existing box first — its crop becomes the visual query (`image_guided_detection`) |
 | `grounding_dino` | boxes | zero-shot; default `IDEA-Research/grounding-dino-base` (the `-large` checkpoint is not published in transformers format) |
-| `falcon` | boxes + masks | `tiiuae/Falcon-Perception`; free-form text query per category |
 
 Per-backend config keys (Settings dialog or config JSON): `owlv2_model` /
 `owlv2_conf` (default 0.3), `gdino_model` / `gdino_conf` (0.35, maps to the
-box threshold), `falcon_model`. First use downloads the
+box threshold). First use downloads the
 checkpoint from Hugging Face; models are cached per session.
-
-Two compatibility notes for the HF backends (handled automatically in
-`core/`): Falcon's pre-compiled flex-attention kernels exceed the shared
-memory of consumer GPUs (RTX 4090), so they are recompiled with smaller
-blocks at load (BLOCK=128, 1 stage; tunable via `FALCON_FLEX_BLOCK_M` /
-`FALCON_FLEX_BLOCK_N` / `FALCON_FLEX_STAGES`), and per-category queries are
-batched into one `generate` call.
 
 ### Labelling assist features (when and how to use them)
 
@@ -183,7 +176,7 @@ session: let Qwen seed boxes on the keyframes, open the GUI, then combine
 the assistants below depending on the footage.
 
 - **Autolabel (frame / ALL frames)** — open-set detectors fill in boxes (+
-  masks for SAM3/Falcon) for the session categories. Highlighting 2+
+  masks for SAM3) for the session categories. Highlighting 2+
   categories in the list restricts the run to just those. Use it to add a
   category you forgot to prompt Qwen for, or to re-label with a stronger
   open-set model. `owlv2_exemplar` is the 1-shot variant: draw/fix ONE good
@@ -315,7 +308,7 @@ python scripts/orchestrate_pipeline.py --images Datasets/HKU_GH --camera both
 # QWEN_MODEL, LLAMACPP_URL, QWEN_MMPROJ; all extra args pass through):
 ./scripts/run_pipeline.sh 20260821_Centen_Clio-n-Metacam_Data/metacam_data/2026-08-20_22-06-52 --camera both
 
-# Alternative llama.cpp backend (GGUF + mmproj on port 8089):
+# Alternative llama.cpp backend (self-hosted model files on port 8089):
 python scripts/orchestrate_pipeline.py --images Datasets/HKU_GH \
   --qwen-backend llamacpp --llamacpp-url http://127.0.0.1:8089 \
   --qwen-model Qwen3.8-27B-Q4_K_M.gguf --qwen-mmproj Qwen3.8-mmproj-F16.gguf
@@ -331,8 +324,8 @@ every sampled frame instead) and waits — the pipeline continues after you
 save and close. Useful per-stage knobs:
 
 - Qwen VLM: `--qwen-backend ollama|llamacpp` (default ollama),
-  `--ollama-url`, `--qwen-model` (Ollama tag or GGUF name; default
-  `qwen3.8` / `Qwen3.8-27B-Q4_K_M.gguf`), `--llamacpp-url`,
+  `--ollama-url`, `--qwen-model` (Ollama model tag or llama.cpp model file
+  name; default `qwen3.8` / `Qwen3.8-27B-Q4_K_M.gguf`), `--llamacpp-url`,
   `--qwen-mmproj` (llamacpp only),
   `--prompt` (class list is parsed from it; or `--classes`), `--resume-from`
 - sampling/keyframes: `--sample-size` (stereo: right side is synced to the
@@ -360,7 +353,7 @@ train_augmented,final}` (+ `dataset.yaml` and `dataset_statistics.csv`),
 | Path | Contents |
 |------|----------|
 | `scripts/` | Numbered CLI entry points (pipeline stages) + helpers. |
-| `core/` | Reusable OOP classes / headless inference wrappers the scripts build on. |
+| `core/` | Reusable OOP classes / GUI-free inference wrappers the scripts build on. |
 The numbered `scripts/` are thin CLI wrappers over `core/` classes
 (`ModelTrainer`, `ModelEvaluator`, `DataProcessor`, `DatasetCreator`,
 `ModelVisualizer`) and inference wrappers (`run_qwen`, `run_qwen_api`,
@@ -439,13 +432,14 @@ it to the pipeline via `--qwen-model <tag>` (orchestrator), `QWEN_MODEL`
 (`run_pipeline.sh`), or `--model <tag>` (`scripts/07_run_qwen.py`).
 
 With `--llamacpp` the script instead builds llama.cpp's `llama-server` as
-an alternative backend; you then download a Qwen3.8 vision GGUF + its
-`mmproj` (e.g. `Qwen3.8-27B-Q4_K_M.gguf` + `Qwen3.8-mmproj-F16.gguf`) into
+an alternative backend; you then download the Qwen3.8 model + vision
+projector files (e.g. `Qwen3.8-27B-Q4_K_M.gguf` +
+`Qwen3.8-mmproj-F16.gguf`) into
 `~/code/llama/llama.cpp/` and start it yourself (see the llama.cpp
 alternative in Step 1 of the Quickstart).
 
-**HF autolabel backends** (`owlv2`, `grounding-dino`,
-`falcon`) download automatically on first use in the GUI's
+**HF autolabel backends** (`owlv2`, `grounding-dino`)
+download automatically on first use in the GUI's
 Settings → Autolabel, into `~/.cache/huggingface/`. YOLO pretrained base
 weights (`yolo26n.pt`, …) are fetched by Ultralytics on first training
 run into `models/`. Neither needs an install step.
@@ -453,11 +447,11 @@ run into `models/`. Neither needs an install step.
 ### Option B — Docker (GPU + GUI + full pipeline)
 
 The `Dockerfile` (repo root) builds an image with the CUDA runtime, all
-Python deps, and the label-review GUI. GPU + X11 are forwarded to the host
-so the GUI shows on your desktop. The Qwen VLM seed-label server runs
-separately — **Ollama** by default (requires Ollama 0.32.15+ for qwen3.8),
-with an optional llama.cpp `llama-server` build inside the image as an
-alternative.
+Python deps, and the label-review GUI. The container shares your display
+and GPU with the host, so the GUI shows on your desktop. The Qwen VLM
+seed-label server runs separately — **Ollama** by default (requires
+Ollama 0.32.15+ for qwen3.8), with an optional llama.cpp `llama-server`
+build inside the image as an alternative.
 
 ```bash
 # build (fetch SAM3 weights at build time with a token):
@@ -485,9 +479,9 @@ docker run --gpus all -d --name ollama \
 docker exec -it ollama ollama pull qwen3.8
 ```
 
-(Alternative: build the image with `BUILD_LLAMACPP=1` and serve a Qwen3.8
-GGUF + mmproj with llama-server on port 8089, then run the pipeline with
-`--qwen-backend llamacpp`.)
+(Alternative: build the image with `BUILD_LLAMACPP=1` and serve the
+Qwen3.8 model files with llama-server on port 8089, then run the pipeline
+with `--qwen-backend llamacpp`.)
 
 Build-args:
 
@@ -532,7 +526,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama serve &          # or: sudo systemctl start ollama
 ollama pull qwen3.8
 # (alternative: llama.cpp — clone https://github.com/ggerganov/llama.cpp,
-#  build llama-server, and serve a Qwen3.8 GGUF + mmproj on port 8089;
+#  build llama-server, and serve the Qwen3.8 model files on port 8089;
 #  run the pipeline with --qwen-backend llamacpp)
 ```
 
@@ -550,9 +544,9 @@ python -m gui.label_review.main --help
 | SAM3 (`sam3.pt`) | `facebook/sam3` (gated) | `core/sam3/models/sam3-model/sam3.pt` | `install.sh` / manual / Docker build |
 | SAM3.1 (`sam3.1_multiplex.pt`) | `facebook/sam3.1` (gated) | `core/sam3/models/sam3.1-model/sam3.1_multiplex.pt` | same |
 | YOLO base weights (`yolo26n.pt` …) | Ultralytics | `models/` | Ultralytics on first training run |
-| OWLv2 / Grounding-DINO / Falcon | HuggingFace | `~/.cache/huggingface/` | `transformers.from_pretrained` on first GUI use |
+| OWLv2 / Grounding-DINO | HuggingFace | `~/.cache/huggingface/` | `transformers.from_pretrained` on first GUI use |
 | Qwen VLM (`qwen3.8`) | Ollama model registry | Ollama's store (`~/.ollama`) | `install.sh` / `ollama pull qwen3.8` (needs Ollama 0.32.15+) |
-| Qwen VLM (GGUF, llamacpp alternative) | user-supplied | `~/code/llama/llama.cpp/` | you (install.sh `--llamacpp` builds the server only) |
+| Qwen VLM (llama.cpp alternative: self-hosted model files) | user-supplied | `~/code/llama/llama.cpp/` | you (install.sh `--llamacpp` builds the server only) |
 
 ### Standalone bundle (no Python needed on the target)
 
@@ -584,7 +578,7 @@ Notes:
 - The bundle inherits this machine's torch build: a CUDA torch bundle needs
   a compatible NVIDIA driver on the target; build in a CPU-torch env for
   CPU-only targets.
-- On a fresh Linux install PyQt6 needs system GL/X libraries:
+- On a fresh Linux install PyQt6 needs system graphics libraries:
   `sudo apt install libgl1 libegl1 libxkbcommon0 libdbus-1-3`.
 
 
@@ -821,7 +815,7 @@ These back the scripts above; not normally invoked directly.
 
 | Module | Role |
 |--------|------|
-| `models_inference.py` | Headless VLM/SAM3 inference wrappers: `run_qwen` (Ollama), `run_qwen_api` (DashScope), `run_gemini` (HKU proxy), `run_sam3`; prompt templates + output parsing. |
+| `models_inference.py` | GUI-free VLM/SAM3 inference wrappers: `run_qwen` (Ollama), `run_qwen_api` (DashScope), `run_gemini` (HKU proxy), `run_sam3`; prompt templates + output parsing. |
 | `model_trainer.py` | `ModelTrainer` — YOLO training pipeline (backs `04`). |
 | `model_evaluator.py` | `ModelEvaluator` — evaluation + pred/GT comparison (backs `05`). |
 | `data_processor.py` | `DataProcessor` — augmentation + dataset stats (backs `02`). |
@@ -896,24 +890,19 @@ viewer:
 
 1. **Open rerun file…** (File menu or the sidebar's **🎬 Rerun viewer / map…**
    button) opens a `.rrd` recording — it carries the colored point-cloud
-   map, the camera images and their timestamps — embedded in the app: the
-   native rerun viewer runs as a subprocess and its X11 window is
-   reparented into the waypoint view, which replaces the image labeling
-   view (switch back with View → **Switch back to image view**). This is
-   the full-speed native renderer, so even maps with 100M+ points stay
-   smooth. Embedding needs an X11 session (xcb) and the `xwininfo` tool —
-   standard on Linux desktops; over SSH/Wayland the recording opens in a
-   standalone viewer window instead. The viewer opens on the **3D map
+   map, the camera images and their timestamps — embedded right inside the
+   app: the map replaces the image labeling view (switch back with View →
+   **Switch back to image view**). This is the full-speed native renderer,
+   so even maps with 100M+ points stay smooth. Embedding works out of the
+   box on a normal Linux desktop; over SSH or Wayland the recording opens
+   in a separate viewer window instead. The viewer opens on the **3D map
    view** by default — the camera image/depth views are left out; add
    them back from the viewer's blueprint menu if needed. The camera-body
    subtree (`body/camera_left`, `body/camera_right`, `body/axes`,
    `body/cloud_body` scans) is hidden by default — re-include it from the
-   streams panel. If the recording's ground plane comes out tilted (some
-   pipelines write a "leveled" ancestor transform that doesn't actually
-   level the map), the GUI fits the map cloud's ground plane on open and
-   streams a corrective static transform, so the map renders flat — the
-   `.rrd` itself is never modified. Clicking the embedded map hands it the
-   keyboard focus,
+   streams panel. If the map comes out tilted, the GUI automatically
+   flattens it when the recording opens — the `.rrd` file itself is never
+   modified. Clicking the embedded map hands it the keyboard focus,
    so the viewer's WASD camera controls work as usual. Switching to the
    waypoint view with a recording already open in a standalone window
    moves it into the app (the extra window is closed). The GUI then
@@ -1045,7 +1034,7 @@ The GUI loop is **box first, then segment**:
   (`sam3.*`).
 - **Autolabel detector**: `sam3`, `owlv2`, `owlv2_exemplar` (1-shot — select
   an existing box first; its crop becomes the visual query),
-  `grounding_dino`, `falcon`, plus per-backend model/conf keys
+  `grounding_dino`, plus per-backend model/conf keys
   (`autolabel.*`). First use downloads HF checkpoints.
 - **Masks / Display**: overlay opacity (`ui.mask_opacity`), max image size
   (`display.max_image_dim`, 0 = original).
